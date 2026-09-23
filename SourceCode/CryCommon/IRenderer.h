@@ -14,6 +14,8 @@
 #ifndef _IRENDERER_H
 #define _IRENDERER_H
 
+#include <stddef.h>
+
 //#if defined(LINUX)
 //	#include "Splash.h"
 //#else
@@ -85,6 +87,7 @@ struct	ITimer;
 struct	ISystem;
 class		IPhysicalWorld;
 class   ICrySizer;
+namespace CryVR { class Runtime; class VulkanContext; class VulkanResourceManager; class VulkanShaderLibrary; class VulkanFrameRenderer; }
 
 //////////////////////////////////////////////////////////////////////
 typedef unsigned char bvec4[4];
@@ -133,6 +136,14 @@ template	<class T> class list2;
 #define FILTER_BILINEAR		1
 #define FILTER_TRILINEAR	2
 
+enum EVulkanTextureFilter
+{
+  eVTF_Nearest = 0,
+  eVTF_Linear,
+  eVTF_Bilinear,
+  eVTF_Trilinear
+};
+
 //////////////////////////////////////////////////////////////////////
 #define R_SOLID_MODE		1
 #define R_WIREFRAME_MODE	2
@@ -142,6 +153,7 @@ template	<class T> class list2;
 #define R_DX9_RENDERER	2
 #define R_NULL_RENDERER	3
 #define R_CUBAGL_RENDERER	4
+#define R_VULKAN_RENDERER 5
 
 //////////////////////////////////////////////////////////////////////
 // Render features
@@ -374,6 +386,11 @@ struct SCryRenderInterface
   ISystem  *ipSystem;
   int      *ipTest_int;
 	IPhysicalWorld *pIPhysicalWorld;
+	CryVR::Runtime *pVRRuntime;
+	CryVR::VulkanContext *pVulkanContext;
+	CryVR::VulkanResourceManager *pVulkanResources;
+	CryVR::VulkanShaderLibrary *pVulkanShaders;
+	CryVR::VulkanFrameRenderer *pVulkanFrameRenderer;
 };
 
 //////////////////////////////////////////////////////////////////////
@@ -444,6 +461,52 @@ struct SAAFormat
 #define VSM_GENERAL  (1<<VSM_GENERAL)
 #define VSM_TANGENTS (1<<VSF_TANGENTS)
 
+struct SVulkanBufferCallbacks
+{
+  void *userData;
+  void *(*createBuffer)(void *userData, unsigned int size, bool indexBuffer);
+  bool (*uploadBuffer)(void *userData, void *buffer, const void *data,
+                       unsigned int size, unsigned int offset);
+  void (*destroyBuffer)(void *userData, void *buffer);
+  void *drawUserData;
+  bool (*queueIndexedDraw)(void *drawUserData, void *vertexBuffer, void *tangentBuffer, void *indexBuffer,
+                           int vertexFormat, unsigned int indexCount, unsigned int firstIndex,
+                           int topology, unsigned int renderState, int cullMode, int textureId, int textureId1,
+                           int textureStage0ColorOp, int textureStage0AlphaOp,
+                           int textureStage1ColorOp, int textureStage1AlphaOp,
+                           unsigned int textureStage0ColorArg, unsigned int textureStage0AlphaArg,
+                           unsigned int textureStage0Constant, unsigned int textureStage1ColorArg,
+                           unsigned int textureStage1AlphaArg, unsigned int textureStage1Constant,
+                           unsigned int stencilState, unsigned int stencilRef, unsigned int stencilMask,
+                           const float modelView[16], const float textureMatrix0[16],
+                           const float textureMatrix1[16]);
+  bool (*queueClientIndexedDraw)(void *drawUserData, const void *vertices, unsigned int vertexCount,
+                                 const unsigned short *indices, unsigned int indexCount,
+                                 int vertexFormat, int topology, unsigned int renderState, int cullMode,
+                                 int textureId, int textureId1, int textureStage0ColorOp,
+                                 int textureStage0AlphaOp, int textureStage1ColorOp,
+                                 int textureStage1AlphaOp, unsigned int textureStage0ColorArg,
+                                 unsigned int textureStage0AlphaArg, unsigned int textureStage0Constant,
+                                 unsigned int textureStage1ColorArg, unsigned int textureStage1AlphaArg,
+                                 unsigned int textureStage1Constant, unsigned int stencilState,
+                                 unsigned int stencilRef, unsigned int stencilMask, const float modelView[16],
+                                 const float textureMatrix0[16], const float textureMatrix1[16]);
+  void (*requirePanelFallback)(void *drawUserData);
+  bool (*mirrorRgbaTexture)(void *drawUserData, int textureId, unsigned int width,
+                            unsigned int height, const unsigned char *rgbaPixels,
+                            bool clampU, bool clampV, bool dynamicTexture, bool noMipmaps,
+                            int filterMode);
+  bool (*mirrorRgbaTextureRegion)(void *drawUserData, int textureId, unsigned int x,
+                                  unsigned int y, unsigned int width, unsigned int height,
+                                  const unsigned char *rgbaPixels);
+  void (*releaseMirroredTexture)(void *drawUserData, int textureId);
+  SVulkanBufferCallbacks() : userData(NULL), createBuffer(NULL), uploadBuffer(NULL), destroyBuffer(NULL),
+                             drawUserData(NULL), queueIndexedDraw(NULL), queueClientIndexedDraw(NULL),
+                             requirePanelFallback(NULL), mirrorRgbaTexture(NULL),
+                             mirrorRgbaTextureRegion(NULL),
+                             releaseMirroredTexture(NULL) {}
+};
+
 union UHWBuf
 {
   void *m_pPtr;
@@ -459,12 +522,15 @@ struct SVertexStream
   bool m_bDynamic;
   int m_nBufOffset;
   struct SVertPool *m_pPool;
+  // Optional source mirror for a second graphics backend; enabled only in VR.
+  void *m_VulkanBufferHandle;
   SVertexStream()
   {
     Reset();
     m_bDynamic = false;
     m_nBufOffset = 0;
     m_pPool = NULL;
+    m_VulkanBufferHandle = NULL;
   }
 
   void Reset()
@@ -473,6 +539,7 @@ struct SVertexStream
     m_VertBuf.m_pPtr = NULL;
     m_nItems = 0;
     m_bLocked = false;
+    m_VulkanBufferHandle = NULL;
   }
 };
 
@@ -1118,6 +1185,7 @@ struct IRenderer//: public IRendererCallbackServer
   virtual bool DestroyRenderTarget (int nHandle)=0;
   virtual bool SetRenderTarget (int nHandle)=0;
   virtual float EF_GetWaterZElevation(float fX, float fY)=0;
+  virtual void SetVulkanBufferCallbacks(const SVulkanBufferCallbacks& callbacks) { (void)callbacks; }
 };
 
 

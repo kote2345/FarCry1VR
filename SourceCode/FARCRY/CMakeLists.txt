@@ -20,7 +20,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 if (ANDROID)
-    target_link_libraries(${PROJECT_NAME} SDL3 dl log)
+    target_link_libraries(${PROJECT_NAME} SDL3::SDL3 dl log)
 else()
-    target_link_libraries(${PROJECT_NAME} SDL3 dl)
+    target_link_libraries(${PROJECT_NAME} SDL3::SDL3 dl)
 endif()

@@ -23,12 +23,18 @@
 #include <IPhysics.h>
 #include "Timer.h"
 #include <CryVersion.h>
+#include <vector>
 
 #include "FrameProfileSystem.h"
 #include "StreamEngine.h"
 #include "MTSafeAllocator.h"
 #include "CPUDetect.h"
 #include "PakVars.h"
+#include <CryVR.h>
+#include <VulkanContext.h>
+#include <VulkanFrameRenderer.h>
+#include <VulkanResourceManager.h>
+#include <VulkanShaderLibrary.h>
 
 #include "DownloadManager.h"
 
@@ -135,6 +141,11 @@ public:
 	CLUADbg					*GetLuaDebugger() { return m_pLuaDebugger; }
 	IValidator			*GetIValidator() { return m_pValidator; };
 	IFrameProfileSystem* GetIProfileSystem() { return &m_FrameProfileSystem; }
+	CryVR::Runtime* GetVRRuntime() { return &m_vrRuntime; }
+	CryVR::VulkanContext* GetVulkanContext() { return &m_vulkanContext; }
+	CryVR::VulkanFrameRenderer* GetVulkanFrameRenderer() { return &m_vulkanFrameRenderer; }
+	CryVR::VulkanResourceManager* GetVulkanResources() { return &m_vulkanResources; }
+	CryVR::VulkanShaderLibrary* GetVulkanShaders() { return &m_vulkanShaders; }
 	const char			*GetGameMOD() { if (m_szGameMOD[0]) return (m_szGameMOD);return (NULL); }
 
 	XDOM::IXMLDOMDocument *CreateXMLDocument();
@@ -323,6 +334,12 @@ private: // ------------------------------------------------------
 	//! Input system
 	//! @see CRenderer
 	IRenderer		*m_pRenderer;
+	CryVR::Runtime		m_vrRuntime;
+	CryVR::VulkanContext	m_vulkanContext;
+	CryVR::VulkanFrameRenderer	m_vulkanFrameRenderer;
+	CryVR::VulkanResourceManager	m_vulkanResources;
+	CryVR::VulkanShaderLibrary	m_vulkanShaders;
+	std::vector<unsigned char>		m_vrFrameCaptureBuffer;
 
   //! CPU features
   CCpuFeatures *m_pCpu;

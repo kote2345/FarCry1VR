@@ -13,6 +13,15 @@
 #include "RenderPCH.h"
 #include "GL_Renderer.h"
 
+static unsigned int PackTextureEnvironmentColor(int stage)
+{
+  const UCol& color = CGLTexMan::m_TUState[stage].m_Color;
+  return static_cast<unsigned int>(color.bcolor[0]) |
+      (static_cast<unsigned int>(color.bcolor[1]) << 8) |
+      (static_cast<unsigned int>(color.bcolor[2]) << 16) |
+      (static_cast<unsigned int>(color.bcolor[3]) << 24);
+}
+
 void *CVertexBuffer::GetStream(int nStream, int *nOffs)
 {
   if (nOffs)
@@ -49,6 +58,51 @@ void *CGLRenderer::GetDynVBPtr(int nVerts, int &nOffs, int Pool)
 
 void CGLRenderer::DrawDynVB(int nOffs, int Pool, int nVerts)
 {
+  if ((m_RP.m_FlagsPerFlush & RBSI_DRAWAS2D) && m_vulkanBufferCallbacks.requirePanelFallback)
+    m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+  if (!(m_RP.m_FlagsPerFlush & RBSI_DRAWAS2D) &&
+      m_vulkanBufferCallbacks.queueClientIndexedDraw && nVerts > 0 && nVerts <= 65535)
+  {
+    struct_VERTEX_FORMAT_P3F_COL4UB_TEX2F *pVB = m_DynVB;
+    if (m_TempDynVB)
+      pVB = m_TempDynVB;
+    if (pVB)
+    {
+      float modelView[16];
+      float textureMatrix0[16];
+      float textureMatrix1[16];
+      glGetFloatv(GL_MODELVIEW_MATRIX, modelView);
+      GLint previousMatrixMode = GL_MODELVIEW;
+      GLint previousActiveTexture = GL_TEXTURE0_ARB;
+      glGetIntegerv(GL_MATRIX_MODE, &previousMatrixMode);
+      glGetIntegerv(GL_ACTIVE_TEXTURE_ARB, &previousActiveTexture);
+      glActiveTextureARB(GL_TEXTURE0_ARB);
+      glMatrixMode(GL_TEXTURE);
+      glGetFloatv(GL_TEXTURE_MATRIX, textureMatrix0);
+      glActiveTextureARB(GL_TEXTURE1_ARB);
+      glGetFloatv(GL_TEXTURE_MATRIX, textureMatrix1);
+      glMatrixMode(static_cast<GLenum>(previousMatrixMode));
+      glActiveTextureARB(static_cast<GLenum>(previousActiveTexture));
+      m_vulkanBufferCallbacks.queueClientIndexedDraw(m_vulkanBufferCallbacks.drawUserData,
+          pVB, static_cast<unsigned int>(nVerts), NULL, 0,
+          VERTEX_FORMAT_P3F_COL4UB_TEX2F, 0, static_cast<unsigned int>(m_CurState),
+          m_RP.m_eCull == eCULL_None ? R_CULL_NONE :
+          m_RP.m_eCull == eCULL_Front ? R_CULL_FRONT : R_CULL_BACK,
+          CGLTexMan::m_TUState[0].m_Bind, CGLTexMan::m_TUState[1].m_Bind,
+          m_eCurColorOp[0] != 255 ? m_eCurColorOp[0] : m_RP.m_TexStages[0].m_CO,
+          m_eCurAlphaOp[0] != 255 ? m_eCurAlphaOp[0] : m_RP.m_TexStages[0].m_AO,
+          m_eCurColorOp[1] != 255 ? m_eCurColorOp[1] : m_RP.m_TexStages[1].m_CO,
+          m_eCurAlphaOp[1] != 255 ? m_eCurAlphaOp[1] : m_RP.m_TexStages[1].m_AO,
+          m_eCurColorArg[0] != 255 ? m_eCurColorArg[0] : m_RP.m_TexStages[0].m_CA,
+          m_eCurAlphaArg[0] != 255 ? m_eCurAlphaArg[0] : m_RP.m_TexStages[0].m_AA,
+          PackTextureEnvironmentColor(0),
+          m_eCurColorArg[1] != 255 ? m_eCurColorArg[1] : m_RP.m_TexStages[1].m_CA,
+          m_eCurAlphaArg[1] != 255 ? m_eCurAlphaArg[1] : m_RP.m_TexStages[1].m_AA,
+          PackTextureEnvironmentColor(1),
+          static_cast<unsigned int>(m_CurStencilState), m_CurStencRef, m_CurStencMask,
+          modelView, textureMatrix0, textureMatrix1);
+    }
+  }
   if (!m_DynVBId)
   {
     int size = sizeof(struct_VERTEX_FORMAT_P3F_COL4UB_TEX2F)*2048;
@@ -158,6 +212,45 @@ void CGLRenderer::DrawDynVB(int nOffs, int Pool, int nVerts)
 
 void CGLRenderer::DrawDynVB(struct_VERTEX_FORMAT_P3F_COL4UB_TEX2F *pBuf, ushort *pInds, int nVerts, int nInds, int nPrimType)
 {
+  if ((m_RP.m_FlagsPerFlush & RBSI_DRAWAS2D) && m_vulkanBufferCallbacks.requirePanelFallback)
+    m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+  if (!(m_RP.m_FlagsPerFlush & RBSI_DRAWAS2D) &&
+      m_vulkanBufferCallbacks.queueClientIndexedDraw && pBuf && pInds && nVerts > 0 && nInds > 0)
+  {
+    float modelView[16];
+    float textureMatrix0[16];
+    float textureMatrix1[16];
+    glGetFloatv(GL_MODELVIEW_MATRIX, modelView);
+    GLint previousMatrixMode = GL_MODELVIEW;
+    GLint previousActiveTexture = GL_TEXTURE0_ARB;
+    glGetIntegerv(GL_MATRIX_MODE, &previousMatrixMode);
+    glGetIntegerv(GL_ACTIVE_TEXTURE_ARB, &previousActiveTexture);
+    glActiveTextureARB(GL_TEXTURE0_ARB);
+    glMatrixMode(GL_TEXTURE);
+    glGetFloatv(GL_TEXTURE_MATRIX, textureMatrix0);
+    glActiveTextureARB(GL_TEXTURE1_ARB);
+    glGetFloatv(GL_TEXTURE_MATRIX, textureMatrix1);
+    glMatrixMode(static_cast<GLenum>(previousMatrixMode));
+    glActiveTextureARB(static_cast<GLenum>(previousActiveTexture));
+    m_vulkanBufferCallbacks.queueClientIndexedDraw(m_vulkanBufferCallbacks.drawUserData,
+        pBuf, static_cast<unsigned int>(nVerts), pInds, static_cast<unsigned int>(nInds),
+        VERTEX_FORMAT_P3F_COL4UB_TEX2F, 0, static_cast<unsigned int>(m_CurState),
+        m_RP.m_eCull == eCULL_None ? R_CULL_NONE :
+        m_RP.m_eCull == eCULL_Front ? R_CULL_FRONT : R_CULL_BACK,
+        CGLTexMan::m_TUState[0].m_Bind, CGLTexMan::m_TUState[1].m_Bind,
+        m_eCurColorOp[0] != 255 ? m_eCurColorOp[0] : m_RP.m_TexStages[0].m_CO,
+        m_eCurAlphaOp[0] != 255 ? m_eCurAlphaOp[0] : m_RP.m_TexStages[0].m_AO,
+        m_eCurColorOp[1] != 255 ? m_eCurColorOp[1] : m_RP.m_TexStages[1].m_CO,
+        m_eCurAlphaOp[1] != 255 ? m_eCurAlphaOp[1] : m_RP.m_TexStages[1].m_AO,
+        m_eCurColorArg[0] != 255 ? m_eCurColorArg[0] : m_RP.m_TexStages[0].m_CA,
+        m_eCurAlphaArg[0] != 255 ? m_eCurAlphaArg[0] : m_RP.m_TexStages[0].m_AA,
+        PackTextureEnvironmentColor(0),
+        m_eCurColorArg[1] != 255 ? m_eCurColorArg[1] : m_RP.m_TexStages[1].m_CA,
+        m_eCurAlphaArg[1] != 255 ? m_eCurAlphaArg[1] : m_RP.m_TexStages[1].m_AA,
+        PackTextureEnvironmentColor(1),
+        static_cast<unsigned int>(m_CurStencilState), m_CurStencRef, m_CurStencMask,
+        modelView, textureMatrix0, textureMatrix1);
+  }
   if (!m_DynVBId)
   {
     int size = sizeof(struct_VERTEX_FORMAT_P3F_COL4UB_TEX2F)*4096;
@@ -249,6 +342,14 @@ void CGLRenderer::CreateBuffer(int size, int vertexformat, CVertexBuffer *buf, i
   PROFILE_FRAME(Mesh_CreateVBuffers);
 
   assert(Type >= 0 && Type < VSF_NUM);
+  if (size > 0 && m_vulkanBufferCallbacks.createBuffer)
+  {
+    SVertexStream& stream = buf->m_VS[Type];
+    if (stream.m_VulkanBufferHandle && m_vulkanBufferCallbacks.destroyBuffer)
+      m_vulkanBufferCallbacks.destroyBuffer(m_vulkanBufferCallbacks.userData, stream.m_VulkanBufferHandle);
+    stream.m_VulkanBufferHandle = m_vulkanBufferCallbacks.createBuffer(
+        m_vulkanBufferCallbacks.userData, static_cast<unsigned int>(size), false);
+  }
 
   void *data;
   if(IsVarPresent())
@@ -299,6 +400,14 @@ void CGLRenderer::CreateIndexBuffer(SVertexStream *dest,const void *src,int inde
   ReleaseIndexBuffer(dest);
   if (indexcount)
   {
+    const unsigned int indexBytes = static_cast<unsigned int>(indexcount * sizeof(ushort));
+    if (m_vulkanBufferCallbacks.createBuffer)
+    {
+      if (dest->m_VulkanBufferHandle && m_vulkanBufferCallbacks.destroyBuffer)
+        m_vulkanBufferCallbacks.destroyBuffer(m_vulkanBufferCallbacks.userData, dest->m_VulkanBufferHandle);
+      dest->m_VulkanBufferHandle = m_vulkanBufferCallbacks.createBuffer(
+          m_vulkanBufferCallbacks.userData, indexBytes, true);
+    }
     if (SUPPORTS_GL_ARB_vertex_buffer_object)
     {
       glGenBuffersARB(1, &dest->m_VertBuf.m_nID);
@@ -326,6 +435,10 @@ void CGLRenderer::UpdateIndexBuffer(SVertexStream *dest,const void *src,int inde
       CreateIndexBuffer(dest, NULL, indexcount);
     }
     int size = indexcount*sizeof(ushort);
+    if (dest->m_VulkanBufferHandle && m_vulkanBufferCallbacks.uploadBuffer)
+      m_vulkanBufferCallbacks.uploadBuffer(m_vulkanBufferCallbacks.userData,
+                                           dest->m_VulkanBufferHandle, src,
+                                           static_cast<unsigned int>(size), 0);
     if (SUPPORTS_GL_ARB_vertex_buffer_object)
     {
       glBindBufferARB(GL_ELEMENT_ARRAY_BUFFER_ARB, dest->m_VertBuf.m_nID);
@@ -351,6 +464,9 @@ void CGLRenderer::UpdateIndexBuffer(SVertexStream *dest,const void *src,int inde
 
 void CGLRenderer::ReleaseIndexBuffer(SVertexStream *dest)
 {
+  if (dest->m_VulkanBufferHandle && m_vulkanBufferCallbacks.destroyBuffer)
+    m_vulkanBufferCallbacks.destroyBuffer(m_vulkanBufferCallbacks.userData, dest->m_VulkanBufferHandle);
+  dest->m_VulkanBufferHandle = NULL;
   if (SUPPORTS_GL_ARB_vertex_buffer_object)
   {
     if (dest->m_VertBuf.m_nID)
@@ -371,6 +487,9 @@ CVertexBuffer *CGLRenderer::CreateBuffer(int vertexcount,int vertexformat, const
   vtemp->m_bDynamic = bDynamic;
 
   int size = m_VertexSize[vertexformat]*vertexcount;
+  if (size > 0 && m_vulkanBufferCallbacks.createBuffer)
+    vtemp->m_VS[VSF_GENERAL].m_VulkanBufferHandle = m_vulkanBufferCallbacks.createBuffer(
+        m_vulkanBufferCallbacks.userData, static_cast<unsigned int>(size), false);
   if(IsVarPresent())
   {
     vtemp->m_VS[VSF_GENERAL].m_VData = AllocateVarShunk(size, szSource);
@@ -524,6 +643,18 @@ void CGLRenderer::UpdateBuffer(CVertexBuffer *dest,const void *src,int vertexcou
         return;
       }
 
+      if (Type >= 0 && Type < VSF_NUM && dest->m_VS[Type].m_VulkanBufferHandle &&
+          m_vulkanBufferCallbacks.uploadBuffer)
+      {
+        const size_t stride = Type == VSF_TANGENTS ? sizeof(SPipTangents) :
+                              static_cast<size_t>(m_VertexSize[dest->m_vertexformat]);
+        const size_t shadowOffset = stride * static_cast<size_t>(offs);
+        const size_t shadowBytes = stride * static_cast<size_t>(vertexcount);
+        m_vulkanBufferCallbacks.uploadBuffer(m_vulkanBufferCallbacks.userData,
+            dest->m_VS[Type].m_VulkanBufferHandle, src,
+            static_cast<unsigned int>(shadowBytes), static_cast<unsigned int>(shadowOffset));
+      }
+
       if (SUPPORTS_GL_ARB_vertex_buffer_object && dest->m_VS[Type].m_VertBuf.m_nID)
       {
         uint IdBuf = dest->m_VS[Type].m_VertBuf.m_nID;
@@ -570,10 +701,66 @@ void CGLRenderer::UpdateBuffer(CVertexBuffer *dest,const void *src,int vertexcou
 
 #include "../Common/NvTriStrip/NvTriStrip.h"
 
+bool CGLRenderer::QueueVulkanCurrentClientIndexedDraw(const void *vertices, unsigned int vertexCount,
+                                                       const unsigned short *indices,
+                                                       unsigned int indexCount, int topology)
+{
+  if (!m_vulkanBufferCallbacks.queueClientIndexedDraw)
+    return false;
+  if ((m_RP.m_FlagsPerFlush & RBSI_DRAWAS2D) || !vertices || !vertexCount || !indices || !indexCount)
+  {
+    if (m_vulkanBufferCallbacks.requirePanelFallback)
+      m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+    return false;
+  }
+
+  float modelView[16];
+  float textureMatrix0[16];
+  float textureMatrix1[16];
+  glGetFloatv(GL_MODELVIEW_MATRIX, modelView);
+  GLint previousMatrixMode = GL_MODELVIEW;
+  GLint previousActiveTexture = GL_TEXTURE0_ARB;
+  glGetIntegerv(GL_MATRIX_MODE, &previousMatrixMode);
+  glGetIntegerv(GL_ACTIVE_TEXTURE_ARB, &previousActiveTexture);
+  glActiveTextureARB(GL_TEXTURE0_ARB);
+  glMatrixMode(GL_TEXTURE);
+  glGetFloatv(GL_TEXTURE_MATRIX, textureMatrix0);
+  glActiveTextureARB(GL_TEXTURE1_ARB);
+  glGetFloatv(GL_TEXTURE_MATRIX, textureMatrix1);
+  glMatrixMode(static_cast<GLenum>(previousMatrixMode));
+  glActiveTextureARB(static_cast<GLenum>(previousActiveTexture));
+
+  const bool queued = m_vulkanBufferCallbacks.queueClientIndexedDraw(
+      m_vulkanBufferCallbacks.drawUserData, vertices, vertexCount, indices, indexCount,
+      m_RP.m_CurVFormat, topology,
+      static_cast<unsigned int>(m_CurState),
+      m_RP.m_eCull == eCULL_None ? R_CULL_NONE :
+      m_RP.m_eCull == eCULL_Front ? R_CULL_FRONT : R_CULL_BACK,
+      CGLTexMan::m_TUState[0].m_Bind, CGLTexMan::m_TUState[1].m_Bind,
+      m_eCurColorOp[0] != 255 ? m_eCurColorOp[0] : m_RP.m_TexStages[0].m_CO,
+      m_eCurAlphaOp[0] != 255 ? m_eCurAlphaOp[0] : m_RP.m_TexStages[0].m_AO,
+      m_eCurColorOp[1] != 255 ? m_eCurColorOp[1] : m_RP.m_TexStages[1].m_CO,
+      m_eCurAlphaOp[1] != 255 ? m_eCurAlphaOp[1] : m_RP.m_TexStages[1].m_AO,
+      m_eCurColorArg[0] != 255 ? m_eCurColorArg[0] : m_RP.m_TexStages[0].m_CA,
+      m_eCurAlphaArg[0] != 255 ? m_eCurAlphaArg[0] : m_RP.m_TexStages[0].m_AA,
+      PackTextureEnvironmentColor(0),
+      m_eCurColorArg[1] != 255 ? m_eCurColorArg[1] : m_RP.m_TexStages[1].m_CA,
+      m_eCurAlphaArg[1] != 255 ? m_eCurAlphaArg[1] : m_RP.m_TexStages[1].m_AA,
+      PackTextureEnvironmentColor(1),
+      static_cast<unsigned int>(m_CurStencilState), m_CurStencRef, m_CurStencMask,
+      modelView, textureMatrix0, textureMatrix1);
+  if (!queued && m_vulkanBufferCallbacks.requirePanelFallback)
+    m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+  return queued;
+}
+
 ///////////////////////////////////////////
 void CGLRenderer::DrawBuffer(CVertexBuffer * src, SVertexStream *indicies,int numindices, int offsindex, int prmode,int vert_start,int vert_num, CMatInfo *mi)
 {
   PROFILE_FRAME(Draw_IndexMesh);
+
+  if ((m_RP.m_FlagsPerFlush & RBSI_DRAWAS2D) && m_vulkanBufferCallbacks.requirePanelFallback)
+    m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
 
   if (!numindices && !mi)
     return;
@@ -604,11 +791,153 @@ void CGLRenderer::DrawBuffer(CVertexBuffer * src, SVertexStream *indicies,int nu
 	if(!src || src->m_vertexformat<0 || src->m_vertexformat>=VERTEX_FORMAT_NUMS)
 	{
 		iLog->Log("Error: CGLRenderer::DrawBuffer: VertexBuffer is NULL (!src || src->m_vertexformat<0 || src->m_vertexformat>5)");
+		if (!(m_RP.m_FlagsPerFlush & RBSI_DRAWAS2D) &&
+		    m_vulkanBufferCallbacks.queueIndexedDraw &&
+		    m_vulkanBufferCallbacks.requirePanelFallback)
+			m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
 		return;
 	}
   
-  assert(numindices>0);
+	assert(numindices>0);
   SBufInfoTable *pOffs = &gBufInfoTable[src->m_vertexformat];
+
+  if (!(m_RP.m_FlagsPerFlush & RBSI_DRAWAS2D) &&
+      m_vulkanBufferCallbacks.queueIndexedDraw && indicies &&
+      src->m_VS[VSF_GENERAL].m_VulkanBufferHandle && indicies->m_VulkanBufferHandle)
+  {
+    float modelView[16];
+    float textureMatrix0[16];
+    float textureMatrix1[16];
+    glGetFloatv(GL_MODELVIEW_MATRIX, modelView);
+    GLint previousMatrixMode = GL_MODELVIEW;
+    GLint previousActiveTexture = GL_TEXTURE0_ARB;
+    glGetIntegerv(GL_MATRIX_MODE, &previousMatrixMode);
+    glGetIntegerv(GL_ACTIVE_TEXTURE_ARB, &previousActiveTexture);
+    glActiveTextureARB(GL_TEXTURE0_ARB);
+    glMatrixMode(GL_TEXTURE);
+    glGetFloatv(GL_TEXTURE_MATRIX, textureMatrix0);
+    glActiveTextureARB(GL_TEXTURE1_ARB);
+    glGetFloatv(GL_TEXTURE_MATRIX, textureMatrix1);
+    glMatrixMode(static_cast<GLenum>(previousMatrixMode));
+    glActiveTextureARB(static_cast<GLenum>(previousActiveTexture));
+    if (prmode == R_PRIMV_TRIANGLES || prmode == R_PRIMV_TRIANGLE_STRIP ||
+        prmode == R_PRIMV_TRIANGLE_FAN)
+    {
+      const int vulkanTopology = prmode == R_PRIMV_TRIANGLES ? 0 :
+                                 prmode == R_PRIMV_TRIANGLE_STRIP ? 1 : 2;
+      const bool queued = m_vulkanBufferCallbacks.queueIndexedDraw(m_vulkanBufferCallbacks.drawUserData,
+          src->m_VS[VSF_GENERAL].m_VulkanBufferHandle,
+          src->m_VS[VSF_TANGENTS].m_VulkanBufferHandle, indicies->m_VulkanBufferHandle,
+          src->m_vertexformat, static_cast<unsigned int>(numindices),
+          static_cast<unsigned int>(offsindex), vulkanTopology, static_cast<unsigned int>(m_CurState),
+          m_RP.m_eCull == eCULL_None ? R_CULL_NONE :
+          m_RP.m_eCull == eCULL_Front ? R_CULL_FRONT : R_CULL_BACK,
+          CGLTexMan::m_TUState[0].m_Bind, CGLTexMan::m_TUState[1].m_Bind,
+          m_eCurColorOp[0] != 255 ? m_eCurColorOp[0] : m_RP.m_TexStages[0].m_CO,
+          m_eCurAlphaOp[0] != 255 ? m_eCurAlphaOp[0] : m_RP.m_TexStages[0].m_AO,
+          m_eCurColorOp[1] != 255 ? m_eCurColorOp[1] : m_RP.m_TexStages[1].m_CO,
+          m_eCurAlphaOp[1] != 255 ? m_eCurAlphaOp[1] : m_RP.m_TexStages[1].m_AO,
+          m_eCurColorArg[0] != 255 ? m_eCurColorArg[0] : m_RP.m_TexStages[0].m_CA,
+          m_eCurAlphaArg[0] != 255 ? m_eCurAlphaArg[0] : m_RP.m_TexStages[0].m_AA,
+          PackTextureEnvironmentColor(0),
+          m_eCurColorArg[1] != 255 ? m_eCurColorArg[1] : m_RP.m_TexStages[1].m_CA,
+          m_eCurAlphaArg[1] != 255 ? m_eCurAlphaArg[1] : m_RP.m_TexStages[1].m_AA,
+          PackTextureEnvironmentColor(1),
+          static_cast<unsigned int>(m_CurStencilState), m_CurStencRef, m_CurStencMask,
+          modelView, textureMatrix0, textureMatrix1);
+      if (!queued && m_vulkanBufferCallbacks.requirePanelFallback)
+        m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+    }
+    else if (prmode == R_PRIMV_MULTI_STRIPS && m_RP.m_pRE)
+    {
+      list2<CMatInfo> *mats = m_RP.m_pRE->mfGetMatInfoList();
+      if (mats)
+      {
+        CMatInfo *mat = mats->Get(0);
+        bool sawStrip = false;
+        bool queuedAllStrips = true;
+        for (int stripIndex = 0; stripIndex < mats->Count(); ++stripIndex, ++mat)
+        {
+          if (mat->nNumIndices <= 0)
+            continue;
+          sawStrip = true;
+          const bool queued = m_vulkanBufferCallbacks.queueIndexedDraw(m_vulkanBufferCallbacks.drawUserData,
+              src->m_VS[VSF_GENERAL].m_VulkanBufferHandle,
+              src->m_VS[VSF_TANGENTS].m_VulkanBufferHandle, indicies->m_VulkanBufferHandle,
+              src->m_vertexformat, static_cast<unsigned int>(mat->nNumIndices),
+              static_cast<unsigned int>(offsindex + mat->nFirstIndexId), 1,
+              static_cast<unsigned int>(m_CurState),
+              m_RP.m_eCull == eCULL_None ? R_CULL_NONE :
+              m_RP.m_eCull == eCULL_Front ? R_CULL_FRONT : R_CULL_BACK,
+              CGLTexMan::m_TUState[0].m_Bind, CGLTexMan::m_TUState[1].m_Bind,
+              m_eCurColorOp[0] != 255 ? m_eCurColorOp[0] : m_RP.m_TexStages[0].m_CO,
+              m_eCurAlphaOp[0] != 255 ? m_eCurAlphaOp[0] : m_RP.m_TexStages[0].m_AO,
+              m_eCurColorOp[1] != 255 ? m_eCurColorOp[1] : m_RP.m_TexStages[1].m_CO,
+              m_eCurAlphaOp[1] != 255 ? m_eCurAlphaOp[1] : m_RP.m_TexStages[1].m_AO,
+              m_eCurColorArg[0] != 255 ? m_eCurColorArg[0] : m_RP.m_TexStages[0].m_CA,
+              m_eCurAlphaArg[0] != 255 ? m_eCurAlphaArg[0] : m_RP.m_TexStages[0].m_AA,
+              PackTextureEnvironmentColor(0),
+              m_eCurColorArg[1] != 255 ? m_eCurColorArg[1] : m_RP.m_TexStages[1].m_CA,
+              m_eCurAlphaArg[1] != 255 ? m_eCurAlphaArg[1] : m_RP.m_TexStages[1].m_AA,
+              PackTextureEnvironmentColor(1),
+              static_cast<unsigned int>(m_CurStencilState), m_CurStencRef, m_CurStencMask,
+              modelView, textureMatrix0, textureMatrix1);
+          queuedAllStrips = queuedAllStrips && queued;
+        }
+        if ((!sawStrip || !queuedAllStrips) && m_vulkanBufferCallbacks.requirePanelFallback)
+          m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+      }
+      else if (m_vulkanBufferCallbacks.requirePanelFallback)
+        m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+    }
+    else if (prmode == R_PRIMV_MULTI_GROUPS && mi && mi->m_pPrimitiveGroups)
+    {
+      for (int groupIndex = 0; groupIndex < mi->m_dwNumSections; ++groupIndex)
+      {
+        const SPrimitiveGroup& group = mi->m_pPrimitiveGroups[groupIndex];
+        int topology = group.type == PT_LIST ? 0 : group.type == PT_STRIP ? 1 :
+                       group.type == PT_FAN ? 2 : -1;
+        if (topology >= 0 && group.numIndices > 0)
+        {
+          const bool queued = m_vulkanBufferCallbacks.queueIndexedDraw(m_vulkanBufferCallbacks.drawUserData,
+              src->m_VS[VSF_GENERAL].m_VulkanBufferHandle,
+              src->m_VS[VSF_TANGENTS].m_VulkanBufferHandle, indicies->m_VulkanBufferHandle,
+              src->m_vertexformat, static_cast<unsigned int>(group.numIndices),
+              static_cast<unsigned int>(offsindex + group.offsIndex), topology,
+              static_cast<unsigned int>(m_CurState),
+              m_RP.m_eCull == eCULL_None ? R_CULL_NONE :
+              m_RP.m_eCull == eCULL_Front ? R_CULL_FRONT : R_CULL_BACK,
+              CGLTexMan::m_TUState[0].m_Bind, CGLTexMan::m_TUState[1].m_Bind,
+              m_eCurColorOp[0] != 255 ? m_eCurColorOp[0] : m_RP.m_TexStages[0].m_CO,
+              m_eCurAlphaOp[0] != 255 ? m_eCurAlphaOp[0] : m_RP.m_TexStages[0].m_AO,
+              m_eCurColorOp[1] != 255 ? m_eCurColorOp[1] : m_RP.m_TexStages[1].m_CO,
+              m_eCurAlphaOp[1] != 255 ? m_eCurAlphaOp[1] : m_RP.m_TexStages[1].m_AO,
+              m_eCurColorArg[0] != 255 ? m_eCurColorArg[0] : m_RP.m_TexStages[0].m_CA,
+              m_eCurAlphaArg[0] != 255 ? m_eCurAlphaArg[0] : m_RP.m_TexStages[0].m_AA,
+              PackTextureEnvironmentColor(0),
+              m_eCurColorArg[1] != 255 ? m_eCurColorArg[1] : m_RP.m_TexStages[1].m_CA,
+              m_eCurAlphaArg[1] != 255 ? m_eCurAlphaArg[1] : m_RP.m_TexStages[1].m_AA,
+              PackTextureEnvironmentColor(1),
+              static_cast<unsigned int>(m_CurStencilState), m_CurStencRef, m_CurStencMask,
+              modelView, textureMatrix0, textureMatrix1);
+          if (!queued && m_vulkanBufferCallbacks.requirePanelFallback)
+            m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+        }
+        else if (m_vulkanBufferCallbacks.requirePanelFallback)
+          m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+      }
+    }
+    else if (m_vulkanBufferCallbacks.requirePanelFallback)
+      m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+  }
+  else if (!(m_RP.m_FlagsPerFlush & RBSI_DRAWAS2D) &&
+           m_vulkanBufferCallbacks.queueIndexedDraw &&
+           m_vulkanBufferCallbacks.requirePanelFallback)
+  {
+    // No Vulkan mirror or no indexed-buffer path: preserve the complete GL
+    // frame in the VR panel instead of presenting a partial native scene.
+    m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+  }
 
   switch(src->m_vertexformat)
   {
@@ -801,6 +1130,19 @@ void CGLRenderer::DrawBuffer(CVertexBuffer * src, SVertexStream *indicies,int nu
       }
       break;
 
+    case R_PRIMV_TRIANGLE_FAN:
+      {
+        glDrawElements(GL_TRIANGLE_FAN,numindices,GL_UNSIGNED_SHORT,pInds);
+        m_nPolygons+=numindices-2;
+      }
+      break;
+
+    case R_PRIMV_MULTI_STRIPS:
+      // DrawBuffer is called per render chunk, so this index range is one strip.
+      glDrawElements(GL_TRIANGLE_STRIP,numindices,GL_UNSIGNED_SHORT,pInds);
+      m_nPolygons+=numindices-2;
+      break;
+
     case R_PRIMV_MULTI_GROUPS:
       {
         if (mi)
@@ -896,6 +1238,16 @@ void CGLRenderer::ReleaseBuffer(CVertexBuffer *bufptr)
   m_nFrameCreateBuf++;
   if (bufptr)
   {
+    if (m_vulkanBufferCallbacks.destroyBuffer)
+    {
+      for (int stream = 0; stream < VSF_NUM; ++stream)
+      {
+        if (bufptr->m_VS[stream].m_VulkanBufferHandle)
+          m_vulkanBufferCallbacks.destroyBuffer(m_vulkanBufferCallbacks.userData,
+                                                 bufptr->m_VS[stream].m_VulkanBufferHandle);
+        bufptr->m_VS[stream].m_VulkanBufferHandle = NULL;
+      }
+    }
     if(IsVarPresent())
     {
       if (bufptr->m_VS[VSF_GENERAL].m_VData)

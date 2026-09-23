@@ -889,6 +889,8 @@ bool CUIVideoFFmpeg::Init(const char* pathToVideo, bool needSound)
 
 		if (m_player->videoStream)
 		{
+			m_videoWidth = codec->width;
+			m_videoHeight = codec->height;
 			m_frameBuffer = new uint8[codec->width * codec->height * 4];
 			memset(m_frameBuffer, 0, codec->width * codec->height * 4);
 			m_textureId = GetISystem()->GetIRenderer()->DownLoadToVideoMemory(m_frameBuffer, codec->width, codec->height, eTF_0888, eTF_0888, 0, 0, FILTER_LINEAR, 0, nullptr, FT_DYNAMIC);
@@ -925,6 +927,8 @@ void CUIVideoFFmpeg::Terminate()
 	}
 	m_audioStream = nullptr;
 	SAFE_DELETE(m_audioSrc);
+	m_videoWidth = 0;
+	m_videoHeight = 0;
 
 	if (m_textureId > -1)
 	{
@@ -1049,20 +1053,10 @@ int CUIVideoFFmpeg::GetTextureId() const
 
 int	CUIVideoFFmpeg::GetWidth() const
 {
-	if (!m_player)
-		return 1;
-	MoviePlayerData::VideoState& videoState = m_player->videoState;
-	if (!videoState.presentFrame)
-		return 1;
-	return videoState.presentFrame->width;
+	return m_videoWidth > 0 ? m_videoWidth : 1;
 }
 
 int	CUIVideoFFmpeg::GetHeight() const
 {
-	if (!m_player)
-		return 1;
-	MoviePlayerData::VideoState& videoState = m_player->videoState;
-	if (!videoState.presentFrame)
-		return 1;
-	return videoState.presentFrame->height;
+	return m_videoHeight > 0 ? m_videoHeight : 1;
 }

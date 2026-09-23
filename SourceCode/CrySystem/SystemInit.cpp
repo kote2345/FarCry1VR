@@ -35,6 +35,7 @@
 #include <ILog.h>
 #include <ISound.h>
 #include <IGame.h>
+#include <new>
 
 #include "CryPak.h"
 #include "XConsole.h"
@@ -45,11 +46,141 @@
 #include "DataProbe.h"
 #include "ApplicationHelper.h"				// CApplicationHelper
 
-#if defined(USE_SDL)
+#if defined(USE_SDL) || defined(__ANDROID__)
 #include <SDL3/SDL.h>
+#if defined(__ANDROID__)
+#include <SDL3/SDL_system.h>
+#endif
 #endif
 
 #define  PROFILE_WITH_VTUNE
+
+namespace
+{
+void* CreateVulkanMirrorBuffer(void* userData, unsigned int size, bool indexBuffer)
+{
+    CryVR::VulkanResourceManager* resources = static_cast<CryVR::VulkanResourceManager*>(userData);
+    if (!resources || !resources->IsInitialized() || size == 0)
+        return nullptr;
+    CryVR::VulkanBuffer* buffer = new (std::nothrow) CryVR::VulkanBuffer();
+    if (!buffer)
+        return nullptr;
+    const VkBufferUsageFlags usage = indexBuffer ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT :
+                                                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    const VkMemoryPropertyFlags memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (!resources->CreateBuffer(size, usage, memory, *buffer))
+    {
+        delete buffer;
+        return nullptr;
+    }
+    return buffer;
+}
+
+bool UploadVulkanMirrorBuffer(void* userData, void* opaqueBuffer, const void* data,
+                              unsigned int size, unsigned int offset)
+{
+    CryVR::VulkanResourceManager* resources = static_cast<CryVR::VulkanResourceManager*>(userData);
+    CryVR::VulkanBuffer* buffer = static_cast<CryVR::VulkanBuffer*>(opaqueBuffer);
+    return resources && buffer && data &&
+           resources->UploadBuffer(*buffer, data, size, offset);
+}
+
+void DestroyVulkanMirrorBuffer(void* userData, void* opaqueBuffer)
+{
+    CryVR::VulkanResourceManager* resources = static_cast<CryVR::VulkanResourceManager*>(userData);
+    CryVR::VulkanBuffer* buffer = static_cast<CryVR::VulkanBuffer*>(opaqueBuffer);
+    if (resources && buffer)
+        resources->DestroyBuffer(*buffer);
+    delete buffer;
+}
+
+bool QueueVulkanStockDraw(void* drawUserData, void* vertexBuffer, void* tangentBuffer, void* indexBuffer,
+                          int vertexFormat, unsigned int indexCount, unsigned int firstIndex,
+                          int topology, unsigned int renderState, int cullMode, int textureId, int textureId1,
+                          int textureStage0ColorOp, int textureStage0AlphaOp,
+                          int textureStage1ColorOp, int textureStage1AlphaOp,
+                          unsigned int textureStage0ColorArg, unsigned int textureStage0AlphaArg,
+                          unsigned int textureStage0Constant, unsigned int textureStage1ColorArg,
+                          unsigned int textureStage1AlphaArg, unsigned int textureStage1Constant,
+                          unsigned int stencilState, unsigned int stencilRef, unsigned int stencilMask,
+                          const float modelView[16], const float textureMatrix0[16],
+                          const float textureMatrix1[16])
+{
+    CryVR::VulkanFrameRenderer* renderer = static_cast<CryVR::VulkanFrameRenderer*>(drawUserData);
+    const bool queued = renderer && renderer->QueueStockIndexedDraw(
+        static_cast<const CryVR::VulkanBuffer*>(vertexBuffer),
+        static_cast<const CryVR::VulkanBuffer*>(indexBuffer), vertexFormat,
+        indexCount, firstIndex, topology, renderState, cullMode, textureId, textureId1,
+        textureStage0ColorOp, textureStage0AlphaOp,
+        textureStage1ColorOp, textureStage1AlphaOp,
+        textureStage0ColorArg, textureStage0AlphaArg, textureStage0Constant,
+        textureStage1ColorArg, textureStage1AlphaArg, textureStage1Constant,
+        stencilState, stencilRef, stencilMask,
+        modelView, textureMatrix0, textureMatrix1, 0, nullptr, 1.0f, 0.0f,
+        static_cast<const CryVR::VulkanBuffer*>(tangentBuffer));
+    if (renderer && !queued)
+        renderer->RequirePanelFallback();
+    return queued;
+}
+
+bool QueueVulkanClientStockDraw(void* drawUserData, const void* vertices, unsigned int vertexCount,
+                                const unsigned short* indices, unsigned int indexCount,
+                                int vertexFormat, int topology, unsigned int renderState, int cullMode,
+                                int textureId, int textureId1, int textureStage0ColorOp,
+                                int textureStage0AlphaOp, int textureStage1ColorOp,
+                                int textureStage1AlphaOp, unsigned int textureStage0ColorArg,
+                                unsigned int textureStage0AlphaArg, unsigned int textureStage0Constant,
+                                unsigned int textureStage1ColorArg, unsigned int textureStage1AlphaArg,
+                                unsigned int textureStage1Constant, unsigned int stencilState,
+                                unsigned int stencilRef, unsigned int stencilMask, const float modelView[16],
+                                const float textureMatrix0[16], const float textureMatrix1[16])
+{
+    CryVR::VulkanFrameRenderer* renderer = static_cast<CryVR::VulkanFrameRenderer*>(drawUserData);
+    const bool queued = renderer && renderer->QueueStockClientIndexedDraw(vertices, vertexCount, indices, indexCount,
+        vertexFormat, topology, renderState, cullMode, textureId, textureId1,
+        textureStage0ColorOp, textureStage0AlphaOp, textureStage1ColorOp, textureStage1AlphaOp,
+        textureStage0ColorArg, textureStage0AlphaArg, textureStage0Constant,
+        textureStage1ColorArg, textureStage1AlphaArg, textureStage1Constant,
+        stencilState, stencilRef, stencilMask,
+        modelView, textureMatrix0, textureMatrix1);
+    if (renderer && !queued)
+        renderer->RequirePanelFallback();
+    return queued;
+}
+
+void RequireVulkanPanelFallback(void* drawUserData)
+{
+    CryVR::VulkanFrameRenderer* renderer = static_cast<CryVR::VulkanFrameRenderer*>(drawUserData);
+    if (renderer)
+        renderer->RequirePanelFallback();
+}
+
+bool MirrorVulkanRgbaTexture(void* drawUserData, int textureId, unsigned int width,
+                             unsigned int height, const unsigned char* rgbaPixels,
+                             bool clampU, bool clampV, bool dynamicTexture, bool noMipmaps,
+                             int filterMode)
+{
+    CryVR::VulkanFrameRenderer* renderer = static_cast<CryVR::VulkanFrameRenderer*>(drawUserData);
+    return renderer && renderer->RegisterLegacyRgbaTexture(textureId, width, height,
+        rgbaPixels, clampU, clampV, dynamicTexture, noMipmaps, filterMode);
+}
+
+bool MirrorVulkanRgbaTextureRegion(void* drawUserData, int textureId, unsigned int x,
+                                  unsigned int y, unsigned int width, unsigned int height,
+                                  const unsigned char* rgbaPixels)
+{
+    CryVR::VulkanFrameRenderer* renderer = static_cast<CryVR::VulkanFrameRenderer*>(drawUserData);
+    return renderer && renderer->RegisterLegacyRgbaTextureRegion(textureId, x, y,
+        width, height, rgbaPixels);
+}
+
+void ReleaseMirroredVulkanTexture(void* drawUserData, int textureId)
+{
+    CryVR::VulkanFrameRenderer* renderer = static_cast<CryVR::VulkanFrameRenderer*>(drawUserData);
+    if (renderer) renderer->ReleaseLegacyTexture(textureId);
+}
+}
 
 //////////////////////////////////////////////////////////////////////////
 #ifdef WIN32
@@ -151,6 +282,9 @@ bool CSystem::OpenRenderLibrary(const char *t_rend)
   else
   if (stricmp(t_rend, "NULL") == 0)
     return OpenRenderLibrary(R_NULL_RENDERER);
+  else
+  if (stricmp(t_rend, "Vulkan") == 0)
+    return OpenRenderLibrary(R_VULKAN_RENDERER);
 
 	Error( "Unknown renderer type: %s", t_rend );
 	return (false);
@@ -172,8 +306,13 @@ bool CSystem::OpenRenderLibrary(int type)
   sp.ipLog = GetILog();
   sp.ipSystem = this;
   sp.ipTest_int = &test_int;
-  sp.ipTimer = GetITimer();
+	sp.ipTimer = GetITimer();
 	sp.pIPhysicalWorld = m_pIPhysicalWorld;
+	sp.pVRRuntime = &m_vrRuntime;
+	sp.pVulkanContext = &m_vulkanContext;
+	sp.pVulkanResources = &m_vulkanResources;
+	sp.pVulkanShaders = &m_vulkanShaders;
+	sp.pVulkanFrameRenderer = &m_vulkanFrameRenderer;
 
 #ifndef _XBOX
 	char libname[128];
@@ -188,6 +327,15 @@ bool CSystem::OpenRenderLibrary(int type)
   else
   if (type == R_NULL_RENDERER)
     strcpy(libname, DLL_NULLRENDERER);
+	else
+  if (type == R_VULKAN_RENDERER)
+  {
+#if defined(WIN32)
+    strcpy(libname, "XRenderVulkan.dll");
+#else
+    strcpy(libname, "libXRenderVulkan.so");
+#endif
+  }
 	else
 	{
 		Error("No renderer specified");
@@ -456,6 +604,49 @@ bool CSystem::InitRenderer(WIN_HINSTANCE hinst, WIN_HWND hwnd,const char *szCmdL
 {
   CreateRendererVars();
 
+	// The OpenXR/Vulkan bootstrap is common to Quest and PCVR. The renderer
+	// receives the shared runtime and device context through the import struct.
+	if (szCmdLine && strstr(szCmdLine, "-vr"))
+	{
+		void *androidEnv = 0;
+		void *androidActivity = 0;
+#if defined(__ANDROID__)
+		CryVR::GetAndroidOpenXRContext(&androidEnv, &androidActivity);
+#endif
+		if (!m_vrRuntime.Initialize("Far Cry", "CryEngine 1", androidEnv, androidActivity))
+		{
+			CryLogAlways("OpenXR: runtime initialization failed: %s", m_vrRuntime.GetLastError());
+			return false;
+		}
+		if (!m_vulkanContext.Initialize(m_vrRuntime))
+		{
+			CryLogAlways("Vulkan: native device bootstrap failed: %s", m_vulkanContext.GetLastError());
+			return false;
+		}
+		if (!m_vrRuntime.CreateVulkanSession(m_vulkanContext.GetOpenXRBinding()))
+		{
+			CryLogAlways("OpenXR: Vulkan session creation failed: %s", m_vrRuntime.GetLastError());
+			return false;
+		}
+		if (!m_vulkanResources.Initialize(m_vulkanContext))
+		{
+			CryLogAlways("Vulkan: resource manager initialization failed: %s", m_vulkanResources.GetLastError());
+			return false;
+		}
+		m_vulkanFrameRenderer.SetResourceManager(&m_vulkanResources);
+		if (!m_vulkanFrameRenderer.Initialize(m_vrRuntime, m_vulkanContext))
+		{
+			CryLogAlways("Vulkan: XR frame renderer initialization failed: %s", m_vulkanFrameRenderer.GetLastError());
+			return false;
+		}
+		if (!m_vulkanShaders.Initialize(m_vulkanContext))
+		{
+			CryLogAlways("Vulkan: shader library initialization failed: %s", m_vulkanShaders.GetLastError());
+			return false;
+		}
+		CryLogAlways("OpenXR/Vulkan: Android loader, runtime, Vulkan device, session, swapchain and shader layers initialized");
+	}
+
 	if(m_bDedicatedServer)
 	{
 		m_sSavedRDriver=m_rDriver->GetString();
@@ -498,7 +689,7 @@ bool CSystem::InitRenderer(WIN_HINSTANCE hinst, WIN_HWND hwnd,const char *szCmdL
 		}
 	}
 #elif defined(__ANDROID__)
-	m_rDriver->Set("OpenGL");
+	m_rDriver->Set("Vulkan");
 #endif
 
 	CryLogAlways("InitRenderer: driver='%s', resolution=%dx%d", m_rDriver->GetString(), m_rWidth->GetIVal(), m_rHeight->GetIVal());
@@ -553,6 +744,22 @@ bool CSystem::InitRenderer(WIN_HINSTANCE hinst, WIN_HWND hwnd,const char *szCmdL
 			m_rHeight->Set(dh);
 		}
 #endif
+		SVulkanBufferCallbacks bufferCallbacks;
+		if (m_vrRuntime.IsInitialized())
+		{
+			bufferCallbacks.userData = &m_vulkanResources;
+			bufferCallbacks.createBuffer = CreateVulkanMirrorBuffer;
+			bufferCallbacks.uploadBuffer = UploadVulkanMirrorBuffer;
+			bufferCallbacks.destroyBuffer = DestroyVulkanMirrorBuffer;
+			bufferCallbacks.drawUserData = &m_vulkanFrameRenderer;
+			bufferCallbacks.queueIndexedDraw = QueueVulkanStockDraw;
+			bufferCallbacks.queueClientIndexedDraw = QueueVulkanClientStockDraw;
+			bufferCallbacks.requirePanelFallback = RequireVulkanPanelFallback;
+			bufferCallbacks.mirrorRgbaTexture = MirrorVulkanRgbaTexture;
+			bufferCallbacks.mirrorRgbaTextureRegion = MirrorVulkanRgbaTextureRegion;
+			bufferCallbacks.releaseMirroredTexture = ReleaseMirroredVulkanTexture;
+		}
+		m_pRenderer->SetVulkanBufferCallbacks(bufferCallbacks);
 		m_hWnd = m_pRenderer->Init(0, 0, m_rWidth->GetIVal(), m_rHeight->GetIVal(), m_rColorBits->GetIVal(), m_rDepthBits->GetIVal(), m_rStencilBits->GetIVal(), m_rFullscreen->GetIVal() ? true : false, hinst, hwnd);
 		if (m_hWnd)
 		{
@@ -1279,10 +1486,11 @@ bool CSystem::Init( const SSystemInitParams &params )
 #endif
 
 #ifdef __ANDROID__
-	if (m_rDriver) m_rDriver->Set("OpenGL");
-	if (ICVar* cvNoPS20 = m_pConsole->GetCVar("r_NoPS20")) cvNoPS20->Set(0);
+	// Android now uses the native Vulkan renderer. Keep the renderer CVar in
+	// sync with the library selected by InitRenderer above; setting this back
+	// to OpenGL left the active Vulkan renderer paired with a false driver name.
+	if (m_rDriver) m_rDriver->Set("Vulkan");
 	if (ICVar* cvBump = m_pConsole->GetCVar("r_Quality_BumpMapping")) cvBump->Set(3);
-	if (ICVar* cvNV30 = m_pConsole->GetCVar("r_GL_NV30_PS20")) cvNV30->Set(1);
 	if (ICVar* cvFS = m_pConsole->GetCVar("r_Fullscreen")) cvFS->Set(1);
 #endif
 

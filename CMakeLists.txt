@@ -26,6 +26,13 @@ if (ANDROID)
         include_directories(${CMAKE_PREFIX_PATH}/include)
         link_directories(${CMAKE_PREFIX_PATH}/lib)
     endif()
+    # Link through SDL's imported target so Android's shared library is passed
+    # to the linker by its resolved path (rather than an ambiguous -lSDL3).
+    list(GET CMAKE_PREFIX_PATH 0 FARCRY_ANDROID_DEPS_PREFIX)
+    find_package(SDL3 CONFIG REQUIRED
+        PATHS "${FARCRY_ANDROID_DEPS_PREFIX}/lib/cmake/SDL3"
+        NO_DEFAULT_PATH
+    )
     add_compile_options(
         -w
         -fPIC
@@ -39,7 +46,7 @@ if (ANDROID)
         -Wl,--unresolved-symbols=ignore-all
         -Wl,--no-fatal-warnings
     )
-    link_libraries(SDL3 log dl m)
+    link_libraries(SDL3::SDL3 log dl m)
 elseif (CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(ARCH_TYPE "x64")
 else (CMAKE_SIZEOF_VOID_P EQUAL 4)

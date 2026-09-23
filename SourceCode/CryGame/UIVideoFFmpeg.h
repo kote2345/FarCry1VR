@@ -49,4 +49,6 @@ protected:
 	CMovieAudioSource*	m_audioSrc{ nullptr };
 	int					m_playerCmd{ 0 };
 	int					m_textureId{ -1 };
+	int					m_videoWidth{ 0 };
+	int					m_videoHeight{ 0 };
 };

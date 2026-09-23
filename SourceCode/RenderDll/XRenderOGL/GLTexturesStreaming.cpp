@@ -9,10 +9,85 @@
 
 #include "RenderPCH.h"
 #include "GL_Renderer.h"
+#include "GLVulkanTextureDecode.h"
 #include "GLPBuffer.h"
 #include "I3DEngine.h"
 
+#include <vector>
+
 //===============================================================================
+
+static void MirrorStreamingTextureBase(int textureId, ETEX_Format format,
+                                       unsigned int width, unsigned int height,
+                                       const byte* pixels, int pixelBytes,
+                                       bool clampU, bool clampV, bool dynamicTexture)
+{
+  if (!pixels || !width || !height)
+    return;
+  const size_t pixelCount = static_cast<size_t>(width) * height;
+  if (format == eTF_DXT1 || format == eTF_DXT3 || format == eTF_DXT5)
+  {
+    const bool dxt1 = format == eTF_DXT1;
+    const size_t blockBytes = dxt1 ? 8 : 16;
+    const size_t requiredBytes = static_cast<size_t>((width + 3) / 4) * ((height + 3) / 4) * blockBytes;
+    if (pixelBytes < 0 || static_cast<size_t>(pixelBytes) < requiredBytes)
+      return;
+    std::vector<byte> rgba;
+    if (DecodeDxtBaseLevel(pixels, static_cast<int>(width), static_cast<int>(height),
+                           dxt1, format == eTF_DXT3, format == eTF_DXT5, rgba))
+      gcpOGL->MirrorVulkanTexture(textureId, width, height, rgba.data(), clampU, clampV, dynamicTexture);
+    return;
+  }
+  if (format == eTF_8888)
+  {
+    if (pixelBytes >= static_cast<int>(pixelCount * 4))
+      gcpOGL->MirrorVulkanTexture(textureId, width, height, pixels, clampU, clampV, dynamicTexture);
+    return;
+  }
+  if (format == eTF_8000)
+  {
+    if (pixelBytes < static_cast<int>(pixelCount))
+      return;
+    std::vector<byte> rgba(pixelCount * 4);
+    for (size_t i = 0; i < pixelCount; ++i)
+    {
+      rgba[i * 4 + 0] = 255;
+      rgba[i * 4 + 1] = 255;
+      rgba[i * 4 + 2] = 255;
+      rgba[i * 4 + 3] = pixels[i];
+    }
+    gcpOGL->MirrorVulkanTexture(textureId, width, height, rgba.data(), clampU, clampV, dynamicTexture);
+    return;
+  }
+  if (format == eTF_0088)
+  {
+    if (pixelBytes < static_cast<int>(pixelCount * 2))
+      return;
+    std::vector<byte> rgba(pixelCount * 4);
+    for (size_t i = 0; i < pixelCount; ++i)
+    {
+      const byte luminance = pixels[i * 2];
+      rgba[i * 4 + 0] = luminance;
+      rgba[i * 4 + 1] = luminance;
+      rgba[i * 4 + 2] = luminance;
+      rgba[i * 4 + 3] = pixels[i * 2 + 1];
+    }
+    gcpOGL->MirrorVulkanTexture(textureId, width, height, rgba.data(), clampU, clampV, dynamicTexture);
+    return;
+  }
+  if ((format != eTF_0888 && format != eTF_RGB8) ||
+      pixelBytes < static_cast<int>(pixelCount * 3))
+    return;
+  std::vector<byte> rgba(pixelCount * 4);
+  for (size_t i = 0; i < pixelCount; ++i)
+  {
+    rgba[i * 4 + 0] = pixels[i * 3 + 0];
+    rgba[i * 4 + 1] = pixels[i * 3 + 1];
+    rgba[i * 4 + 2] = pixels[i * 3 + 2];
+    rgba[i * 4 + 3] = 255;
+  }
+  gcpOGL->MirrorVulkanTexture(textureId, width, height, rgba.data(), clampU, clampV, dynamicTexture);
+}
 
 void STexPic::BuildMips()
 {
@@ -111,6 +186,12 @@ bool STexPic::UploadMips(int nStartMip, int nEndMip)
             glTexImage2D(m_TargetType, 0, tfd, m_Width, m_Height, 0, tfs, GL_UNSIGNED_BYTE, NULL);
           glTexImage2D(m_TargetType, nLod, tfd, mp->USize, mp->VSize, 0, tfs, GL_UNSIGNED_BYTE, &mp->DataArray[0]);
         }
+        if (i == 0 && m_TargetType == GL_TEXTURE_2D)
+          MirrorStreamingTextureBase(m_Bind, m_ETF, mp->USize, mp->VSize,
+              &mp->DataArray[0], mp->DataArray.GetSize(),
+              (m_Flags & FT_CLAMP) || (m_Flags2 & FT2_UCLAMP),
+              (m_Flags & FT_CLAMP) || (m_Flags2 & FT2_VCLAMP),
+              (m_Flags & FT_DYNAMIC) != 0);
         mp->m_bUploaded = true;
       }
     }
@@ -171,6 +252,12 @@ bool STexPic::UploadMips(int nStartMip, int nEndMip)
           glCompressedTexImage2DARB(m_TargetType, nLod, tfd, mp->USize, mp->VSize, 0, mp->DataArray.Num(), &mp->DataArray[0]);
         else
           glTexImage2D(m_TargetType, nLod, tfd, mp->USize, mp->VSize, 0, tfs, GL_UNSIGNED_BYTE, &mp->DataArray[0]);
+        if (i == 0 && m_TargetType == GL_TEXTURE_2D)
+          MirrorStreamingTextureBase(m_Bind, m_ETF, mp->USize, mp->VSize,
+              &mp->DataArray[0], mp->DataArray.GetSize(),
+              (m_Flags & FT_CLAMP) || (m_Flags2 & FT2_UCLAMP),
+              (m_Flags & FT_CLAMP) || (m_Flags2 & FT2_VCLAMP),
+              (m_Flags & FT_DYNAMIC) != 0);
         mp->m_bUploaded = true;
       }
     }

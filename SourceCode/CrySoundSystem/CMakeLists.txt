@@ -65,7 +65,26 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     legacy_stdio_definitions.lib
 )
 elseif (ANDROID)
-target_link_libraries(${PROJECT_NAME} PUBLIC openal ogg vorbis vorbisfile log)
+set(OPENAL_ANDROID_LIBRARY "${FARCRY_ANDROID_DEPS_PREFIX}/lib/libopenal.so")
+set(OGG_ANDROID_LIBRARY "${FARCRY_ANDROID_DEPS_PREFIX}/lib/libogg.so")
+set(VORBIS_ANDROID_LIBRARY "${FARCRY_ANDROID_DEPS_PREFIX}/lib/libvorbis.so")
+set(VORBISFILE_ANDROID_LIBRARY "${FARCRY_ANDROID_DEPS_PREFIX}/lib/libvorbisfile.so")
+if (NOT OPENAL_ANDROID_LIBRARY OR NOT OGG_ANDROID_LIBRARY OR
+    NOT VORBIS_ANDROID_LIBRARY OR NOT VORBISFILE_ANDROID_LIBRARY)
+    message(FATAL_ERROR "Android audio libraries were not found under ${FARCRY_ANDROID_DEPS_PREFIX}/lib")
+endif()
+foreach(_audio_library ${OPENAL_ANDROID_LIBRARY} ${OGG_ANDROID_LIBRARY}
+        ${VORBIS_ANDROID_LIBRARY} ${VORBISFILE_ANDROID_LIBRARY})
+    if (NOT EXISTS "${_audio_library}")
+        message(FATAL_ERROR "Android audio library is missing: ${_audio_library}")
+    endif()
+endforeach()
+target_link_libraries(${PROJECT_NAME} PUBLIC
+    ${OPENAL_ANDROID_LIBRARY}
+    ${OGG_ANDROID_LIBRARY}
+    ${VORBIS_ANDROID_LIBRARY}
+    ${VORBISFILE_ANDROID_LIBRARY}
+    log)
 else()
 target_link_libraries(${PROJECT_NAME} PUBLIC vorbisfile openal)
 endif()

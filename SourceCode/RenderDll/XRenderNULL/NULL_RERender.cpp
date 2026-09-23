@@ -56,7 +56,21 @@ bool CREGlare::mfDraw(SShader *ef, SShaderPass *sfm)
 
 bool CREOcLeaf::mfDraw(SShader *ef, SShaderPass *sl)
 {
-  return (true);
+  CLeafBuffer *leafBuffer = m_pBuffer;
+  if (!leafBuffer || !m_pChunk)
+    return true;
+
+  leafBuffer = leafBuffer->GetVertexContainer();
+  if (!leafBuffer || !leafBuffer->m_pVertexBuffer)
+    return true;
+
+  // The NULL backend remains a no-op through its DrawBuffer implementation;
+  // real backends derived from it can now consume stock opaque geometry.
+  gRenDev->DrawBuffer(leafBuffer->m_pVertexBuffer, &leafBuffer->m_Indices,
+                      m_pChunk->nNumIndices, m_pChunk->nFirstIndexId,
+                      leafBuffer->m_nPrimetiveType, m_pChunk->nFirstVertId,
+                      m_pChunk->nNumVerts, m_pChunk);
+  return true;
 }
 
 ///////////////////////////////////////////////////////////////////

@@ -15,6 +15,7 @@
 #include "GLCGVProgram.h"
 #include "I3DEngine.h"
 #include "CryHeaders.h"
+#include <vector>
 
 //==================================================================
 
@@ -391,13 +392,13 @@ void CGLRenderer::EF_PipelineInit()
 
       CVertexBuffer *pBuf = new CVertexBuffer;
       pBuf->m_bDynamic = true;
+      pBuf->m_vertexformat = VERTEX_FORMAT_P3F_N_COL4UB_TEX2F;
+      pBuf->m_NumVerts = nVerts;
       int size = m_VertexSize[VERTEX_FORMAT_P3F_N_COL4UB_TEX2F]*nVerts*4;
       glGenBuffersARB(1, &pBuf->m_VS[VSF_GENERAL].m_VertBuf.m_nID);
       glBindBufferARB(GL_ARRAY_BUFFER_ARB, pBuf->m_VS[VSF_GENERAL].m_VertBuf.m_nID);
       glBufferDataARB(GL_ARRAY_BUFFER_ARB, size, NULL, GL_STREAM_DRAW_ARB);
       m_CurVertBufferSize += size;
-      pBuf->m_vertexformat = VERTEX_FORMAT_P3F_N_COL4UB_TEX2F;
-      pBuf->m_NumVerts = nVerts;
       m_RP.m_VidBufs[i].m_pVBDyn = pBuf;
       m_RP.m_VidBufs[i].m_nCount = size;
     }
@@ -3546,6 +3547,22 @@ void CGLRenderer::EF_DrawIndexedMesh (int nPrimType)
 {
   //PROFILE_FRAME(Draw_IndexMesh);
 
+  const auto queueMergedRange = [this](const ushort *indices, unsigned int count, int topology) -> bool
+  {
+    if (!m_vulkanBufferCallbacks.queueClientIndexedDraw)
+      return false;
+    if (!(m_RP.m_FlagsPerFlush & RBSI_VERTSMERGED) || !m_RP.m_RendNumVerts ||
+        !m_RP.m_SysRendIndices)
+    {
+      if (m_vulkanBufferCallbacks.requirePanelFallback)
+        m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+      return false;
+    }
+    return QueueVulkanCurrentClientIndexedDraw(m_RP.m_Ptr.Ptr,
+        static_cast<unsigned int>(m_RP.m_RendNumVerts), indices,
+        count, topology);
+  };
+
   int nType = -1;
   switch (nPrimType)
   {
@@ -3571,6 +3588,9 @@ void CGLRenderer::EF_DrawIndexedMesh (int nPrimType)
       
     case R_PRIMV_MULTI_STRIPS:
       {
+    if (m_vulkanBufferCallbacks.queueClientIndexedDraw &&
+            m_vulkanBufferCallbacks.requirePanelFallback)
+          m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
         list2<CMatInfo> *mats = m_RP.m_pRE->mfGetMatInfoList();
         if (mats)
         {
@@ -3587,6 +3607,9 @@ void CGLRenderer::EF_DrawIndexedMesh (int nPrimType)
 
     case R_PRIMV_MULTI_GROUPS:
       {
+    if (m_vulkanBufferCallbacks.queueClientIndexedDraw &&
+            m_vulkanBufferCallbacks.requirePanelFallback)
+          m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
         CMatInfo *mi = m_RP.m_pRE->mfGetMatInfo();
         if (mi)
         {
@@ -3621,6 +3644,43 @@ void CGLRenderer::EF_DrawIndexedMesh (int nPrimType)
 
   if (nType >= 0)
   {
+    if (m_vulkanBufferCallbacks.queueClientIndexedDraw && m_RP.m_RendNumIndices)
+    {
+      const int topology = nPrimType == R_PRIMV_TRIANGLES ? 0 :
+                           nPrimType == R_PRIMV_TRIANGLE_STRIP ? 1 :
+                           nPrimType == R_PRIMV_TRIANGLE_FAN ? 2 : -1;
+      if (topology >= 0)
+        queueMergedRange(m_RP.m_SysRendIndices,
+                         static_cast<unsigned int>(m_RP.m_RendNumIndices), topology);
+      else if (nPrimType == R_PRIMV_QUADS)
+      {
+        const unsigned int quadIndexCount = static_cast<unsigned int>(m_RP.m_RendNumIndices);
+        if (quadIndexCount && (quadIndexCount % 4u) == 0u && m_RP.m_SysRendIndices)
+        {
+          std::vector<ushort> triangleIndices;
+          triangleIndices.reserve((quadIndexCount / 4u) * 6u);
+          for (unsigned int i = 0; i < quadIndexCount; i += 4)
+          {
+            const ushort i0 = m_RP.m_SysRendIndices[i + 0];
+            const ushort i1 = m_RP.m_SysRendIndices[i + 1];
+            const ushort i2 = m_RP.m_SysRendIndices[i + 2];
+            const ushort i3 = m_RP.m_SysRendIndices[i + 3];
+            triangleIndices.push_back(i0);
+            triangleIndices.push_back(i1);
+            triangleIndices.push_back(i2);
+            triangleIndices.push_back(i0);
+            triangleIndices.push_back(i2);
+            triangleIndices.push_back(i3);
+          }
+          queueMergedRange(triangleIndices.data(),
+                           static_cast<unsigned int>(triangleIndices.size()), 0);
+        }
+        else if (m_vulkanBufferCallbacks.requirePanelFallback)
+          m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+      }
+      else if (m_vulkanBufferCallbacks.requirePanelFallback)
+        m_vulkanBufferCallbacks.requirePanelFallback(m_vulkanBufferCallbacks.drawUserData);
+    }
     if(m_RP.m_RendNumIndices)
       glDrawElements(nType, m_RP.m_RendNumIndices, GL_UNSIGNED_SHORT, m_RP.m_RendIndices);
     else

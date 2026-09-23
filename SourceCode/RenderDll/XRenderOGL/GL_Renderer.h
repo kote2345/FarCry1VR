@@ -145,6 +145,26 @@ public:
   virtual bool SetRenderTarget (int nHandle) {return true;}
 
 	virtual void  ShareResources( IRenderer *renderer );
+	virtual void SetVulkanBufferCallbacks(const SVulkanBufferCallbacks& callbacks) { m_vulkanBufferCallbacks = callbacks; }
+	bool MirrorVulkanTexture(int textureId, unsigned int width, unsigned int height,
+		const unsigned char* rgbaPixels, bool clampU, bool clampV, bool dynamicTexture)
+	{
+		return m_vulkanBufferCallbacks.mirrorRgbaTexture &&
+			m_vulkanBufferCallbacks.mirrorRgbaTexture(m_vulkanBufferCallbacks.drawUserData,
+				textureId, width, height, rgbaPixels, clampU, clampV, dynamicTexture, false, 3);
+	}
+	bool MirrorVulkanTextureRegion(int textureId, unsigned int x, unsigned int y,
+		unsigned int width, unsigned int height, const unsigned char* rgbaPixels)
+	{
+		return m_vulkanBufferCallbacks.mirrorRgbaTextureRegion &&
+			m_vulkanBufferCallbacks.mirrorRgbaTextureRegion(m_vulkanBufferCallbacks.drawUserData,
+				textureId, x, y, width, height, rgbaPixels);
+	}
+	void ReleaseMirroredVulkanTexture(int textureId)
+	{
+		if (m_vulkanBufferCallbacks.releaseMirroredTexture)
+			m_vulkanBufferCallbacks.releaseMirroredTexture(m_vulkanBufferCallbacks.drawUserData, textureId);
+	}
 
 	virtual void	MakeCurrent();
 
@@ -346,6 +366,7 @@ public:
 	void FontRestoreRenderingState();
   
 private:
+	SVulkanBufferCallbacks m_vulkanBufferCallbacks;
 
 	bool	SetupPixelFormat(unsigned char colorbits,unsigned char zbits,unsigned char sbits,SRendContext *rc);	
 	void	Print(CXFont *currfont,float x, float y, const char *buf,float xscale,float yscale,float r,float g,float b,float a=1.f);
@@ -1246,6 +1267,9 @@ public:
   
   // Common draw functions
   void EF_DrawIndexedMesh (int nPrimType=R_PRIMV_TRIANGLES);
+  bool QueueVulkanCurrentClientIndexedDraw(const void *vertices, unsigned int vertexCount,
+                                           const unsigned short *indices, unsigned int indexCount,
+                                           int topology);
   
   void EF_DrawGeneralPasses(SShaderTechnique *hs, SShader *ef, bool bVolFog, int nStart, int nEnd);
   void EF_DrawGeometryInstancing_VS30(SShader *ef, SShaderPassHW *slw, CVProgram *curVP);

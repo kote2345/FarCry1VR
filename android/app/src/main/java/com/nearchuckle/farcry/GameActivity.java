@@ -136,7 +136,15 @@ public class GameActivity extends SDLActivity {
 
         // 5. Load native libraries (c++_shared, SDL3, FarCry)
         super.loadLibraries();
+        // The JNI entry point is implemented by CryVR inside CrySystem, which
+        // the engine normally loads later during native startup.
+        System.loadLibrary("CrySystem");
+        // Capture the real Activity before SDL launches its native main thread;
+        // OpenXR's Android loader requires it during early renderer bootstrap.
+        nativeSetOpenXRActivity(this);
     }
+
+    private static native void nativeSetOpenXRActivity(GameActivity activity);
 
     @Override
     protected String[] getArguments() {
@@ -150,6 +158,10 @@ public class GameActivity extends SDLActivity {
 
         // Renderer
         args.add("\"r_Driver OpenGL\"");
+
+        // Quest builds enter the native OpenXR/Vulkan path. On devices without
+        // an OpenXR runtime the engine keeps its normal 2D renderer fallback.
+        args.add("-vr");
 
         // FOV
         int fov = prefs.getInt(LauncherActivity.KEY_FOV, 90);
@@ -314,9 +326,14 @@ public class GameActivity extends SDLActivity {
         Window window = getWindow();
         if (window == null) return;
 
+        // Quest may invoke this before PhoneWindow has created its DecorView.
+        // Window.getInsetsController() dereferences that view on Android 11+.
+        View decorView = window.getDecorView();
+        if (decorView == null) return;
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window.setDecorFitsSystemWindows(false);
-            WindowInsetsController controller = window.getInsetsController();
+            WindowInsetsController controller = decorView.getWindowInsetsController();
             if (controller != null) {
                 controller.hide(WindowInsets.Type.statusBars()
                         | WindowInsets.Type.navigationBars()
@@ -326,16 +343,13 @@ public class GameActivity extends SDLActivity {
             }
         }
 
-        View decorView = window.getDecorView();
-        if (decorView != null) {
-            decorView.setSystemUiVisibility(
-                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                            | View.SYSTEM_UI_FLAG_FULLSCREEN);
-        }
+        decorView.setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                        | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_FULLSCREEN);
     }
 
     @Override

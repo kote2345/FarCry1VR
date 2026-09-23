@@ -28,6 +28,9 @@
 #include "XConsole.h"
 #include <I3DEngine.h>
 #include <IAISystem.h>
+#if defined(USE_SDL)
+#include <SDL3/SDL.h>
+#endif
 
 #include "CrySizerStats.h"
 #include "CrySizerImpl.h"
@@ -43,6 +46,31 @@ extern HRESULT GetDXVersion( DWORD* pdwDirectXVersion, TCHAR* strDirectXVersion,
 #endif
 
 extern int g_nPrecaution;
+
+#if defined(USE_SDL)
+namespace
+{
+void PushVRKey(SDL_Keycode key, SDL_Scancode scanCode, bool down)
+{
+	SDL_Event event{};
+	event.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+	event.key.key = key;
+	event.key.scancode = scanCode;
+	event.key.down = down;
+	event.key.repeat = false;
+	SDL_PushEvent(&event);
+}
+
+void PushVRMouseMotion(float x, float y)
+{
+	SDL_Event event{};
+	event.type = SDL_EVENT_MOUSE_MOTION;
+	event.motion.xrel = x;
+	event.motion.yrel = y;
+	SDL_PushEvent(&event);
+}
+}
+#endif
 
 #if !defined(LINUX)
 /////////////////////////////////////////////////////////////////////////////////
@@ -848,6 +876,33 @@ void CSystem::RenderBegin()
 
 	//////////////////////////////////////////////////////////////////////
 	//start the rendering pipeline
+	if (m_vulkanFrameRenderer.IsInitialized())
+		m_vulkanFrameRenderer.BeginFrame();
+#if defined(USE_SDL)
+	if (m_vrRuntime.IsInitialized())
+	{
+		// OpenXR actions are synced at frame start. SDL consumes these queued
+		// events on the next system input update, keeping game bindings intact.
+		static bool keyW = false, keyA = false, keyS = false, keyD = false;
+		static bool leftSelect = false, rightSelect = false;
+		const CryVR::ControllerState& left = m_vrRuntime.GetLeftController();
+		const CryVR::ControllerState& right = m_vrRuntime.GetRightController();
+		const bool nextW = left.thumbstickY > 0.55f;
+		const bool nextS = left.thumbstickY < -0.55f;
+		const bool nextA = left.thumbstickX < -0.55f;
+		const bool nextD = left.thumbstickX > 0.55f;
+		if (keyW != nextW) PushVRKey(SDLK_W, SDL_SCANCODE_W, nextW);
+		if (keyA != nextA) PushVRKey(SDLK_A, SDL_SCANCODE_A, nextA);
+		if (keyS != nextS) PushVRKey(SDLK_S, SDL_SCANCODE_S, nextS);
+		if (keyD != nextD) PushVRKey(SDLK_D, SDL_SCANCODE_D, nextD);
+		if (leftSelect != left.select) PushVRKey(SDLK_RETURN, SDL_SCANCODE_RETURN, left.select);
+		if (rightSelect != right.select) PushVRKey(SDLK_SPACE, SDL_SCANCODE_SPACE, right.select);
+		keyW = nextW; keyA = nextA; keyS = nextS; keyD = nextD;
+		leftSelect = left.select; rightSelect = right.select;
+		if (right.thumbstickX*right.thumbstickX + right.thumbstickY*right.thumbstickY > 0.04f)
+			PushVRMouseMotion(right.thumbstickX * 12.0f, -right.thumbstickY * 12.0f);
+	}
+#endif
 	if (m_pRenderer) 
 		m_pRenderer->BeginFrame();
 }
@@ -861,7 +916,11 @@ void CSystem::RenderEnd()
 		return;
 
 	if (!m_pRenderer)
+	{
+		if (m_vulkanFrameRenderer.IsInitialized())
+			m_vulkanFrameRenderer.EndFrame();
 		return;
+	}
 
 	if (m_pConsole)
   {
@@ -876,8 +935,35 @@ void CSystem::RenderEnd()
 	m_pRenderer->FlushTextMessages();
 
 	// Flush render data and swap buffers.
+	if (m_vulkanFrameRenderer.IsInitialized() && m_vulkanFrameRenderer.ShouldCaptureGameFrame())
+	{
+		const int frameWidth = m_pRenderer->GetWidth();
+		const int frameHeight = m_pRenderer->GetHeight();
+		if (frameWidth > 0 && frameHeight > 0)
+		{
+			const size_t captureBytes = static_cast<size_t>(frameWidth) *
+				static_cast<size_t>(frameHeight) * 4;
+			if (m_vrFrameCaptureBuffer.size() != captureBytes)
+				m_vrFrameCaptureBuffer.resize(captureBytes);
+			m_pRenderer->ReadFrameBuffer(m_vrFrameCaptureBuffer.data(), frameWidth, frameHeight, true, true);
+			if (!m_vulkanFrameRenderer.SetGameFrameRGBA(m_vrFrameCaptureBuffer.data(), frameWidth, frameHeight))
+				CryLogAlways("OpenXR panel: frame upload failed: %s", m_vulkanFrameRenderer.GetLastError());
+		}
+	}
 	m_pRenderer->Update();
 	m_Time.MeasureTime("3RendFlush");
+
+	if (m_vulkanFrameRenderer.IsInitialized())
+	{
+		static bool warnedAboutUntranslatedDraws = false;
+		const unsigned int untranslatedDraws = m_vulkanFrameRenderer.GetUntranslatedDrawCount();
+		if (untranslatedDraws && !warnedAboutUntranslatedDraws)
+		{
+			CryLogAlways("Vulkan: %u scene draw(s) are not yet translated; native Vulkan draws remain visible, but no legacy framebuffer fallback exists.", untranslatedDraws);
+			warnedAboutUntranslatedDraws = true;
+		}
+		m_vulkanFrameRenderer.EndFrame();
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////

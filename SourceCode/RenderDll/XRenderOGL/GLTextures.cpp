@@ -9,10 +9,13 @@
 
 #include "RenderPCH.h"
 #include "GL_Renderer.h"
+#include "GLVulkanTextureDecode.h"
 #include "GLPBuffer.h"
 #include "I3DEngine.h"
 #include "GLCubeMaps.h"
 #include "CryHeaders.h"
+
+#include <vector>
 
 // tiago: added
 #include "GLCGPShader.h"
@@ -425,6 +428,8 @@ void STexPic::ReleaseDriverTexture()
 {
   if (!(m_Flags2 & FT2_WASUNLOADED) && (m_Bind && m_Bind != TX_FIRSTBIND)) 
   {
+    if (m_TargetType == GL_TEXTURE_2D)
+      gcpOGL->ReleaseMirroredVulkanTexture(m_Bind);
     m_Flags2 &= ~FT2_PARTIALLYLOADED;
     if (m_LoadedSize)
       gRenDev->m_TexMan->m_StatsCurTexMem -= m_LoadedSize;
@@ -1558,10 +1563,186 @@ static inline bool IsDXTFormat(int format)
   return false;
 }
 
+static void DecodeDxtColorBlock(const byte* block, bool allowTransparent, byte colors[4][4])
+{
+  const unsigned int c0 = block[0] | (static_cast<unsigned int>(block[1]) << 8);
+  const unsigned int c1 = block[2] | (static_cast<unsigned int>(block[3]) << 8);
+  const unsigned int endpoints[2] = { c0, c1 };
+  for (int endpoint = 0; endpoint < 2; ++endpoint)
+  {
+    const unsigned int c = endpoints[endpoint];
+    colors[endpoint][0] = static_cast<byte>(((c >> 11) & 31) * 255 / 31);
+    colors[endpoint][1] = static_cast<byte>(((c >> 5) & 63) * 255 / 63);
+    colors[endpoint][2] = static_cast<byte>((c & 31) * 255 / 31);
+    colors[endpoint][3] = 255;
+  }
+  if (allowTransparent && c0 <= c1)
+  {
+    for (int channel = 0; channel < 3; ++channel)
+      colors[2][channel] = static_cast<byte>((colors[0][channel] + colors[1][channel]) / 2);
+    colors[2][3] = 255;
+    colors[3][0] = colors[3][1] = colors[3][2] = colors[3][3] = 0;
+  }
+  else
+  {
+    for (int channel = 0; channel < 3; ++channel)
+    {
+      colors[2][channel] = static_cast<byte>((2 * colors[0][channel] + colors[1][channel]) / 3);
+      colors[3][channel] = static_cast<byte>((colors[0][channel] + 2 * colors[1][channel]) / 3);
+    }
+    colors[2][3] = colors[3][3] = 255;
+  }
+}
+
+bool DecodeDxtBaseLevel(const byte* compressed, int width, int height,
+                        bool dxt1, bool dxt3, bool dxt5, std::vector<byte>& rgba)
+{
+  if (!compressed || width <= 0 || height <= 0 || (!dxt1 && !dxt3 && !dxt5))
+    return false;
+  const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+  if (pixelCount > (static_cast<size_t>(-1) / 4))
+    return false;
+  rgba.resize(pixelCount * 4);
+  const int blockBytes = dxt1 ? 8 : 16;
+  const int blocksWide = (width + 3) / 4;
+  const int blocksHigh = (height + 3) / 4;
+  for (int by = 0; by < blocksHigh; ++by)
+  {
+    for (int bx = 0; bx < blocksWide; ++bx)
+    {
+      const byte* block = compressed + (static_cast<size_t>(by) * blocksWide + bx) * blockBytes;
+      const byte* colorBlock = block + (dxt1 ? 0 : 8);
+      byte colors[4][4];
+      DecodeDxtColorBlock(colorBlock, dxt1, colors);
+      const unsigned int selectors = colorBlock[4] | (static_cast<unsigned int>(colorBlock[5]) << 8) |
+          (static_cast<unsigned int>(colorBlock[6]) << 16) | (static_cast<unsigned int>(colorBlock[7]) << 24);
+      byte alpha[16];
+      for (int i = 0; i < 16; ++i)
+        alpha[i] = 255;
+      if (dxt3)
+      {
+        for (int i = 0; i < 16; ++i)
+        {
+          const byte packed = block[i / 2];
+          alpha[i] = static_cast<byte>(((i & 1) ? packed >> 4 : packed & 15) * 17);
+        }
+      }
+      else if (dxt5)
+      {
+        byte alphaTable[8] = { block[0], block[1] };
+        if (alphaTable[0] > alphaTable[1])
+        {
+          for (int i = 1; i <= 6; ++i)
+            alphaTable[i + 1] = static_cast<byte>(((7 - i) * alphaTable[0] + i * alphaTable[1]) / 7);
+        }
+        else
+        {
+          for (int i = 1; i <= 4; ++i)
+            alphaTable[i + 1] = static_cast<byte>(((5 - i) * alphaTable[0] + i * alphaTable[1]) / 5);
+          alphaTable[6] = 0;
+          alphaTable[7] = 255;
+        }
+        unsigned long long alphaSelectors = 0;
+        for (int i = 0; i < 6; ++i)
+          alphaSelectors |= static_cast<unsigned long long>(block[2 + i]) << (8 * i);
+        for (int i = 0; i < 16; ++i)
+          alpha[i] = alphaTable[(alphaSelectors >> (3 * i)) & 7];
+      }
+      for (int py = 0; py < 4; ++py)
+      {
+        const int y = by * 4 + py;
+        if (y >= height) continue;
+        for (int px = 0; px < 4; ++px)
+        {
+          const int x = bx * 4 + px;
+          if (x >= width) continue;
+          const int pixel = py * 4 + px;
+          const byte* color = colors[(selectors >> (2 * pixel)) & 3];
+          byte* out = &rgba[(static_cast<size_t>(y) * width + x) * 4];
+          out[0] = color[0]; out[1] = color[1]; out[2] = color[2];
+          out[3] = dxt1 ? color[3] : alpha[pixel];
+        }
+      }
+    }
+  }
+  return true;
+}
+
 void CGLTexMan::BuildMips(GLenum tgt, byte* src, int wdt, int hgt, int depth, STexPic *ti, int srcFormat, int dstFormat, int blockSize, int DXTSize, int nMips)
 {
   int offset = 0;
   ti->m_nMips = 0;
+  if (tgt == GL_TEXTURE_2D && ti->m_TargetType == GL_TEXTURE_2D &&
+      src && wdt > 0 && hgt > 0)
+  {
+    const size_t pixelCount = static_cast<size_t>(wdt) * static_cast<size_t>(hgt);
+    if ((dstFormat == GL_RGBA8 || dstFormat == GL_RGBA4) && srcFormat == GL_BGRA_EXT)
+    {
+      std::vector<byte> rgba(pixelCount * 4);
+      for (size_t pixel = 0; pixel < pixelCount; ++pixel)
+      {
+        rgba[pixel * 4 + 0] = src[pixel * 4 + 2];
+        rgba[pixel * 4 + 1] = src[pixel * 4 + 1];
+        rgba[pixel * 4 + 2] = src[pixel * 4 + 0];
+        rgba[pixel * 4 + 3] = src[pixel * 4 + 3];
+      }
+      gcpOGL->MirrorVulkanTexture(ti->m_Bind, static_cast<unsigned int>(wdt),
+          static_cast<unsigned int>(hgt), rgba.data(),
+          (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_UCLAMP),
+          (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_VCLAMP),
+          (ti->m_Flags & FT_DYNAMIC) != 0);
+    }
+    else if (dstFormat == GL_RGB8 && (srcFormat == GL_BGR_EXT || srcFormat == GL_RGB))
+    {
+      std::vector<byte> rgba(pixelCount * 4);
+      const bool bgrOrder = srcFormat == GL_BGR_EXT;
+      for (size_t pixel = 0; pixel < pixelCount; ++pixel)
+      {
+        rgba[pixel * 4 + 0] = src[pixel * 3 + (bgrOrder ? 2 : 0)];
+        rgba[pixel * 4 + 1] = src[pixel * 3 + 1];
+        rgba[pixel * 4 + 2] = src[pixel * 3 + (bgrOrder ? 0 : 2)];
+        rgba[pixel * 4 + 3] = 255;
+      }
+      gcpOGL->MirrorVulkanTexture(ti->m_Bind, static_cast<unsigned int>(wdt),
+          static_cast<unsigned int>(hgt), rgba.data(),
+          (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_UCLAMP),
+          (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_VCLAMP),
+          (ti->m_Flags & FT_DYNAMIC) != 0);
+    }
+    else if ((dstFormat == GL_ALPHA8 || dstFormat == GL_ALPHA) && srcFormat == GL_ALPHA)
+    {
+      std::vector<byte> rgba(pixelCount * 4);
+      for (size_t pixel = 0; pixel < pixelCount; ++pixel)
+      {
+        rgba[pixel * 4 + 0] = 255;
+        rgba[pixel * 4 + 1] = 255;
+        rgba[pixel * 4 + 2] = 255;
+        rgba[pixel * 4 + 3] = src[pixel];
+      }
+      gcpOGL->MirrorVulkanTexture(ti->m_Bind, static_cast<unsigned int>(wdt),
+          static_cast<unsigned int>(hgt), rgba.data(),
+          (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_UCLAMP),
+          (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_VCLAMP),
+          (ti->m_Flags & FT_DYNAMIC) != 0);
+    }
+    else if (dstFormat == GL_LUMINANCE_ALPHA && srcFormat == GL_LUMINANCE_ALPHA)
+    {
+      std::vector<byte> rgba(pixelCount * 4);
+      for (size_t pixel = 0; pixel < pixelCount; ++pixel)
+      {
+        const byte luminance = src[pixel * 2];
+        rgba[pixel * 4 + 0] = luminance;
+        rgba[pixel * 4 + 1] = luminance;
+        rgba[pixel * 4 + 2] = luminance;
+        rgba[pixel * 4 + 3] = src[pixel * 2 + 1];
+      }
+      gcpOGL->MirrorVulkanTexture(ti->m_Bind, static_cast<unsigned int>(wdt),
+          static_cast<unsigned int>(hgt), rgba.data(),
+          (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_UCLAMP),
+          (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_VCLAMP),
+          (ti->m_Flags & FT_DYNAMIC) != 0);
+    }
+  }
   if (nMips)
   {
     signed char *data = (signed char *)src;
@@ -1707,6 +1888,47 @@ void CGLTexMan::BuildMips(GLenum tgt, byte* src, int wdt, int hgt, int depth, ST
           if (!h)
             h = 1;
           glTexImage2D(tgt, l, dstFormat, w, h, 0, srcFormat, GL_UNSIGNED_BYTE, data);
+          if (l == 0 && tgt == GL_TEXTURE_2D && ti->m_TargetType == GL_TEXTURE_2D &&
+              (dstFormat == GL_RGBA8 || dstFormat == GL_RGBA4) &&
+              srcFormat == GL_BGRA_EXT && data && w > 0 && h > 0)
+          {
+            const size_t pixelCount = static_cast<size_t>(w) * static_cast<size_t>(h);
+            std::vector<byte> rgba(pixelCount * 4);
+            const byte* bgra = reinterpret_cast<const byte*>(data);
+            for (size_t pixel = 0; pixel < pixelCount; ++pixel)
+            {
+              rgba[pixel * 4 + 0] = bgra[pixel * 4 + 2];
+              rgba[pixel * 4 + 1] = bgra[pixel * 4 + 1];
+              rgba[pixel * 4 + 2] = bgra[pixel * 4 + 0];
+              rgba[pixel * 4 + 3] = bgra[pixel * 4 + 3];
+            }
+            gcpOGL->MirrorVulkanTexture(ti->m_Bind, static_cast<unsigned int>(w),
+                static_cast<unsigned int>(h), rgba.data(),
+                (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_UCLAMP),
+                (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_VCLAMP),
+                (ti->m_Flags & FT_DYNAMIC) != 0);
+          }
+          else if (l == 0 && tgt == GL_TEXTURE_2D && ti->m_TargetType == GL_TEXTURE_2D &&
+                   dstFormat == GL_RGB8 && (srcFormat == GL_BGR_EXT || srcFormat == GL_RGB) &&
+                   data && w > 0 && h > 0)
+          {
+            const size_t pixelCount = static_cast<size_t>(w) * static_cast<size_t>(h);
+            std::vector<byte> rgba(pixelCount * 4);
+            const byte* rgb = reinterpret_cast<const byte*>(data);
+            const bool bgrOrder = srcFormat == GL_BGR_EXT;
+            for (size_t pixel = 0; pixel < pixelCount; ++pixel)
+            {
+              rgba[pixel * 4 + 0] = rgb[pixel * 3 + (bgrOrder ? 2 : 0)];
+              rgba[pixel * 4 + 1] = rgb[pixel * 3 + 1];
+              rgba[pixel * 4 + 2] = rgb[pixel * 3 + (bgrOrder ? 0 : 2)];
+              rgba[pixel * 4 + 3] = 255;
+            }
+            gcpOGL->MirrorVulkanTexture(ti->m_Bind, static_cast<unsigned int>(w),
+                static_cast<unsigned int>(h), rgba.data(),
+                (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_UCLAMP),
+                (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_VCLAMP),
+                (ti->m_Flags & FT_DYNAMIC) != 0);
+          }
           data += TexSize(w, h, depth, srcFormat);
           ti->m_Size += TexSize(w, h, depth, dstFormat);
           w >>= 1;
@@ -2409,6 +2631,17 @@ STexPic *CGLTexMan::CreateTexture(const char *name, int wdt, int hgt, int depth,
       if (IsDXTFormat(dstFormat))
       {
         bool bComp = ((gRenDev->GetFeatures() & RFT_COMPRESSTEXTURE) != 0);
+        if (tgt == GL_TEXTURE_2D && ti->m_TargetType == GL_TEXTURE_2D)
+        {
+          std::vector<byte> rgba;
+          if (DecodeDxtBaseLevel(dst, wdt, hgt, (ti->m_Flags & FT_DXT1) != 0,
+                                 (ti->m_Flags & FT_DXT3) != 0, (ti->m_Flags & FT_DXT5) != 0, rgba))
+            gcpOGL->MirrorVulkanTexture(ti->m_Bind, static_cast<unsigned int>(wdt),
+                static_cast<unsigned int>(hgt), rgba.data(),
+                (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_UCLAMP),
+                (ti->m_Flags & FT_CLAMP) || (ti->m_Flags2 & FT2_VCLAMP),
+                (ti->m_Flags & FT_DYNAMIC) != 0);
+        }
         if (!bComp)
         {
           dst1 = ImgConvertDXT_RGBA(dst, ti, DXTSize);
@@ -2610,6 +2843,22 @@ void CGLTexMan::UpdateTextureRegion(STexPic *pic, byte *data, int X, int Y, int 
     default:
       assert(0);
   }
+  if (pic->m_ETF == eTF_8888 && (pic->m_Flags & FT_DYNAMIC) && pic->m_TargetType == GL_TEXTURE_2D &&
+      X >= 0 && Y >= 0 && USize > 0 && VSize > 0 && data)
+  {
+    const size_t pixels = static_cast<size_t>(USize) * static_cast<size_t>(VSize);
+    std::vector<byte> rgba(pixels * 4);
+    for (size_t i = 0; i < pixels; ++i)
+    {
+      rgba[i * 4 + 0] = data[i * 4 + 2];
+      rgba[i * 4 + 1] = data[i * 4 + 1];
+      rgba[i * 4 + 2] = data[i * 4 + 0];
+      rgba[i * 4 + 3] = data[i * 4 + 3];
+    }
+    gcpOGL->MirrorVulkanTextureRegion(pic->m_Bind, static_cast<unsigned int>(X),
+        static_cast<unsigned int>(Y), static_cast<unsigned int>(USize),
+        static_cast<unsigned int>(VSize), rgba.data());
+  }
   //pic->SaveTGA("Font.tga", 0);
 }
 
@@ -2754,6 +3003,21 @@ void CGLTexMan::UpdateTextureData(STexPic *pic, byte *data, int USize, int VSize
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     pic->m_Flags |= FT_NOMIPS;
+  }
+  if (pic->m_ETF == eTF_8888 && (pic->m_Flags & FT_DYNAMIC) && pic->m_TargetType == GL_TEXTURE_2D &&
+      USize > 0 && VSize > 0 && data)
+  {
+    const size_t pixels = static_cast<size_t>(USize) * static_cast<size_t>(VSize);
+    std::vector<byte> rgba(pixels * 4);
+    for (size_t i = 0; i < pixels; ++i)
+    {
+      rgba[i * 4 + 0] = data[i * 4 + 2];
+      rgba[i * 4 + 1] = data[i * 4 + 1];
+      rgba[i * 4 + 2] = data[i * 4 + 0];
+      rgba[i * 4 + 3] = data[i * 4 + 3];
+    }
+    gcpOGL->MirrorVulkanTextureRegion(pic->m_Bind, 0, 0,
+        static_cast<unsigned int>(USize), static_cast<unsigned int>(VSize), rgba.data());
   }
 }
 

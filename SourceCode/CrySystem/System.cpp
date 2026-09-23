@@ -241,6 +241,14 @@ CSystem::~CSystem()
 {
 	ShutDown(m_bRelaunch);
 
+	// XR session objects refer to the Vulkan device. Release renderer resources,
+	// then the OpenXR session, and destroy the Vulkan device last.
+	m_vulkanFrameRenderer.Shutdown();
+	m_vulkanShaders.Shutdown();
+	m_vulkanResources.Shutdown();
+	m_vrRuntime.Shutdown();
+	m_vulkanContext.Shutdown();
+
 	FreeLib(m_dll.hNetwork);
 	FreeLib(m_dll.hAI);
 	FreeLib(m_dll.hInput);

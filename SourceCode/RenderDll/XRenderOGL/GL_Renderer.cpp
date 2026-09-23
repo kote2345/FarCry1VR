@@ -15,6 +15,7 @@
 #include "GL_Renderer.h"
 #include "GLCGVProgram.h"
 #include "GLCGPShader.h"
+#include "GLVulkanTextureDecode.h"
 
 // GL functions implement.
 #define GL_EXT(name) byte SUPPORTS##name;
@@ -25,6 +26,50 @@
 
 #include "../Common/Shadow_Renderer.h"
 #include "limits.h"
+#include <vector>
+
+static bool ConvertVulkanMirrorPixels(const unsigned char* source, int width, int height,
+                                      ETEX_Format format, std::vector<unsigned char>& rgba)
+{
+  if (!source || width <= 0 || height <= 0)
+    return false;
+  const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+  rgba.resize(count * 4);
+  for (size_t i = 0; i < count; ++i)
+  {
+    switch (format)
+    {
+    case eTF_8888: // GL upload interprets this as BGRA
+      rgba[i * 4 + 0] = source[i * 4 + 2];
+      rgba[i * 4 + 1] = source[i * 4 + 1];
+      rgba[i * 4 + 2] = source[i * 4 + 0];
+      rgba[i * 4 + 3] = source[i * 4 + 3];
+      break;
+    case eTF_RGBA:
+      rgba[i * 4 + 0] = source[i * 4 + 0];
+      rgba[i * 4 + 1] = source[i * 4 + 1];
+      rgba[i * 4 + 2] = source[i * 4 + 2];
+      rgba[i * 4 + 3] = source[i * 4 + 3];
+      break;
+    case eTF_0888: // GL upload interprets this as BGR
+      rgba[i * 4 + 0] = source[i * 3 + 2];
+      rgba[i * 4 + 1] = source[i * 3 + 1];
+      rgba[i * 4 + 2] = source[i * 3 + 0];
+      rgba[i * 4 + 3] = 255;
+      break;
+    case eTF_8000: // GL_ALPHA samples as white RGB with supplied alpha
+      rgba[i * 4 + 0] = 255;
+      rgba[i * 4 + 1] = 255;
+      rgba[i * 4 + 2] = 255;
+      rgba[i * 4 + 3] = source[i];
+      break;
+    default:
+      rgba.clear();
+      return false;
+    }
+  }
+  return true;
+}
 
 int CGLRenderer::CV_gl_useextensions;
 int CGLRenderer::CV_gl_3dfx_gamma_control;
@@ -1678,6 +1723,16 @@ unsigned int CGLRenderer::DownLoadToVideoMemory(unsigned char *data,int w, int h
                   GL_UNSIGNED_BYTE, data);  
   }
 
+  if (tgt == GL_TEXTURE_2D && nummipmap == 0 && data &&
+      (eTFSrc == eTF_8888 || eTFSrc == eTF_RGBA || eTFSrc == eTF_0888 || eTFSrc == eTF_8000))
+  {
+    std::vector<unsigned char> rgba;
+    if (ConvertVulkanMirrorPixels(data, w, h, eTFSrc, rgba))
+      MirrorVulkanTexture(static_cast<int>(tnum), static_cast<unsigned int>(w),
+          static_cast<unsigned int>(h), rgba.data(), !repeat, !repeat,
+          (flags & FT_DYNAMIC) != 0);
+  }
+
   return (tnum);  
 }
 
@@ -1723,6 +1778,16 @@ void CGLRenderer::UpdateTextureInVideoMemory(uint tnum, unsigned char *newdata,i
   {
     int target = TargetTex[tnum] ? TargetTex[tnum] : GL_TEXTURE_2D;
     glTexSubImage2D(target, 0, posx, posy, w, h, srcformat, GL_UNSIGNED_BYTE, newdata);
+  }
+  if ((!TargetTex[tnum] || TargetTex[tnum] == GL_TEXTURE_2D) &&
+      posx >= 0 && posy >= 0 &&
+      (eTF == eTF_8888 || eTF == eTF_RGBA || eTF == eTF_0888 || eTF == eTF_8000))
+  {
+    std::vector<unsigned char> rgba;
+    if (ConvertVulkanMirrorPixels(newdata, w, h, eTF, rgba))
+      MirrorVulkanTextureRegion(static_cast<int>(tnum), static_cast<unsigned int>(posx),
+          static_cast<unsigned int>(posy), static_cast<unsigned int>(w),
+          static_cast<unsigned int>(h), rgba.data());
   }
 }
 
