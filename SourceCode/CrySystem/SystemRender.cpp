@@ -1176,6 +1176,8 @@ void CSystem::Render()
 
 	//////////////////////////////////////////////////////////////////////
 	//draw	
+	bool restoreGameCameraAfterDraw = false;
+	CCamera gameCameraToRestore;
   if (m_pProcess && (m_pProcess->GetFlags() & PROC_3DENGINE))
   {	
 		if (!IsEquivalent(m_ViewCamera.GetPos(),Vec3(0,0,0),VEC_EPSILON))		
@@ -1184,42 +1186,69 @@ void CSystem::Render()
 			{
 				if (m_vulkanFrameRenderer.IsInitialized())
 				{
-					// Keep the engine's scene camera at the game pose. Vulkan applies
-					// the OpenXR orientation once per eye; rotating this camera too
-					// would apply the headset rotation a second time. Expand only the
-					// culling frustum to cover the tracked head direction.
-					CCamera visibilityCamera = m_ViewCamera;
+					// C3DEngine::SetCamera writes through GetViewCamera(), which aliases
+					// CSystem::m_ViewCamera. Keep the unmodified game camera separately:
+					// the engine needs the tracked camera for culling, while Vulkan's
+					// per-eye XR transform must be applied to the original game camera.
+					gameCameraToRestore = m_ViewCamera;
+					// Keep the renderer camera at the game pose because Vulkan applies
+					// the OpenXR orientation once per eye. The 3D engine needs its own
+					// culling camera aimed in the tracked head direction.
+					CCamera visibilityCamera = gameCameraToRestore;
 					const float maxFov = 3.12413936f; // 179 degrees
 					const CryVR::Frame& xrFrame = m_vulkanFrameRenderer.GetCurrentFrame();
-					const float headRotation = m_vulkanFrameRenderer.GetHeadRotationDeltaRadians();
+					const float headYaw = RAD2DEG(m_vulkanFrameRenderer.GetHeadYawDeltaRadians());
+					const float headPitch = RAD2DEG(m_vulkanFrameRenderer.GetHeadPitchDeltaRadians());
+					Vec3 visibilityAngles = visibilityCamera.GetAngles();
+					// In Cry angle space positive x looks down, while positive OpenXR
+					// pitch looks up, so the pitch delta has the opposite sign here.
+					visibilityAngles.x -= headPitch;
+					visibilityAngles.z += headYaw;
+					visibilityCamera.SetAngle(visibilityAngles);
+
+					float xrHorizontalHalfFov = 0.0f;
 					float xrVerticalHalfFov = 0.0f;
 					if (xrFrame.viewsValid)
 					{
 						for (uint32_t eye = 0; eye < xrFrame.viewCount; ++eye)
 						{
 							const XrFovf& fov = xrFrame.views[eye].fov;
-						const float verticalHalfFov = fabsf(fov.angleUp) > fabsf(fov.angleDown)
-							? fabsf(fov.angleUp) : fabsf(fov.angleDown);
-						if (verticalHalfFov > xrVerticalHalfFov)
-							xrVerticalHalfFov = verticalHalfFov;
+							const float horizontalHalfFov = fabsf(fov.angleLeft) > fabsf(fov.angleRight)
+								? fabsf(fov.angleLeft) : fabsf(fov.angleRight);
+							const float verticalHalfFov = fabsf(fov.angleUp) > fabsf(fov.angleDown)
+								? fabsf(fov.angleUp) : fabsf(fov.angleDown);
+							if (horizontalHalfFov > xrHorizontalHalfFov)
+								xrHorizontalHalfFov = horizontalHalfFov;
+							if (verticalHalfFov > xrVerticalHalfFov)
+								xrVerticalHalfFov = verticalHalfFov;
 						}
 					}
 					const float projectionRatio = m_ViewCamera.GetProjRatio() > 0.0f
 						? m_ViewCamera.GetProjRatio() : 0.75f;
-					const float fovForHeadRotation = m_ViewCamera.GetFov() + 2.0f * headRotation;
-					const float fovForEyeProjection =
-						(2.0f * (xrVerticalHalfFov + headRotation)) / projectionRatio;
-					const float expandedFov = fovForEyeProjection > fovForHeadRotation
-						? fovForEyeProjection : fovForHeadRotation;
-					visibilityCamera.SetFov(expandedFov < maxFov ? expandedFov : maxFov);
+					// CCamera's FOV is horizontal; its projection ratio is height/width.
+					// Use the larger of the XR horizontal and vertical extents and a
+					// small guard band for the separation between the two eyes.
+					if (xrFrame.viewsValid && xrFrame.viewCount > 0)
+					{
+						const float guardBand = DEG2RAD(4.0f);
+						const float fovForHorizontalExtent = 2.0f * (xrHorizontalHalfFov + guardBand);
+						const float fovForVerticalExtent =
+							(2.0f * (xrVerticalHalfFov + guardBand)) / projectionRatio;
+						const float expandedFov = fovForVerticalExtent > fovForHorizontalExtent
+							? fovForVerticalExtent : fovForHorizontalExtent;
+						visibilityCamera.SetFov(expandedFov < maxFov ? expandedFov : maxFov);
+					}
 					m_pI3DEngine->SetCamera(visibilityCamera, false);
-					m_pRenderer->SetCamera(m_ViewCamera);
+					m_pRenderer->SetCamera(gameCameraToRestore);
+					restoreGameCameraAfterDraw = true;
 				}
 				else
 					m_pI3DEngine->SetCamera(m_ViewCamera);
 			}
 
 			m_pProcess->Draw();		
+			if (restoreGameCameraAfterDraw)
+				m_ViewCamera = gameCameraToRestore;
 						
 			if (m_pAISystem)		
 				m_pAISystem->DebugDraw(g_pRenderer);		

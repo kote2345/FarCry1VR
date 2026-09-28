@@ -1985,16 +1985,14 @@ void CPlayer::ProcessMovements(CXEntityProcessingCmd &cmd, bool bScheduled)
 	//convert in the format used by physics
 	Vec3d tempangle = cmd.GetDeltaAngles();
 	Vec3d dirangle = tempangle;
-	// In Vulkan VR the eye view is rotated relative to the game's camera by
-	// OpenXR head pose. Movement must use that same camera heading or the player
-	// walks in a direction different from the one they are looking.
+	// The command stores horizontal heading in z (ROLL). ConvertToRad below
+	// remaps that component into YAW, which is what the movement vector uses.
+	// Add the tracked head yaw before that remap so walking follows the HMD view.
 	if (m_pGame && m_pGame->GetSystem() &&
 		m_pGame->GetSystem()->GetIRenderer() &&
 		m_pGame->GetSystem()->GetIRenderer()->GetType() == R_VULKAN_RENDERER)
 	{
-		const CCamera& viewCamera = m_pGame->GetSystem()->GetViewCamera();
-		dirangle[YAW] = viewCamera.GetAngles().z +
-			RAD2DEG(m_pGame->GetSystem()->GetVRHeadYawDeltaRadians());
+		dirangle[ROLL] += RAD2DEG(m_pGame->GetSystem()->GetVRHeadYawDeltaRadians());
 	}
 	 dirangle=ConvertToRad(dirangle);
 
