@@ -738,7 +738,14 @@ void CShader::mfInit (void)
     m_AliasNames.Free();
     fxParserInit();
 
-#if !defined(NULL_RENDERER)
+    // The NULL renderer normally skips material scripts entirely. Vulkan uses
+    // the NULL renderer for its engine integration, but its scene translator
+    // needs the same parsed fixed-function material/pass descriptions as GL.
+    // Keep pure NULL mode lightweight while allowing Vulkan to load the common
+    // and hardware shader definition files (programmable programs still need a
+    // Vulkan translation before their original Cg/NVParse semantics can run).
+    if (gRenDev->GetType() != R_NULL_RENDERER)
+    {
     //FILE *fp = fxopen("Shaders/Aliases.txt", "r");
     FILE *fp = iSystem->GetIPak()->FOpen("Shaders/Aliases.txt", "r");
     if (fp)
@@ -875,7 +882,7 @@ void CShader::mfInit (void)
     if (CRenderer::CV_r_usehwshaders)
       mfLoadFromFiles(1);
     m_CurEfsNum = 0;
-#endif //NULL_RENDERER
+    }
     mfSetDefaults();
 
     m_bInitialized = true;

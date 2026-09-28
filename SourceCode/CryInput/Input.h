@@ -147,8 +147,20 @@ public:
 	inline	int		JoyGetDirReleased(int idCtrl)		{ return (m_Joystick.GetDirReleased(idCtrl)); }	
 	inline	int		JoyGetHatDirPressed(int idCtrl)  { return (m_Joystick.GetHatDirPressed(idCtrl)); }
 	inline	int		JoyGetHatDirReleased(int idCtrl)  { return (m_Joystick.GetHatDirReleased(idCtrl)); }
-	inline	Vec3	JoyGetAnalog1Dir(int idCtrl) const  { return (m_Joystick.GetAnalog1Dir(idCtrl)); }		
-	inline	Vec3	JoyGetAnalog2Dir(int idCtrl) const  { return (m_Joystick.GetAnalog2Dir(idCtrl)); }		
+	inline Vec3 JoyGetAnalog1Dir(int idCtrl) const
+	{
+		return m_vrAxesActive && idCtrl == 0 ? m_vrMoveAxes : m_Joystick.GetAnalog1Dir(idCtrl);
+	}
+	inline Vec3 JoyGetAnalog2Dir(int idCtrl) const
+	{
+		return m_vrAxesActive && idCtrl == 0 ? m_vrLookAxes : m_Joystick.GetAnalog2Dir(idCtrl);
+	}
+	void SetVRControllerAxes(const Vec3& moveAxes, const Vec3& lookAxes) override
+	{
+		m_vrMoveAxes = moveAxes;
+		m_vrLookAxes = lookAxes;
+		m_vrAxesActive = true;
+	}
 
 	bool JoyIsXKeyPressed(int idCtrl,int idXKey);
 	bool JoyIsXKeyDown(int idCtrl,int idXKey);
@@ -271,6 +283,9 @@ private:
 	CXMouse		m_Mouse;
 #endif
 	CJoystick	m_Joystick;
+	Vec3 m_vrMoveAxes = Vec3(0, 0, 0);
+	Vec3 m_vrLookAxes = Vec3(0, 0, 0);
+	bool m_vrAxesActive = false;
 #ifdef _XBOX
   CXGamepad m_Gamepad;
 #endif

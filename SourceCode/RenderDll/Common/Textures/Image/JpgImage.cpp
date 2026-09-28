@@ -215,7 +215,7 @@ mfSet_error(eIFE_BadFormat, "IJL disabled");
 
 #if defined(WIN64) || defined(__linux)
 
-#ifdef __linux
+#if defined(WIN64) || defined(__linux)
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 #endif

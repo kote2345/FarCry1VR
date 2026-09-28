@@ -144,6 +144,8 @@ public:
 	CryVR::Runtime* GetVRRuntime() { return &m_vrRuntime; }
 	CryVR::VulkanContext* GetVulkanContext() { return &m_vulkanContext; }
 	CryVR::VulkanFrameRenderer* GetVulkanFrameRenderer() { return &m_vulkanFrameRenderer; }
+	float GetVRHeadYawDeltaRadians() const override { return m_vulkanFrameRenderer.GetHeadYawDeltaRadians(); }
+	float GetVRHeadPitchDeltaRadians() const override { return m_vulkanFrameRenderer.GetHeadPitchDeltaRadians(); }
 	CryVR::VulkanResourceManager* GetVulkanResources() { return &m_vulkanResources; }
 	CryVR::VulkanShaderLibrary* GetVulkanShaders() { return &m_vulkanShaders; }
 	const char			*GetGameMOD() { if (m_szGameMOD[0]) return (m_szGameMOD);return (NULL); }

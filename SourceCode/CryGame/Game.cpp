@@ -2152,7 +2152,16 @@ ITagPointManager* CXGame::GetTagPointManager()
 
 string CXGame::GetPlayerProfilePath()
 {
-#ifdef __linux
+#ifdef __ANDROID__
+	// Android installs may start with a clean external game directory. The
+	// menu asks for the save-game list before starting a new game, so ensure
+	// the default profile path exists instead of trapping when "profiles" is
+	// absent from the working directory.
+	const char *profilePath = "Profiles/Player/";
+	if (m_pSystem && m_pSystem->GetIPak())
+		m_pSystem->GetIPak()->MakeDir(profilePath);
+	return profilePath;
+#elif defined(__linux)
 	DIR *fdir;
 	int found_profiles = 0;
 	int found_player = 0;

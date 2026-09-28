@@ -14,6 +14,7 @@
 #include "Image/CImage.h"
 #include <Names.h>
 #include "../ResFile.h"
+#include <XRenderNullApi.h>
 
 #define TX_FIRSTBIND 0x1000
 #define TX_LASTBIND  0x4000
@@ -907,7 +908,7 @@ public:
 public:
   static bool m_bRGBA;
 
-  static int m_CurStage;
+  static XRENDERNULL_API int m_CurStage;
   static int m_nCurStages;
 
   short m_nEnvCX, m_nEnvCY, m_nEnvCZ;

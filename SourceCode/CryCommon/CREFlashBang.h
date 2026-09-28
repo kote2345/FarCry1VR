@@ -79,6 +79,16 @@ public:
   {
     return m_fFlashTimeOut;
   };
+
+  void UpdateFlashTimeOut(float frameTime)
+  {
+    m_fFlashTimeOut -= 0.00009f * m_fTimeScale * (frameTime * 1000.0f);
+    if(m_fFlashTimeOut<=0.01f)
+    {
+      m_bIsActive=0;
+      m_fFlashTimeOut=1.0f;
+    }
+  }
   
 private:
   // active flag

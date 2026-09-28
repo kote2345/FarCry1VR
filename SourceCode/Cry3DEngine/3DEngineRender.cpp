@@ -35,6 +35,18 @@
 
 void C3DEngine::Draw()
 {
+	static unsigned int vulkanDrawAuditCalls = 0;
+	const unsigned int vulkanDrawAuditCall = vulkanDrawAuditCalls++;
+	if (vulkanDrawAuditCall < 8 || (vulkanDrawAuditCall % 120) == 0)
+	{
+		const Vec3 cameraPosition = GetViewCamera().GetPos();
+		CryLogAlways("3DEngine draw path: call=%u enabled=%u camera=(%.3f,%.3f,%.3f) obj=%p decal=%p terrain=%p maxView=%.3f fogFar=%.3f frame=%d recurse=%d",
+			vulkanDrawAuditCall, m_bEnabled ? 1u : 0u,
+			cameraPosition.x, cameraPosition.y, cameraPosition.z,
+			m_pObjManager, m_pDecalManager, m_pTerrain,
+			m_fMaxViewDist, m_fFogFarDist, GetRenderer()->GetFrameID(),
+			(int)(INT_PTR)GetRenderer()->EF_Query(EFQ_RecurseLevel));
+	}
 	m_bProfilerEnabled = GetISystem()->GetIProfileSystem()->IsProfiling();
 
 	FUNCTION_PROFILER( GetSystem(),PROFILE_3DENGINE );
@@ -165,6 +177,12 @@ void C3DEngine::Draw()
 
 void C3DEngine::RenderScene(unsigned int dwDrawFlags)
 {
+	static unsigned int vulkanSceneAuditCalls = 0;
+	const unsigned int vulkanSceneAuditCall = vulkanSceneAuditCalls++;
+	if (vulkanSceneAuditCall < 8 || (vulkanSceneAuditCall % 120) == 0)
+		CryLogAlways("3DEngine scene path: call=%u terrain=%p stack=%d recurse=%d drawFlags=0x%x",
+			vulkanSceneAuditCall, m_pTerrain, m_nRenderStackLevel,
+			(int)(INT_PTR)GetRenderer()->EF_Query(EFQ_RecurseLevel), dwDrawFlags);
 	FUNCTION_PROFILER( GetSystem(),PROFILE_3DENGINE );
   if (!m_pTerrain)
     return;

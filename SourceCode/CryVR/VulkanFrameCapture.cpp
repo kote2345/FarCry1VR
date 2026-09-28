@@ -31,15 +31,17 @@ void MultiplyColumnMajor(const float a[16], const float b[16], float out[16])
         out[i] = result[i];
 }
 
-bool BuildProjection(const XrFovf& fov, float nearPlane, float farPlane, float projection[16])
+bool BuildProjection(const XrFovf& fov, float nearPlane, float farPlane, float projection[16],
+                     float fovScale = 1.0f)
 {
-    const float left = std::tan(fov.angleLeft);
-    const float right = std::tan(fov.angleRight);
-    const float down = std::tan(fov.angleDown);
-    const float up = std::tan(fov.angleUp);
+    const float left = std::tan(fov.angleLeft * fovScale);
+    const float right = std::tan(fov.angleRight * fovScale);
+    const float down = std::tan(fov.angleDown * fovScale);
+    const float up = std::tan(fov.angleUp * fovScale);
     if (!projection || !std::isfinite(left) || !std::isfinite(right) ||
         !std::isfinite(down) || !std::isfinite(up) || !(right > left) || !(up > down) ||
-        !(nearPlane > 0.0f) || !(farPlane > nearPlane))
+        !(nearPlane > 0.0f) || !(farPlane > nearPlane) ||
+        !(fovScale > 0.0f) || !std::isfinite(fovScale))
         return false;
     const float depth = nearPlane - farPlane;
     const float values[16] = {
@@ -89,6 +91,40 @@ bool BuildPoseMatrix(const XrPosef& pose, float matrix[16])
 }
 }
 
+bool GetOpenXrRelativeOrientation(const XrQuaternionf& origin,
+                                  const XrQuaternionf& current,
+                                  XrQuaternionf& relative)
+{
+    const float originLength = std::sqrt(origin.x*origin.x + origin.y*origin.y +
+        origin.z*origin.z + origin.w*origin.w);
+    const float currentLength = std::sqrt(current.x*current.x + current.y*current.y +
+        current.z*current.z + current.w*current.w);
+    if (!(originLength > 0.0f) || !(currentLength > 0.0f) ||
+        !std::isfinite(originLength) || !std::isfinite(currentLength))
+        return false;
+
+    const Quat inverseOrigin{-origin.x / originLength, -origin.y / originLength,
+                             -origin.z / originLength, origin.w / originLength};
+    const Quat normalizedCurrent{current.x / currentLength, current.y / currentLength,
+                                 current.z / currentLength, current.w / currentLength};
+    Quat result{
+        inverseOrigin.w*normalizedCurrent.x + normalizedCurrent.w*inverseOrigin.x +
+            inverseOrigin.y*normalizedCurrent.z - inverseOrigin.z*normalizedCurrent.y,
+        inverseOrigin.w*normalizedCurrent.y + normalizedCurrent.w*inverseOrigin.y +
+            inverseOrigin.z*normalizedCurrent.x - inverseOrigin.x*normalizedCurrent.z,
+        inverseOrigin.w*normalizedCurrent.z + normalizedCurrent.w*inverseOrigin.z +
+            inverseOrigin.x*normalizedCurrent.y - inverseOrigin.y*normalizedCurrent.x,
+        inverseOrigin.w*normalizedCurrent.w - inverseOrigin.x*normalizedCurrent.x -
+            inverseOrigin.y*normalizedCurrent.y - inverseOrigin.z*normalizedCurrent.z};
+    const float resultLength = std::sqrt(result.x*result.x + result.y*result.y +
+        result.z*result.z + result.w*result.w);
+    if (!(resultLength > 0.0f) || !std::isfinite(resultLength))
+        return false;
+    relative = XrQuaternionf{result.x / resultLength, result.y / resultLength,
+                             result.z / resultLength, result.w / resultLength};
+    return true;
+}
+
 bool BuildOpenXrViewProjection(const XrView& view, float nearPlane,
                                float farPlane, float viewProjection[16])
 {
@@ -104,14 +140,46 @@ bool BuildOpenXrViewProjection(const XrView& view, float nearPlane,
 
 bool BuildOpenXrEyeMvp(const XrView& eye, const XrPosef& referenceHeadPose,
                        const float referenceModelView[16],
-                       float nearPlane, float farPlane, float mvp[16], float eyeModelView[16])
+                       float nearPlane, float farPlane, float mvp[16], float eyeModelView[16],
+                       bool nearestObject)
 {
     if (!referenceModelView || !mvp) return false;
-    float eyeView[16], referenceTransform[16], delta[16], projection[16], viewModel[16];
-    if (!BuildEyeView(eye.pose, eyeView) || !BuildPoseMatrix(referenceHeadPose, referenceTransform) ||
-        !BuildProjection(eye.fov, nearPlane, farPlane, projection)) return false;
-    MultiplyColumnMajor(eyeView, referenceTransform, delta);
-    MultiplyColumnMajor(delta, referenceModelView, viewModel);
+    XrPosef relativeEye{};
+    if (!GetOpenXrRelativeOrientation(referenceHeadPose.orientation,
+                                      eye.pose.orientation,
+                                      relativeEye.orientation))
+        return false;
+
+    Quat inverseCurrent{-eye.pose.orientation.x, -eye.pose.orientation.y,
+                        -eye.pose.orientation.z, eye.pose.orientation.w};
+    const float currentLength = std::sqrt(inverseCurrent.x*inverseCurrent.x +
+        inverseCurrent.y*inverseCurrent.y + inverseCurrent.z*inverseCurrent.z +
+        inverseCurrent.w*inverseCurrent.w);
+    if (!(currentLength > 0.0f) || !std::isfinite(currentLength) ||
+        !std::isfinite(referenceHeadPose.position.x) ||
+        !std::isfinite(referenceHeadPose.position.y) ||
+        !std::isfinite(referenceHeadPose.position.z) ||
+        !std::isfinite(eye.pose.position.x) || !std::isfinite(eye.pose.position.y) ||
+        !std::isfinite(eye.pose.position.z))
+        return false;
+    inverseCurrent.x /= currentLength;
+    inverseCurrent.y /= currentLength;
+    inverseCurrent.z /= currentLength;
+    inverseCurrent.w /= currentLength;
+    const Vec3 worldDelta{eye.pose.position.x - referenceHeadPose.position.x,
+                          eye.pose.position.y - referenceHeadPose.position.y,
+                          eye.pose.position.z - referenceHeadPose.position.z};
+    const Vec3 eyeLocal = Rotate(inverseCurrent, worldDelta);
+    const Quat relativeQ{relativeEye.orientation.x, relativeEye.orientation.y,
+                         relativeEye.orientation.z, relativeEye.orientation.w};
+    const Vec3 eyeInOrigin = Rotate(relativeQ, eyeLocal);
+    relativeEye.position = XrVector3f{eyeInOrigin.x, eyeInOrigin.y, eyeInOrigin.z};
+
+    float eyeView[16], projection[16], viewModel[16];
+    if (!BuildEyeView(relativeEye, eyeView) ||
+        !BuildProjection(eye.fov, nearPlane, farPlane, projection,
+                         nearestObject ? 0.6666f : 1.0f)) return false;
+    MultiplyColumnMajor(eyeView, referenceModelView, viewModel);
     MultiplyColumnMajor(projection, viewModel, mvp);
     if (eyeModelView)
         for (int i = 0; i < 16; ++i) eyeModelView[i] = viewModel[i];
@@ -148,8 +216,9 @@ bool BuildFlatPanelMvp(const XrView& leftView, const XrView& rightView,
                         panelCenter.z-eyePosition.z};
     const Vec3 translation = Rotate(inverseEye, relative);
 
-    // Keep the panel approximately 1.25m tall at its center distance.
-    const float halfHeight = 0.625f;
+    // Keep the menu comfortably readable in VR instead of a small desktop
+    // window floating at a distance.
+    const float halfHeight = 0.95f;
     const float halfWidth = halfHeight * aspectRatio;
     const Vec3 cameraRight = Rotate(inverseEye, {right.x*halfWidth, right.y*halfWidth, right.z*halfWidth});
     const Vec3 cameraUp = Rotate(inverseEye, {up.x*halfHeight, up.y*halfHeight, up.z*halfHeight});

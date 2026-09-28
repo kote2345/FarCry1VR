@@ -14,6 +14,8 @@
 #ifndef _RENDERER_H
 #define _RENDERER_H
 
+#include <XRenderNullApi.h>
+
 #if _MSC_VER > 1000
 # pragma once
 #endif
@@ -1044,7 +1046,7 @@ public:
 
   static int CV_r_specantialias;
   static float CV_r_shininess;
-  static float CV_r_wavescale;
+  static XRENDERNULL_API float CV_r_wavescale;
 
   static int CV_r_logusedtextures;
   static int CV_r_logusedshaders;
@@ -1101,7 +1103,7 @@ public:
   static int CV_r_waterrefractions;
   static int CV_r_waterbeachrefractions;
   static int CV_r_selfrefract;
-  static int CV_r_texture_anisotropic_level;
+  static XRENDERNULL_API int CV_r_texture_anisotropic_level;
   static int CV_r_oceanrendtype;
   static int CV_r_oceansectorsize;
   static int CV_r_oceanheightscale;
@@ -1128,7 +1130,7 @@ public:
   static int CV_r_noloadtextures;
   static int CV_r_texbindmode;
   static int CV_r_nodrawshaders;
-  static int CV_r_nodrawnear;
+  static XRENDERNULL_API int CV_r_nodrawnear;
 
   static int CV_r_nops20;
   static int CV_r_nops30;
@@ -1166,7 +1168,7 @@ public:
   static float CV_r_embm;
   static int CV_r_sse;
   static int CV_r_coronas;
-  static int CV_r_scissor;
+  static XRENDERNULL_API int CV_r_scissor;
   static float CV_r_coronafade;
   static float CV_r_coronacolorscale;
   static float CV_r_coronasizescale;
@@ -1175,7 +1177,7 @@ public:
 	
   static int CV_r_noparticles;
 
-  static int CV_r_cullbyclipplanes;
+  static XRENDERNULL_API int CV_r_cullbyclipplanes;
   static int CV_r_accurateparticles;
 
 	static int CV_ind_VisualizeShadowVolumes;		
@@ -1190,7 +1192,7 @@ public:
   static int CV_r_vpfog;
   static int CV_r_printmemoryleaks;
   static float CV_r_character_lod_bias;
-  static int CV_r_character_nodeform;
+  static XRENDERNULL_API int CV_r_character_nodeform;
   static int CV_r_character_debug;
   static int CV_r_character_noanim;
   static int CV_r_shadow_maps_debug;

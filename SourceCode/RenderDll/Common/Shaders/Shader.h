@@ -14,6 +14,7 @@
 #include <Names.h>
 #include <vector>
 #include "../Defs.h"
+#include <XRenderNullApi.h>
 
 
 // Shader.h
@@ -3038,7 +3039,7 @@ struct SParamComp_Opacity : public SParamComp
 
 struct SParam
 {
-  static vec4_t m_sFVals;
+  static XRENDERNULL_API vec4_t m_sFVals;
   unsigned int m_Flags;
   unsigned int m_Reg;
   SParamComp *m_Comps[4];
@@ -3440,7 +3441,7 @@ public:
   float m_fIntensity;
   float m_LastTime;
 
-  static TArray <CLightStyle *> m_LStyles;  
+  static XRENDERNULL_API TArray <CLightStyle *> m_LStyles;
 
   int Size()
   {
@@ -4285,8 +4286,8 @@ struct SShader : public IShader
   int mfSize();
 
   // All loaded shaders list
-  static TArray<SShader *> m_Shaders_known;
-  static TArray<SRenderShaderResources *> m_ShaderResources_known;
+  static XRENDERNULL_API TArray<SShader *> m_Shaders_known;
+  static XRENDERNULL_API TArray<SRenderShaderResources *> m_ShaderResources_known;
   
   virtual bool mfIsValidTime(CCObject *obj, float curtime);
   virtual int Size(int Flags)

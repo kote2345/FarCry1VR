@@ -936,7 +936,6 @@ struct IInput
 	virtual Vec3 JoyGetAnalog1Dir(int idCtrl) const  = 0;		
 	//! get the next 3 axis (ruv)
 	virtual Vec3 JoyGetAnalog2Dir(int idCtrl) const = 0;
-
 	virtual bool JoyIsXKeyPressed(int idCtrl,int idXKey)=0;
 	virtual bool JoyIsXKeyDown(int idCtrl,int idXKey)=0;
 	virtual bool JoyIsXKeyReleased(int idCtrl,int idXKey)=0;
@@ -996,6 +995,10 @@ struct IInput
 	virtual void ClearKeyState() = 0;
 
 	virtual unsigned char GetKeyState(int nKey) = 0;
+
+	// Optional VR axes. Appended to preserve the existing IInput vtable layout
+	// for implementations that do not provide this hook.
+	virtual void SetVRControllerAxes(const Vec3& moveAxes, const Vec3& lookAxes) { }
 };
 
 

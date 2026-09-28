@@ -630,12 +630,13 @@ _inline int CullBoxByPlane (float *Mins, float *Maxs, SPlane *p)
 //===============================================================================================
 
 // Interfaces from the Game
-extern ILog     *iLog;
-extern IConsole *iConsole;
-extern ITimer   *iTimer;
-extern ISystem  *iSystem;
-extern int *pTest_int;
-extern IPhysicalWorld *pIPhysicalWorld;
+#include <XRenderNullApi.h>
+extern XRENDERNULL_API ILog     *iLog;
+extern XRENDERNULL_API IConsole *iConsole;
+extern XRENDERNULL_API ITimer   *iTimer;
+extern XRENDERNULL_API ISystem  *iSystem;
+extern XRENDERNULL_API int *pTest_int;
+extern XRENDERNULL_API IPhysicalWorld *pIPhysicalWorld;
 
 #define MAX_PATH_LENGTH	512
 

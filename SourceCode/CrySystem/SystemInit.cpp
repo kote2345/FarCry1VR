@@ -159,11 +159,20 @@ void RequireVulkanPanelFallback(void* drawUserData)
 bool MirrorVulkanRgbaTexture(void* drawUserData, int textureId, unsigned int width,
                              unsigned int height, const unsigned char* rgbaPixels,
                              bool clampU, bool clampV, bool dynamicTexture, bool noMipmaps,
-                             int filterMode)
+                             int filterMode, float maxAnisotropy)
 {
     CryVR::VulkanFrameRenderer* renderer = static_cast<CryVR::VulkanFrameRenderer*>(drawUserData);
     return renderer && renderer->RegisterLegacyRgbaTexture(textureId, width, height,
-        rgbaPixels, clampU, clampV, dynamicTexture, noMipmaps, filterMode);
+        rgbaPixels, clampU, clampV, dynamicTexture, noMipmaps, filterMode, maxAnisotropy);
+}
+
+bool MirrorVulkanRgbaCubeTexture(void* drawUserData, int textureId, unsigned int width,
+                                 unsigned int height, const unsigned char* const facePixels[6],
+                                 bool noMipmaps, int filterMode, float maxAnisotropy)
+{
+    CryVR::VulkanFrameRenderer* renderer = static_cast<CryVR::VulkanFrameRenderer*>(drawUserData);
+    return renderer && renderer->RegisterLegacyRgbaCubeTexture(textureId, width, height,
+        facePixels, noMipmaps, filterMode, maxAnisotropy);
 }
 
 bool MirrorVulkanRgbaTextureRegion(void* drawUserData, int textureId, unsigned int x,
@@ -608,12 +617,7 @@ bool CSystem::InitRenderer(WIN_HINSTANCE hinst, WIN_HWND hwnd,const char *szCmdL
 	// receives the shared runtime and device context through the import struct.
 	if (szCmdLine && strstr(szCmdLine, "-vr"))
 	{
-		void *androidEnv = 0;
-		void *androidActivity = 0;
-#if defined(__ANDROID__)
-		CryVR::GetAndroidOpenXRContext(&androidEnv, &androidActivity);
-#endif
-		if (!m_vrRuntime.Initialize("Far Cry", "CryEngine 1", androidEnv, androidActivity))
+		if (!m_vrRuntime.Initialize("Far Cry", "CryEngine 1"))
 		{
 			CryLogAlways("OpenXR: runtime initialization failed: %s", m_vrRuntime.GetLastError());
 			return false;
@@ -756,6 +760,7 @@ bool CSystem::InitRenderer(WIN_HINSTANCE hinst, WIN_HWND hwnd,const char *szCmdL
 			bufferCallbacks.queueClientIndexedDraw = QueueVulkanClientStockDraw;
 			bufferCallbacks.requirePanelFallback = RequireVulkanPanelFallback;
 			bufferCallbacks.mirrorRgbaTexture = MirrorVulkanRgbaTexture;
+			bufferCallbacks.mirrorRgbaCubeTexture = MirrorVulkanRgbaCubeTexture;
 			bufferCallbacks.mirrorRgbaTextureRegion = MirrorVulkanRgbaTextureRegion;
 			bufferCallbacks.releaseMirroredTexture = ReleaseMirroredVulkanTexture;
 		}

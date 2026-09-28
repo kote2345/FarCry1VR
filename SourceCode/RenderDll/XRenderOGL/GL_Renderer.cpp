@@ -194,6 +194,7 @@ CGLRenderer::CGLRenderer()
 {
 	if (!gcpOGL)
     gcpOGL = this;
+  SetType(R_GL_RENDERER);
 
 #ifdef DEBUGALLOC
 #undef new

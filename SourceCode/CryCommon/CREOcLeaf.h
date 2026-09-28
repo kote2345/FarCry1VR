@@ -1,6 +1,8 @@
 #ifndef __CREOCLEAF_H__
 #define __CREOCLEAF_H__
 
+#include "XRenderNullApi.h"
+
 //=============================================================
 
 struct SLightIndicies
@@ -88,7 +90,7 @@ public:
     mMaskLight2 = 0;
     m_Center.Set(0,0,0);
   }
-  SLightIndicies *mfGetIndiciesForLight(CDLight *pDLight);
+  XRENDERNULL_API SLightIndicies *mfGetIndiciesForLight(CDLight *pDLight);
   void mfGenerateIndicesInsideFrustrum(SLightIndicies *li, CDLight *pDLight);
   void mfGenerateIndicesForAttenuation(SLightIndicies *li, CDLight *pDLight);
   void mfFillRB(CCObject *pObj);

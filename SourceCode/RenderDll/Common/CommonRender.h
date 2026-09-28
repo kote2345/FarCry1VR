@@ -35,13 +35,14 @@ int gfCullBoundBox(float *minmax);
 
 #define CR_LITTLE_ENDIAN
 
+#include <XRenderNullApi.h>
 
 extern TArray <CFColor> gCurLightStyles;
 
 struct SWaveForm;
 struct SShader;
 
-extern bool gbRgb;
+extern XRENDERNULL_API bool gbRgb;
 
 _inline DWORD COLCONV (DWORD clr)
 {
@@ -79,6 +80,7 @@ _inline void d2f(float *dst, double *src)
 
 struct SGenTC_NormalMap : public SGenTC
 {
+  virtual EGenTCType GetType() const { return eGTCType_NormalMap; }
   virtual SGenTC *mfCopy();
   virtual bool mfSet(bool bEnable);
   virtual void mfCompile(char *params, SShader *ef);
@@ -91,6 +93,7 @@ struct SGenTC_NormalMap : public SGenTC
 
 struct SGenTC_ReflectionMap : public SGenTC
 {
+  virtual EGenTCType GetType() const { return eGTCType_ReflectionMap; }
   virtual SGenTC *mfCopy();
   virtual bool mfSet(bool bEnable);
   virtual void mfCompile(char *params, SShader *ef);
@@ -103,6 +106,7 @@ struct SGenTC_ReflectionMap : public SGenTC
 
 struct SGenTC_SphereMap : public SGenTC
 {
+  virtual EGenTCType GetType() const { return eGTCType_SphereMap; }
   virtual SGenTC *mfCopy();
   virtual bool mfSet(bool bEnable);
   virtual void mfCompile(char *params, SShader *ef);
@@ -115,6 +119,7 @@ struct SGenTC_SphereMap : public SGenTC
 
 struct SGenTC_EmbossMap : public SGenTC
 {
+  virtual EGenTCType GetType() const { return eGTCType_EmbossMap; }
   virtual SGenTC *mfCopy();
   virtual bool mfSet(bool bEnable);
   virtual void mfCompile(char *params, SShader *ef);
@@ -128,6 +133,8 @@ struct SGenTC_EmbossMap : public SGenTC
 struct SGenTC_ObjectLinear : public SGenTC
 {
   TArray<SParam> m_Params;
+
+  virtual EGenTCType GetType() const { return eGTCType_ObjectLinear; }
   
   virtual ~SGenTC_ObjectLinear()
   {
@@ -147,6 +154,8 @@ struct SGenTC_ObjectLinear : public SGenTC
 struct SGenTC_EyeLinear : public SGenTC
 {
   TArray<SParam> m_Params;
+
+  virtual EGenTCType GetType() const { return eGTCType_EyeLinear; }
   
   virtual ~SGenTC_EyeLinear()
   {

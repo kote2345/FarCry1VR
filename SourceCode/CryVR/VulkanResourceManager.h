@@ -55,6 +55,8 @@ public:
                             bool generateMipmaps = true);
     bool CreateDepthImage(uint32_t width, uint32_t height, VkFormat format,
                           VulkanTexture& texture);
+    bool CreateColorTarget(uint32_t width, uint32_t height, VkFormat format,
+                           VulkanTexture& texture);
     bool UpdateTextureRGBA8(const void* rgbaData, uint32_t width, uint32_t height,
                             VulkanTexture& texture);
     bool PrepareTextureRGBA8Update(const void* rgbaData, uint32_t width, uint32_t height,

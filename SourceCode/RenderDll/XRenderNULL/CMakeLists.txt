@@ -105,6 +105,13 @@ else() #x64
 endif()
 
 add_library(${PROJECT_NAME} SHARED ${SRC_FILES})
+target_compile_definitions(${PROJECT_NAME} PRIVATE XRENDERNULL_EXPORTS)
+
+# XRenderVulkan reuses the NULL renderer's common shader, texture, and
+# render-element implementations. Export those common symbols so the Vulkan
+# backend can link against the shared implementation instead of compiling a
+# second copy with separate renderer globals.
+set_target_properties(${PROJECT_NAME} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/SourceCode/CryCommon

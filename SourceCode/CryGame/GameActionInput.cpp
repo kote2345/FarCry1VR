@@ -108,10 +108,20 @@ void CXGame::SetCommonKeyBindings(IActionMap *pMap)
 	//pMap->BindAction(ACTION_MOVE_BACKWARD,XKEY_J_DIR_DOWN);
 
 	//look around
-	pMap->BindAction(ACTION_TURNLR,XKEY_MAXIS_X);
-	pMap->BindAction(ACTION_TURNUD,XKEY_MAXIS_Y);
-	//pMap->BindAction(ACTION_TURNLR,XKEY_J_AXIS_5);
-	//pMap->BindAction(ACTION_TURNUD,XKEY_J_AXIS_4);
+	IRenderer* pRenderer = GetSystem()->GetIRenderer();
+	const bool bVulkanVR = pRenderer && pRenderer->GetType() == R_VULKAN_RENDERER;
+	if (bVulkanVR)
+	{
+		// Vulkan VR samples the right stick directly in CXClient::Update so
+		// its turn rate is frame-time based and independent of legacy axis binds.
+	}
+	else
+	{
+		pMap->BindAction(ACTION_TURNLR,XKEY_MAXIS_X);
+		pMap->BindAction(ACTION_TURNUD,XKEY_MAXIS_Y);
+		pMap->BindAction(ACTION_TURNLR,XKEY_J_AXIS_4);
+		pMap->BindAction(ACTION_TURNUD,XKEY_J_AXIS_5);
+	}
 		
 	//reload 
 	pMap->BindAction(ACTION_RELOAD,XKEY_R);

@@ -969,6 +969,17 @@ struct STexAnim
   }
 };
 
+enum EGenTCType
+{
+  eGTCType_Unknown,
+  eGTCType_ObjectLinear,
+  eGTCType_EyeLinear,
+  eGTCType_NormalMap,
+  eGTCType_ReflectionMap,
+  eGTCType_SphereMap,
+  eGTCType_EmbossMap
+};
+
 struct SGenTC     
 {
   int m_Mask;
@@ -985,6 +996,7 @@ struct SGenTC
   virtual bool mfSet(bool bEnable) = 0;
   virtual void mfCompile(char *params, SShader *ef) = 0;
   virtual int Size() = 0;
+  virtual EGenTCType GetType() const { return eGTCType_Unknown; }
 };
 
 // Type of the texture

@@ -374,6 +374,11 @@ struct ISystem
 
 	// Get current configuration specification.
 	virtual ESystemConfigSpec GetConfigSpec() = 0;
+
+	// OpenXR head rotation relative to the game's camera reference, in radians.
+	// Keep VR extensions at the end so existing ISystem vtable slots stay stable.
+	virtual float GetVRHeadYawDeltaRadians() const { return 0.0f; }
+	virtual float GetVRHeadPitchDeltaRadians() const { return 0.0f; }
 };
 
 //////////////////////////////////////////////////////////////////////////

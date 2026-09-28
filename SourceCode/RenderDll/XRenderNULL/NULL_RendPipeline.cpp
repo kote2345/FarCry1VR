@@ -213,6 +213,31 @@ void CNULLRenderer::PS2SetCull(ECull eCull)
 
 void CRenderer::EF_SetState(int st)
 {
+  // Match the state-mask resolution performed by the OpenGL renderer. Shader
+  // passes use these masks to inherit state selected earlier in the current
+  // flush; leaving the raw sentinels in m_CurState makes Vulkan reject the
+  // state or select a different immutable pipeline.
+  const int changed = st ^ m_CurState;
+  if ((changed & (GS_DEPTHFUNC_EQUAL | GS_DEPTHFUNC_GREAT)) &&
+      (m_RP.m_FlagsPerFlush & RBSI_DEPTHFUNC))
+  {
+    const int mask = GS_DEPTHFUNC_EQUAL | GS_DEPTHFUNC_GREAT;
+    st = (st & ~mask) | (m_CurState & mask);
+  }
+  if (changed & GS_BLEND_MASK)
+  {
+    if ((st & GS_BLEND_MASK) == GS_BLEND_MASK ||
+        (m_RP.m_FlagsPerFlush & RBSI_ALPHABLEND))
+      st = (st & ~GS_BLEND_MASK) | (m_CurState & GS_BLEND_MASK);
+  }
+  if ((changed & GS_DEPTHWRITE) && (m_RP.m_FlagsPerFlush & RBSI_DEPTHWRITE))
+    st = (st & ~GS_DEPTHWRITE) | (m_CurState & GS_DEPTHWRITE);
+  if ((changed & GS_NODEPTHTEST) && (m_RP.m_FlagsPerFlush & RBSI_DEPTHTEST))
+    st = (st & ~GS_NODEPTHTEST) | (m_CurState & GS_NODEPTHTEST);
+  if ((changed & GS_STENCIL) && (m_RP.m_FlagsPerFlush & RBSI_STENCIL))
+    st = (st & ~GS_STENCIL) | (m_CurState & GS_STENCIL);
+  if ((changed & GS_ALPHATEST_MASK) && (m_RP.m_FlagsPerFlush & RBSI_ALPHATEST))
+    st = (st & ~GS_ALPHATEST_MASK) | (m_CurState & GS_ALPHATEST_MASK);
   m_CurState = st;
 }
 

@@ -854,6 +854,46 @@ void CXClient::Update()
 			return;
 	}
 
+	// The Android OpenXR controller axes are supplied independently from the
+	// legacy joystick device. Poll the right stick here, in the same player
+	// command update that consumes turn input, instead of relying on the old
+	// action-map axis hold path (which can miss OpenXR-only axes).
+	if (pPlayer && !m_pGame->m_bMenuOverlay)
+	{
+		IRenderer* pRenderer = m_pGame->GetSystem()->GetIRenderer();
+		IInput* pInput = m_pGame->GetSystem()->GetIInput();
+		if (pRenderer && pRenderer->GetType() == R_VULKAN_RENDERER && pInput)
+		{
+			const float axis = pInput->JoyGetAnalog2Dir(
+				pInput->JoyGetDefaultControllerId()).x;
+			const float magnitude = fabsf(axis);
+			float turnAxis = 0.0f;
+			if (magnitude > 0.15f)
+				turnAxis = (axis < 0.0f ? -1.0f : 1.0f) *
+					((magnitude - 0.15f) / 0.85f);
+			float frameTime = fFrameTime;
+			if (frameTime < 0.0f) frameTime = 0.0f;
+			if (frameTime > 0.05f) frameTime = 0.05f;
+			if (turnAxis != 0.0f && frameTime > 0.0f)
+			{
+				float fovScale = 1.0f;
+				IEntityCamera* pPlayerCamera = pPlayer->GetEntity()->GetCamera();
+				if (pPlayerCamera)
+					fovScale = pPlayerCamera->GetFov() / 1.5707963267948966f;
+				const float yawDelta = turnAxis * frameTime * 120.0f * fovScale;
+				m_PlayerProcessingCmd.GetDeltaAngles()[ROLL] -= yawDelta;
+				m_PlayerProcessingCmd.AddAction(ACTION_TURNLR);
+				static bool loggedVRYawInput = false;
+				if (!loggedVRYawInput)
+				{
+					CryLogAlways("OpenXR right-stick yaw reached player command: axis=%.3f dt=%.4f delta=%.3f",
+						axis, frameTime, yawDelta);
+					loggedVRYawInput = true;
+				}
+			}
+		}
+	}
+
 	//ASSIGN THE CAMERA
 	IEntityCamera *pEntCam=NULL;
 	if (m_CameraParams->nCameraId)

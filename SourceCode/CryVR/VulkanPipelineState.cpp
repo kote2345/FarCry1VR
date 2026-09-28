@@ -119,8 +119,10 @@ bool DecodeLegacyPipelineState(uint32_t state, int cull, bool mirror,
         return false;
     if (mirror && out.cullMode != VK_CULL_MODE_NONE)
         out.cullMode = out.cullMode == VK_CULL_MODE_FRONT_BIT ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_FRONT_BIT;
-    // Vulkan projection uses a Y flip to retain the OpenXR framebuffer convention.
-    out.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    // BuildProjection flips clip-space Y, while the positive-height Vulkan
+    // viewport flips it again when mapping to framebuffer coordinates. The
+    // resulting winding matches OpenGL's default CCW front face.
+    out.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     out.stencilTestEnable = (state & Stencil) != 0;
     const bool twoSidedStencil = (stencilState & 8u) != 0;
     if (out.stencilTestEnable &&

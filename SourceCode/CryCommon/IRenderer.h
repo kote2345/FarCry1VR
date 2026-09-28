@@ -141,7 +141,8 @@ enum EVulkanTextureFilter
   eVTF_Nearest = 0,
   eVTF_Linear,
   eVTF_Bilinear,
-  eVTF_Trilinear
+  eVTF_Trilinear,
+  eVTF_Anisotropic
 };
 
 //////////////////////////////////////////////////////////////////////
@@ -495,7 +496,10 @@ struct SVulkanBufferCallbacks
   bool (*mirrorRgbaTexture)(void *drawUserData, int textureId, unsigned int width,
                             unsigned int height, const unsigned char *rgbaPixels,
                             bool clampU, bool clampV, bool dynamicTexture, bool noMipmaps,
-                            int filterMode);
+                            int filterMode, float maxAnisotropy);
+  bool (*mirrorRgbaCubeTexture)(void *drawUserData, int textureId, unsigned int width,
+                                unsigned int height, const unsigned char *const facePixels[6],
+                                bool noMipmaps, int filterMode, float maxAnisotropy);
   bool (*mirrorRgbaTextureRegion)(void *drawUserData, int textureId, unsigned int x,
                                   unsigned int y, unsigned int width, unsigned int height,
                                   const unsigned char *rgbaPixels);
@@ -503,6 +507,7 @@ struct SVulkanBufferCallbacks
   SVulkanBufferCallbacks() : userData(NULL), createBuffer(NULL), uploadBuffer(NULL), destroyBuffer(NULL),
                              drawUserData(NULL), queueIndexedDraw(NULL), queueClientIndexedDraw(NULL),
                              requirePanelFallback(NULL), mirrorRgbaTexture(NULL),
+                             mirrorRgbaCubeTexture(NULL),
                              mirrorRgbaTextureRegion(NULL),
                              releaseMirroredTexture(NULL) {}
 };

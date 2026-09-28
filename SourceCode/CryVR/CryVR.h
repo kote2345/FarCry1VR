@@ -2,14 +2,11 @@
 #define CRY_VR_H
 
 #include "openxr_api.h"
+#include "OpenXRPlatform.h"
 #include <vector>
 
 namespace CryVR
 {
-// Android Activity is handed off by GameActivity before SDL starts its native
-// thread; SDL's Android getters are not reliable before SDL initialization.
-void GetAndroidOpenXRContext(void** jniEnv, void** activity);
-
 struct VulkanBinding
 {
     void* instance = nullptr;
@@ -26,6 +23,7 @@ struct Frame
     XrDuration predictedDisplayPeriod = 0;
     bool shouldRender = false;
     bool viewsValid = false;
+    bool viewPositionsValid = false;
     uint32_t viewCount = 0;
     XrView views[2]{};
 };
@@ -55,8 +53,7 @@ public:
 
     // Creates only the API instance/system. Vulkan device creation remains in
     // the renderer and is therefore the only platform/backend-specific part.
-    bool Initialize(const char* applicationName, const char* engineName,
-                    void* androidJniEnv = nullptr, void* androidActivity = nullptr);
+    bool Initialize(const char* applicationName, const char* engineName);
     bool GetVulkanRequirements(XrVersion* minApiVersion, XrVersion* maxApiVersion) const;
     bool GetVulkanGraphicsDevice(void* vulkanInstance, void** physicalDevice) const;
     bool CreateVulkanInstance(void* getInstanceProcAddr, const void* createInfo, void** instance,
@@ -148,6 +145,7 @@ private:
     XrPath m_rightHandPath = 0;
     XrViewConfigurationView m_viewConfig[2]{};
     uint32_t m_viewCount = 0;
+    XrTime m_predictedDisplayTime = 0;
     bool m_sessionRunning = false;
     bool m_shouldExit = false;
     bool m_metaTouchPlusEnabled = false;

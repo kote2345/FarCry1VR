@@ -683,6 +683,58 @@ bool VulkanResourceManager::CreateDepthImage(uint32_t width, uint32_t height, Vk
     return true;
 }
 
+bool VulkanResourceManager::CreateColorTarget(uint32_t width, uint32_t height, VkFormat format,
+                                              VulkanTexture& texture)
+{
+    DestroyTexture(texture);
+    if (!m_context || width == 0 || height == 0 || format == VK_FORMAT_UNDEFINED)
+        return false;
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = format;
+    imageInfo.extent = { width, height, 1 };
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (m_createImage(m_context->GetDevice(), &imageInfo, nullptr, &texture.image) != VK_SUCCESS)
+    {
+        SetError("vkCreateImage(color target) failed");
+        return false;
+    }
+    VkMemoryRequirements requirements{};
+    m_getImageMemoryRequirements(m_context->GetDevice(), texture.image, &requirements);
+    if (!AllocateMemory(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, texture.memory) ||
+        m_bindImageMemory(m_context->GetDevice(), texture.image, texture.memory, 0) != VK_SUCCESS)
+    {
+        DestroyTexture(texture);
+        SetError("Vulkan color target memory allocation failed");
+        return false;
+    }
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = texture.image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = format;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.layerCount = 1;
+    if (m_createImageView(m_context->GetDevice(), &viewInfo, nullptr, &texture.view) != VK_SUCCESS)
+    {
+        DestroyTexture(texture);
+        SetError("vkCreateImageView(color target) failed");
+        return false;
+    }
+    texture.width = width;
+    texture.height = height;
+    texture.format = format;
+    return true;
+}
+
 void VulkanResourceManager::DestroyTexture(VulkanTexture& texture)
 {
     if (m_context && texture.view && m_destroyImageView)

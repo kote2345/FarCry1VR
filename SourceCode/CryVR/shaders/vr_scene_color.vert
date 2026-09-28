@@ -4,5 +4,6 @@ layout(location = 2) in vec4 inColor;
 layout(location = 4) in vec4 inSecondaryColor;
 layout(location = 0) out vec4 vertexColor;
 layout(location = 1) out vec4 secondaryColor;
+layout(location = 9) out vec3 clipPosition;
 layout(push_constant) uniform SceneTransform { mat4 mvp; } transformData;
-void main() { gl_Position = transformData.mvp * vec4(inPosition, 1.0); vertexColor = inColor; secondaryColor = inSecondaryColor; }
+void main() { clipPosition = inPosition; gl_Position = transformData.mvp * vec4(inPosition, 1.0); vertexColor = inColor; secondaryColor = inSecondaryColor; }

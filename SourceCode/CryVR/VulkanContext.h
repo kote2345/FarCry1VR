@@ -26,6 +26,11 @@ public:
     VkQueue GetGraphicsQueue() const { return m_graphicsQueue; }
     uint32_t GetGraphicsQueueFamily() const { return m_graphicsQueueFamily; }
     bool SupportsWireframe() const { return m_supportsWireframe; }
+    bool SupportsAnisotropicFiltering() const { return m_supportsAnisotropicFiltering; }
+    bool SupportsRadialFog() const { return m_supportsRadialFog; }
+    bool SupportsOcclusionQueries() const { return m_device != VK_NULL_HANDLE; }
+    float GetMaxSamplerAnisotropy() const { return m_maxSamplerAnisotropy; }
+    VkDeviceSize GetMinUniformBufferOffsetAlignment() const { return m_minUniformBufferOffsetAlignment; }
     PFN_vkGetInstanceProcAddr GetInstanceProcAddr() const { return m_getInstanceProcAddr; }
 
     VulkanBinding GetOpenXRBinding() const;
@@ -33,18 +38,22 @@ public:
 
 private:
     bool LoadVulkanLibrary();
+    bool LoadGlobalFunctions();
     bool LoadInstanceFunctions();
     bool LoadDeviceFunctions();
     void SetError(const char* message);
 
     bool m_vulkanLibraryLoaded = false;
+    void* m_vulkanLibrary = nullptr;
     PFN_vkGetInstanceProcAddr m_getInstanceProcAddr = nullptr;
+    PFN_vkGetDeviceProcAddr m_getDeviceProcAddr = nullptr;
     PFN_vkEnumerateInstanceVersion m_enumerateInstanceVersion = nullptr;
     PFN_vkCreateInstance m_createInstance = nullptr;
     PFN_vkDestroyInstance m_destroyInstance = nullptr;
     PFN_vkEnumeratePhysicalDevices m_enumeratePhysicalDevices = nullptr;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties m_getPhysicalDeviceQueueFamilyProperties = nullptr;
     PFN_vkGetPhysicalDeviceFeatures m_getPhysicalDeviceFeatures = nullptr;
+    PFN_vkGetPhysicalDeviceProperties m_getPhysicalDeviceProperties = nullptr;
     PFN_vkCreateDevice m_createDevice = nullptr;
     PFN_vkDestroyDevice m_destroyDevice = nullptr;
     PFN_vkGetDeviceQueue m_getDeviceQueue = nullptr;
@@ -56,6 +65,10 @@ private:
     VkQueue m_graphicsQueue = VK_NULL_HANDLE;
     uint32_t m_graphicsQueueFamily = 0;
     bool m_supportsWireframe = false;
+    bool m_supportsAnisotropicFiltering = false;
+    bool m_supportsRadialFog = false;
+    float m_maxSamplerAnisotropy = 1.0f;
+    VkDeviceSize m_minUniformBufferOffsetAlignment = 16;
     char m_lastError[256]{};
 };
 }

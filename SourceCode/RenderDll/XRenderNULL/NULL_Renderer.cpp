@@ -31,6 +31,7 @@ CNULLRenderer *gcpNULL = NULL;
 CNULLRenderer::CNULLRenderer()
 {
   gcpNULL = this;
+  SetType(R_NULL_RENDERER);
 
 #ifdef DEBUGALLOC
 #undef new

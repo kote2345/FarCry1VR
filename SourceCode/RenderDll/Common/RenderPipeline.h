@@ -12,6 +12,8 @@ Copyright (c) 2001 Crytek Studios. All Rights Reserved.
 #ifndef __RENDERPIPELINE_H__
 #define __RENDERPIPELINE_H__
 
+#include <XRenderNullApi.h>
+
 //====================================================================
 
 #define PIPE_USE_INSTANCING
@@ -180,10 +182,10 @@ struct SRendItem : SRendItemPre
   // Sort by light
   static void mfSortByLight(SRendItemPre *First, int Num);
 
-  static int m_RecurseLevel;
-  static int m_StartRI[8][NUMRI_LISTS];
-  static int m_EndRI[8][NUMRI_LISTS];
-  static TArray<SRendItemPre> m_RendItems[];    
+  static XRENDERNULL_API int m_RecurseLevel;
+  static XRENDERNULL_API int m_StartRI[8][NUMRI_LISTS];
+  static XRENDERNULL_API int m_EndRI[8][NUMRI_LISTS];
+  static XRENDERNULL_API TArray<SRendItemPre> m_RendItems[];
 };
 
 struct SRendItemPreprocess : public SRendItem

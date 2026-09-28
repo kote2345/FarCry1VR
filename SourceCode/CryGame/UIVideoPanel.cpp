@@ -44,6 +44,13 @@ int CUIVideoPanel::LoadVideo(const string& szFileName, bool bSound)
 	m_videoPlayer.Terminate();
 	if (!m_videoPlayer.Init(szFileName.c_str(), bSound))
 	{
+		// Keep UI sequences moving when an optional splash/cutscene file is
+		// absent. Update() will deliver the same OnFinished callback as a movie
+		// that reaches its last frame instead of leaving a blank video panel up.
+		m_szVideoFile = szFileName;
+		m_bLooping = false;
+		m_bFinished = true;
+		m_bPaused = false;
 		return 0;
 	}
 

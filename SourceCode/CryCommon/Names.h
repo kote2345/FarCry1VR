@@ -2,6 +2,7 @@
 #define __CNAME_H__
 
 #include <Tarray.h>
+#include "XRenderNullApi.h"
 
 #define MAX_SNAME_LEN 256
 
@@ -97,7 +98,7 @@ public:
   static int Size();
   void mfDeleteEntry(int);
 
-  static TArray<SNameEntry *> mNames;
+  static XRENDERNULL_API TArray<SNameEntry *> mNames;
   static TArray<int> mAvailable;
   static SNameEntry* mNameHash[8192];
   static int mDuplicate;

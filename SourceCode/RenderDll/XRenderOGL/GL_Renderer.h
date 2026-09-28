@@ -149,9 +149,13 @@ public:
 	bool MirrorVulkanTexture(int textureId, unsigned int width, unsigned int height,
 		const unsigned char* rgbaPixels, bool clampU, bool clampV, bool dynamicTexture)
 	{
+		const int anisotropyLevel = CRenderer::CV_r_texture_anisotropic_level > 1 ?
+			CRenderer::CV_r_texture_anisotropic_level : 1;
+		const int filterMode = anisotropyLevel > 1 ? 4 : 3;
 		return m_vulkanBufferCallbacks.mirrorRgbaTexture &&
 			m_vulkanBufferCallbacks.mirrorRgbaTexture(m_vulkanBufferCallbacks.drawUserData,
-				textureId, width, height, rgbaPixels, clampU, clampV, dynamicTexture, false, 3);
+				textureId, width, height, rgbaPixels, clampU, clampV, dynamicTexture,
+				false, filterMode, static_cast<float>(anisotropyLevel));
 	}
 	bool MirrorVulkanTextureRegion(int textureId, unsigned int x, unsigned int y,
 		unsigned int width, unsigned int height, const unsigned char* rgbaPixels)

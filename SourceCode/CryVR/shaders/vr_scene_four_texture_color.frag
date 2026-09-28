@@ -1,0 +1,325 @@
+#version 450
+layout(constant_id = 0) const int alphaTestMode = 0;
+layout(constant_id = 60) const uint stage0UsesTexCoord1 = 0u;
+layout(constant_id = 1) const int stage0ColorMode = 1;
+layout(constant_id = 2) const int stage0AlphaMode = 1;
+layout(constant_id = 3) const int stage1ColorMode = 1;
+layout(constant_id = 4) const int stage1AlphaMode = 1;
+layout(constant_id = 5) const uint stage0ColorArg = 0x0a1u;
+layout(constant_id = 6) const uint stage0AlphaArg = 0x0a1u;
+layout(constant_id = 7) const uint stage0Constant = 0xffffffffu;
+layout(constant_id = 8) const uint stage1ColorArg = 0x0a1u;
+layout(constant_id = 9) const uint stage1AlphaArg = 0x0a1u;
+layout(constant_id = 10) const uint stage1Constant = 0xffffffffu;
+layout(constant_id = 59) const uint stage1UsesTexCoord1 = 1u;
+layout(constant_id = 11) const uint hasSecondaryColor = 0u;
+layout(constant_id = 12) const int stage2ColorMode = 1;
+layout(constant_id = 13) const int stage2AlphaMode = 1;
+layout(constant_id = 14) const uint stage2ColorArg = 0x0a1u;
+layout(constant_id = 15) const uint stage2AlphaArg = 0x0a1u;
+layout(constant_id = 16) const uint stage2Constant = 0xffffffffu;
+layout(constant_id = 17) const uint hasSecondTexture = 0u;
+layout(constant_id = 18) const uint stage2UsesTexCoord1 = 1u;
+layout(constant_id = 19) const int stage3ColorMode = 1;
+layout(constant_id = 20) const int stage3AlphaMode = 1;
+layout(constant_id = 21) const uint stage3ColorArg = 0x0a1u;
+layout(constant_id = 22) const uint stage3AlphaArg = 0x0a1u;
+layout(constant_id = 23) const uint stage3Constant = 0xffffffffu;
+layout(constant_id = 24) const uint stage3UsesTexCoord1 = 1u;
+layout(constant_id = 25) const uint hasFourthTexture = 0u;
+layout(constant_id = 26) const uint hasThirdTexture = 0u;
+layout(constant_id = 27) const int stage4ColorMode = 1;
+layout(constant_id = 28) const int stage4AlphaMode = 1;
+layout(constant_id = 29) const uint stage4ColorArg = 0x0a1u;
+layout(constant_id = 30) const uint stage4AlphaArg = 0x0a1u;
+layout(constant_id = 31) const uint stage4Constant = 0xffffffffu;
+layout(constant_id = 32) const uint stage4UsesTexCoord1 = 1u;
+layout(constant_id = 33) const uint hasFifthTexture = 0u;
+layout(constant_id = 34) const int stage5ColorMode = 1;
+layout(constant_id = 35) const int stage5AlphaMode = 1;
+layout(constant_id = 36) const uint stage5ColorArg = 0x0a1u;
+layout(constant_id = 37) const uint stage5AlphaArg = 0x0a1u;
+layout(constant_id = 38) const uint stage5Constant = 0xffffffffu;
+layout(constant_id = 39) const uint stage5UsesTexCoord1 = 1u;
+layout(constant_id = 40) const uint hasSixthTexture = 0u;
+layout(constant_id = 41) const int stage6ColorMode = 1;
+layout(constant_id = 42) const int stage6AlphaMode = 1;
+layout(constant_id = 43) const uint stage6ColorArg = 0x0a1u;
+layout(constant_id = 44) const uint stage6AlphaArg = 0x0a1u;
+layout(constant_id = 45) const uint stage6Constant = 0xffffffffu;
+layout(constant_id = 46) const uint stage6UsesTexCoord1 = 1u;
+layout(constant_id = 47) const uint hasSeventhTexture = 0u;
+layout(constant_id = 48) const int stage7ColorMode = 1;
+layout(constant_id = 49) const int stage7AlphaMode = 1;
+layout(constant_id = 50) const uint stage7ColorArg = 0x0a1u;
+layout(constant_id = 51) const uint stage7AlphaArg = 0x0a1u;
+layout(constant_id = 52) const uint stage7Constant = 0xffffffffu;
+layout(constant_id = 53) const uint stage7UsesTexCoord1 = 1u;
+layout(constant_id = 54) const uint hasEighthTexture = 0u;
+layout(constant_id = 55) const float stage4LodBias = 0.0;
+layout(constant_id = 56) const float stage5LodBias = 0.0;
+layout(constant_id = 57) const float stage6LodBias = 0.0;
+layout(constant_id = 58) const float stage7LodBias = 0.0;
+layout(set = 0, binding = 0) uniform sampler2D baseColorTexture;
+layout(set = 1, binding = 0) uniform sampler2D secondaryTexture;
+layout(set = 2, binding = 0) uniform sampler2D tertiaryTexture;
+layout(set = 3, binding = 0) uniform sampler2D fourthTexture;
+layout(set = 4, binding = 0) uniform sampler2D fifthTexture;
+layout(set = 5, binding = 0) uniform sampler2D sixthTexture;
+layout(set = 6, binding = 0) uniform sampler2D seventhTexture;
+layout(set = 7, binding = 0) uniform sampler2D eighthTexture;
+layout(set = 0, binding = 1, std140) uniform TextureStageTransforms {
+    vec4 uvRow0[8];
+    vec4 uvRow1[8];
+    vec4 uvRowQ[8];
+    vec4 fogColor;
+    vec4 fogModeDensityStart;
+    vec4 fogEndDepthRange;
+    vec4 materialParams;
+    vec4 primaryColor;
+    vec4 primaryColorMask;
+    vec4 textureLodBias;
+    vec4 clipPlane;
+} textureStageTransforms;
+layout(location = 0) in vec2 texCoord0;
+layout(location = 1) in vec4 vertexColor;
+layout(location = 2) in vec2 texCoord1;
+layout(location = 3) in vec4 secondaryColor;
+layout(location = 9) in vec3 clipPosition;
+layout(location = 0) out vec4 outColor;
+vec4 sampleBaseTexture(vec2 uv) {
+    float scale = exp2(clamp(textureStageTransforms.textureLodBias.x, -16.0, 16.0));
+    return textureGrad(baseColorTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+}
+vec4 sampleSecondaryTexture(vec2 uv) {
+    float scale = exp2(clamp(textureStageTransforms.textureLodBias.y, -16.0, 16.0));
+    return textureGrad(secondaryTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+}
+vec4 sampleTertiaryTexture(vec2 uv) {
+    float scale = exp2(clamp(textureStageTransforms.textureLodBias.z, -16.0, 16.0));
+    return textureGrad(tertiaryTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+}
+vec4 sampleFourthTexture(vec2 uv) {
+    float scale = exp2(clamp(textureStageTransforms.textureLodBias.w, -16.0, 16.0));
+    return textureGrad(fourthTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+}
+vec4 sampleFifthTexture(vec2 uv) {
+    float scale = exp2(clamp(stage4LodBias, -16.0, 16.0));
+    return textureGrad(fifthTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+}
+vec4 sampleSixthTexture(vec2 uv) {
+    float scale = exp2(clamp(stage5LodBias, -16.0, 16.0));
+    return textureGrad(sixthTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+}
+vec4 sampleSeventhTexture(vec2 uv) {
+    float scale = exp2(clamp(stage6LodBias, -16.0, 16.0));
+    return textureGrad(seventhTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+}
+vec4 sampleEighthTexture(vec2 uv) {
+    float scale = exp2(clamp(stage7LodBias, -16.0, 16.0));
+    return textureGrad(eighthTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+}
+vec2 transformStageUv(uint stage, vec2 uv) {
+    vec3 coordinate = vec3(uv, 1.0);
+    float q = dot(textureStageTransforms.uvRowQ[stage].xyz, coordinate);
+    float divisor = abs(q) > 1.0e-7 ? q : (q < 0.0 ? -1.0e-7 : 1.0e-7);
+    return vec2(dot(textureStageTransforms.uvRow0[stage].xyz, coordinate),
+                dot(textureStageTransforms.uvRow1[stage].xyz, coordinate)) / divisor;
+}
+vec4 applyMaterialOverrides(vec4 c) {
+    if (textureStageTransforms.materialParams.z > 0.5) c.rgb *= textureStageTransforms.materialParams.x;
+    else c.a *= textureStageTransforms.materialParams.x;
+    if (textureStageTransforms.materialParams.y > 0.0 && c.a < textureStageTransforms.materialParams.y) discard;
+    return c;
+}
+float radialEyeDistance(float eyeZ) {
+    vec2 viewportSize = max(vec2(textureStageTransforms.uvRowQ[0].w,
+                                 textureStageTransforms.uvRowQ[1].w), vec2(1.0));
+    vec2 ndc = 2.0 * gl_FragCoord.xy / viewportSize - 1.0;
+    float tangentX = mix(textureStageTransforms.uvRow0[0].w,
+                         textureStageTransforms.uvRow1[0].w, (ndc.x + 1.0) * 0.5);
+    float tangentY = mix(textureStageTransforms.uvRow0[1].w,
+                         textureStageTransforms.uvRow1[1].w, (ndc.y + 1.0) * 0.5);
+    return eyeZ * sqrt(1.0 + tangentX * tangentX + tangentY * tangentY);
+}
+vec4 applySceneFog(vec4 c) {
+    if (textureStageTransforms.fogModeDensityStart.x < 0.5) return c;
+    float n=textureStageTransforms.fogEndDepthRange.y, f=textureStageTransforms.fogEndDepthRange.z;
+    float d=n*f/max(f-gl_FragCoord.z*(f-n),1.0e-7);
+    d=radialEyeDistance(d);
+    int m=int(textureStageTransforms.fogModeDensityStart.y+0.5); float a;
+    if(m==1) a=(d-textureStageTransforms.fogModeDensityStart.w)/max(textureStageTransforms.fogEndDepthRange.x-textureStageTransforms.fogModeDensityStart.w,1.0e-6);
+    else if(m==2){float x=textureStageTransforms.fogModeDensityStart.z*d;a=1.0-exp(-min(x*x,80.0));}
+    else a=1.0-exp(-min(textureStageTransforms.fogModeDensityStart.z*d,80.0));
+    c.rgb=mix(c.rgb,textureStageTransforms.fogColor.rgb,clamp(a,0.0,1.0));return c;
+}
+vec3 sourceRgb(uint selector, vec4 texel, vec4 primary, vec4 previous, vec4 constantColor) {
+    if (selector == 0u) return constantColor.rgb;
+    if (selector == 2u) return primary.rgb;
+    if (selector == 3u) return previous.rgb;
+    if (selector == 4u) return constantColor.rgb;
+    return texel.rgb;
+}
+float sourceAlpha(uint selector, vec4 texel, vec4 primary, vec4 previous, vec4 constantColor) {
+    if (selector == 0u) return constantColor.a;
+    if (selector == 2u) return primary.a;
+    if (selector == 3u) return previous.a;
+    if (selector == 4u) return constantColor.a;
+    return texel.a;
+}
+vec3 combineRgb(int mode, vec3 a, vec3 b, float blendFactor, vec3 third, float arg1Alpha) {
+    if (mode == 0) return a;
+    if (mode == 2) return a * b * 2.0;
+    if (mode == 3) return a * b * 4.0;
+    if (mode == 4) return a + b;
+    if (mode == 5) return a + b - vec3(0.5);
+    if (mode == 17) return (a + b - vec3(0.5)) * 2.0;
+    if (mode == 6 || mode == 7) return mix(b, a, blendFactor);
+    if (mode == 8) return b;
+    if (mode == 10) return a - b;
+    if (mode == 9) return third + a * b;
+    if (mode == 11) return a + b * arg1Alpha;
+    if (mode == 12) return a * b + vec3(arg1Alpha);
+    if (mode == 13) return a + b * (1.0 - arg1Alpha);
+    if (mode == 14) return (vec3(1.0) - a) * b + vec3(arg1Alpha);
+    if (mode == 15) return vec3(dot(a * 2.0 - 1.0, b * 2.0 - 1.0));
+    if (mode == 16) return mix(b, a, third);
+    return a * b;
+}
+float combineAlpha(int mode, float a, float b, float third, float blendFactor) {
+    if (mode == 0) return a;
+    if (mode == 2) return a * b * 2.0;
+    if (mode == 3) return a * b * 4.0;
+    if (mode == 6 || mode == 7) return mix(b, a, blendFactor);
+    if (mode == 4) return a + b;
+    if (mode == 5) return a + b - 0.5;
+    if (mode == 8) return b;
+    if (mode == 10) return a - b;
+    if (mode == 9) return third + a * b;
+    if (mode == 16) return mix(b, a, third);
+    return a * b;
+}
+vec4 combineTextureStage(int colorMode, int alphaMode, uint colorArg, uint alphaArg,
+                         uint constantColor, vec4 texel, vec4 primary,
+                         vec4 previous, float blendFactor) {
+    vec4 stageConstant = unpackUnorm4x8(constantColor);
+    vec3 a = sourceRgb(colorArg & 7u, texel, primary, previous, stageConstant);
+    vec3 b = sourceRgb((colorArg >> 3) & 7u, texel, primary, previous, stageConstant);
+    vec3 c = sourceRgb((colorArg >> 6) & 7u, texel, primary, previous, stageConstant);
+    float arg1Alpha = sourceAlpha(colorArg & 7u, texel, primary, previous, stageConstant);
+    float alphaA = sourceAlpha(alphaArg & 7u, texel, primary, previous, stageConstant);
+    float alphaB = sourceAlpha((alphaArg >> 3) & 7u, texel, primary, previous, stageConstant);
+    float alphaC = sourceAlpha((alphaArg >> 6) & 7u, texel, primary, previous, stageConstant);
+    float rgbBlendFactor = sourceAlpha((colorArg >> 6) & 7u, texel,
+                                       primary, previous, stageConstant);
+    return clamp(vec4(combineRgb(colorMode, a, b, rgbBlendFactor, c, arg1Alpha),
+                      combineAlpha(alphaMode, alphaA, alphaB, alphaC, blendFactor)), 0.0, 1.0);
+}
+void main() {
+    if (dot(vec4(clipPosition, 1.0), textureStageTransforms.clipPlane) < 0.0) discard;
+    vec4 generatedVertexColor = vertexColor;
+    if (textureStageTransforms.materialParams.w > 0.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
+    vec4 primaryColor = mix(generatedVertexColor, textureStageTransforms.primaryColor, textureStageTransforms.primaryColorMask);
+    vec2 stage0TexCoord = stage0UsesTexCoord1 != 0u ? texCoord1 : texCoord0;
+    vec4 base = sampleBaseTexture(stage0TexCoord);
+    vec4 env0 = unpackUnorm4x8(stage0Constant);
+    vec3 s0a = sourceRgb(stage0ColorArg & 7u, base, primaryColor, primaryColor, env0);
+    vec3 s0b = sourceRgb((stage0ColorArg >> 3) & 7u, base, primaryColor, primaryColor, env0);
+    float s0aa = sourceAlpha(stage0AlphaArg & 7u, base, primaryColor, primaryColor, env0);
+    float s0ab = sourceAlpha((stage0AlphaArg >> 3) & 7u, base, primaryColor, primaryColor, env0);
+    vec3 s0c = sourceRgb((stage0ColorArg >> 6) & 7u, base, primaryColor, primaryColor, env0);
+    float s0ac = sourceAlpha((stage0AlphaArg >> 6) & 7u, base, primaryColor, primaryColor, env0);
+    float s0Arg1Alpha = sourceAlpha(stage0ColorArg & 7u, base, primaryColor, primaryColor, env0);
+    vec4 previous = vec4(combineRgb(stage0ColorMode, s0a, s0b,
+                                    sourceAlpha((stage0ColorArg >> 6) & 7u, base,
+                                                primaryColor, primaryColor, env0), s0c, s0Arg1Alpha),
+                         combineAlpha(stage0AlphaMode, s0aa, s0ab, s0ac,
+                                      stage0AlphaMode == 6 ? primaryColor.a : base.a));
+    previous = clamp(previous, 0.0, 1.0);
+    vec2 stage1TexCoord = stage1UsesTexCoord1 != 0u ? texCoord1 : texCoord0;
+    vec4 layer = sampleSecondaryTexture(stage1TexCoord);
+    vec4 env1 = unpackUnorm4x8(stage1Constant);
+    vec3 s1a = sourceRgb(stage1ColorArg & 7u, layer, primaryColor, previous, env1);
+    vec3 s1b = sourceRgb((stage1ColorArg >> 3) & 7u, layer, primaryColor, previous, env1);
+    float s1aa = sourceAlpha(stage1AlphaArg & 7u, layer, primaryColor, previous, env1);
+    float s1ab = sourceAlpha((stage1AlphaArg >> 3) & 7u, layer, primaryColor, previous, env1);
+    vec3 s1c = sourceRgb((stage1ColorArg >> 6) & 7u, layer, primaryColor, previous, env1);
+    float s1ac = sourceAlpha((stage1AlphaArg >> 6) & 7u, layer, primaryColor, previous, env1);
+    float s1Arg1Alpha = sourceAlpha(stage1ColorArg & 7u, layer, primaryColor, previous, env1);
+    vec4 color = vec4(combineRgb(stage1ColorMode, s1a, s1b,
+                                 sourceAlpha((stage1ColorArg >> 6) & 7u, layer,
+                                             primaryColor, previous, env1), s1c, s1Arg1Alpha),
+                      combineAlpha(stage1AlphaMode, s1aa, s1ab, s1ac,
+                                   stage1AlphaMode == 6 ? primaryColor.a : layer.a));
+    color = hasSecondTexture != 0u ? clamp(color, 0.0, 1.0) : previous;
+    vec4 tertiary = sampleTertiaryTexture(transformStageUv(2u,
+        stage2UsesTexCoord1 != 0u ? texCoord1 : texCoord0));
+    vec4 env2 = unpackUnorm4x8(stage2Constant);
+    vec3 s2a = sourceRgb(stage2ColorArg & 7u, tertiary, primaryColor, color, env2);
+    vec3 s2b = sourceRgb((stage2ColorArg >> 3) & 7u, tertiary, primaryColor, color, env2);
+    float s2aa = sourceAlpha(stage2AlphaArg & 7u, tertiary, primaryColor, color, env2);
+    float s2ab = sourceAlpha((stage2AlphaArg >> 3) & 7u, tertiary, primaryColor, color, env2);
+    vec3 s2c = sourceRgb((stage2ColorArg >> 6) & 7u, tertiary, primaryColor, color, env2);
+    float s2ac = sourceAlpha((stage2AlphaArg >> 6) & 7u, tertiary, primaryColor, color, env2);
+    float s2Arg1Alpha = sourceAlpha(stage2ColorArg & 7u, tertiary, primaryColor, color, env2);
+    color = vec4(combineRgb(stage2ColorMode, s2a, s2b,
+                            sourceAlpha((stage2ColorArg >> 6) & 7u, tertiary,
+                                        primaryColor, color, env2),
+                            s2c, s2Arg1Alpha),
+                 combineAlpha(stage2AlphaMode, s2aa, s2ab, s2ac,
+                              stage2AlphaMode == 6 ? primaryColor.a : tertiary.a));
+    color = hasThirdTexture != 0u ? clamp(color, 0.0, 1.0) : color;
+    vec4 fourth = sampleFourthTexture(transformStageUv(3u,
+        stage3UsesTexCoord1 != 0u ? texCoord1 : texCoord0));
+    vec4 env3 = unpackUnorm4x8(stage3Constant);
+    vec3 s3a = sourceRgb(stage3ColorArg & 7u, fourth, primaryColor, color, env3);
+    vec3 s3b = sourceRgb((stage3ColorArg >> 3) & 7u, fourth, primaryColor, color, env3);
+    float s3aa = sourceAlpha(stage3AlphaArg & 7u, fourth, primaryColor, color, env3);
+    float s3ab = sourceAlpha((stage3AlphaArg >> 3) & 7u, fourth, primaryColor, color, env3);
+    vec3 s3c = sourceRgb((stage3ColorArg >> 6) & 7u, fourth, primaryColor, color, env3);
+    float s3ac = sourceAlpha((stage3AlphaArg >> 6) & 7u, fourth, primaryColor, color, env3);
+    float s3Arg1Alpha = sourceAlpha(stage3ColorArg & 7u, fourth, primaryColor, color, env3);
+    vec4 stage3Color = vec4(combineRgb(stage3ColorMode, s3a, s3b,
+                                       sourceAlpha((stage3ColorArg >> 6) & 7u, fourth,
+                                                   primaryColor, color, env3),
+                                       s3c, s3Arg1Alpha),
+                            combineAlpha(stage3AlphaMode, s3aa, s3ab, s3ac,
+                                         stage3AlphaMode == 6 ? primaryColor.a : fourth.a));
+    color = hasFourthTexture != 0u ? clamp(stage3Color, 0.0, 1.0) : color;
+    vec4 fifth = sampleFifthTexture(transformStageUv(4u,
+        stage4UsesTexCoord1 != 0u ? texCoord1 : texCoord0));
+    if (hasFifthTexture != 0u)
+        color = combineTextureStage(stage4ColorMode, stage4AlphaMode, stage4ColorArg,
+            stage4AlphaArg, stage4Constant, fifth, primaryColor, color,
+            sourceAlpha((stage4ColorArg >> 6) & 7u, fifth, primaryColor, color,
+                        unpackUnorm4x8(stage4Constant)));
+    vec4 sixth = sampleSixthTexture(transformStageUv(5u,
+        stage5UsesTexCoord1 != 0u ? texCoord1 : texCoord0));
+    if (hasSixthTexture != 0u)
+        color = combineTextureStage(stage5ColorMode, stage5AlphaMode, stage5ColorArg,
+            stage5AlphaArg, stage5Constant, sixth, primaryColor, color,
+            sourceAlpha((stage5ColorArg >> 6) & 7u, sixth, primaryColor, color,
+                        unpackUnorm4x8(stage5Constant)));
+    vec4 seventh = sampleSeventhTexture(transformStageUv(6u,
+        stage6UsesTexCoord1 != 0u ? texCoord1 : texCoord0));
+    if (hasSeventhTexture != 0u)
+        color = combineTextureStage(stage6ColorMode, stage6AlphaMode, stage6ColorArg,
+            stage6AlphaArg, stage6Constant, seventh, primaryColor, color,
+            sourceAlpha((stage6ColorArg >> 6) & 7u, seventh, primaryColor, color,
+                        unpackUnorm4x8(stage6Constant)));
+    vec4 eighth = sampleEighthTexture(transformStageUv(7u,
+        stage7UsesTexCoord1 != 0u ? texCoord1 : texCoord0));
+    if (hasEighthTexture != 0u)
+        color = combineTextureStage(stage7ColorMode, stage7AlphaMode, stage7ColorArg,
+            stage7AlphaArg, stage7Constant, eighth, primaryColor, color,
+            sourceAlpha((stage7ColorArg >> 6) & 7u, eighth, primaryColor, color,
+                        unpackUnorm4x8(stage7Constant)));
+    color = applyMaterialOverrides(color);
+    if (textureStageTransforms.materialParams.y <= 0.0) {
+        if (alphaTestMode == 1 && !(color.a > 0.0)) discard;
+        if (alphaTestMode == 2 && !(color.a < 0.5)) discard;
+        if (alphaTestMode == 3 && !(color.a >= 0.5)) discard;
+        if (alphaTestMode == 4 && !(color.a >= 0.25)) discard;
+    }
+    outColor = applySceneFog(color);
+}

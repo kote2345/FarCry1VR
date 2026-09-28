@@ -28,7 +28,7 @@
 #include "XConsole.h"
 #include <I3DEngine.h>
 #include <IAISystem.h>
-#if defined(USE_SDL)
+#if defined(USE_SDL) || defined(__ANDROID__)
 #include <SDL3/SDL.h>
 #endif
 
@@ -47,7 +47,7 @@ extern HRESULT GetDXVersion( DWORD* pdwDirectXVersion, TCHAR* strDirectXVersion,
 
 extern int g_nPrecaution;
 
-#if defined(USE_SDL)
+#if defined(USE_SDL) || defined(__ANDROID__)
 namespace
 {
 void PushVRKey(SDL_Keycode key, SDL_Scancode scanCode, bool down)
@@ -61,14 +61,16 @@ void PushVRKey(SDL_Keycode key, SDL_Scancode scanCode, bool down)
 	SDL_PushEvent(&event);
 }
 
-void PushVRMouseMotion(float x, float y)
+void PushVRMouseButton(bool down)
 {
 	SDL_Event event{};
-	event.type = SDL_EVENT_MOUSE_MOTION;
-	event.motion.xrel = x;
-	event.motion.yrel = y;
+	event.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+	event.button.button = SDL_BUTTON_LEFT;
+	event.button.down = down;
+	event.button.clicks = 1;
 	SDL_PushEvent(&event);
 }
+
 }
 #endif
 
@@ -877,30 +879,96 @@ void CSystem::RenderBegin()
 	//////////////////////////////////////////////////////////////////////
 	//start the rendering pipeline
 	if (m_vulkanFrameRenderer.IsInitialized())
-		m_vulkanFrameRenderer.BeginFrame();
-#if defined(USE_SDL)
+	{
+		static bool loggedFrameStartFailure = false;
+		static bool loggedInvalidViews = false;
+		if (!m_vulkanFrameRenderer.BeginFrame())
+		{
+			if (!loggedFrameStartFailure)
+			{
+				CryLogAlways("OpenXR: frame start failed: %s", m_vulkanFrameRenderer.GetLastError());
+				loggedFrameStartFailure = true;
+			}
+		}
+		else if (!loggedInvalidViews)
+		{
+			const CryVR::Frame& frame = m_vulkanFrameRenderer.GetCurrentFrame();
+			if (!frame.shouldRender || !frame.viewsValid || frame.viewCount < 2)
+			{
+				CryLogAlways("OpenXR: no valid stereo views (shouldRender=%d viewsValid=%d viewCount=%u)",
+					frame.shouldRender ? 1 : 0, frame.viewsValid ? 1 : 0, frame.viewCount);
+				loggedInvalidViews = true;
+			}
+		}
+	}
+#if defined(USE_SDL) || defined(__ANDROID__)
 	if (m_vrRuntime.IsInitialized())
 	{
 		// OpenXR actions are synced at frame start. SDL consumes these queued
 		// events on the next system input update, keeping game bindings intact.
-		static bool keyW = false, keyA = false, keyS = false, keyD = false;
+		static bool keyUp = false, keyLeft = false, keyDown = false, keyRight = false;
 		static bool leftSelect = false, rightSelect = false;
+		static bool loggedControllerAvailability = false;
+		static bool loggedRightStickMove = false;
 		const CryVR::ControllerState& left = m_vrRuntime.GetLeftController();
 		const CryVR::ControllerState& right = m_vrRuntime.GetRightController();
-		const bool nextW = left.thumbstickY > 0.55f;
-		const bool nextS = left.thumbstickY < -0.55f;
-		const bool nextA = left.thumbstickX < -0.55f;
-		const bool nextD = left.thumbstickX > 0.55f;
-		if (keyW != nextW) PushVRKey(SDLK_W, SDL_SCANCODE_W, nextW);
-		if (keyA != nextA) PushVRKey(SDLK_A, SDL_SCANCODE_A, nextA);
-		if (keyS != nextS) PushVRKey(SDLK_S, SDL_SCANCODE_S, nextS);
-		if (keyD != nextD) PushVRKey(SDLK_D, SDL_SCANCODE_D, nextD);
-		if (leftSelect != left.select) PushVRKey(SDLK_RETURN, SDL_SCANCODE_RETURN, left.select);
-		if (rightSelect != right.select) PushVRKey(SDLK_SPACE, SDL_SCANCODE_SPACE, right.select);
-		keyW = nextW; keyA = nextA; keyS = nextS; keyD = nextD;
+		if (!loggedControllerAvailability)
+		{
+			CryLogAlways("OpenXR input snapshot: left active=%d select=%d stick=(%.2f,%.2f); right active=%d select=%d stick=(%.2f,%.2f)",
+				left.active, left.select, left.thumbstickX, left.thumbstickY,
+				right.active, right.select, right.thumbstickX, right.thumbstickY);
+			loggedControllerAvailability = true;
+		}
+		// CryEngine's analog movement action reads normal joystick axes; its
+		// convention is negative Y for forward.
+		if (m_pIInput)
+			m_pIInput->SetVRControllerAxes(
+				Vec3(left.thumbstickX, -left.thumbstickY, 0.0f),
+				Vec3(right.thumbstickX, -right.thumbstickY, 0.0f));
+		const bool nextUp = left.thumbstickY > 0.55f;
+		const bool nextDown = left.thumbstickY < -0.55f;
+		const bool nextLeft = left.thumbstickX < -0.55f;
+		const bool nextRight = left.thumbstickX > 0.55f;
+		if (keyUp != nextUp) PushVRKey(SDLK_UP, SDL_SCANCODE_UP, nextUp);
+		if (keyLeft != nextLeft) PushVRKey(SDLK_LEFT, SDL_SCANCODE_LEFT, nextLeft);
+		if (keyDown != nextDown) PushVRKey(SDLK_DOWN, SDL_SCANCODE_DOWN, nextDown);
+		if (keyRight != nextRight) PushVRKey(SDLK_RIGHT, SDL_SCANCODE_RIGHT, nextRight);
+		if (leftSelect != left.select)
+		{
+			CryLogAlways("OpenXR menu confirm from left controller: %s", left.select ? "pressed" : "released");
+			PushVRKey(SDLK_RETURN, SDL_SCANCODE_RETURN, left.select);
+		}
+		if (rightSelect != right.select)
+		{
+			CryLogAlways("OpenXR menu click from right controller: %s", right.select ? "pressed" : "released");
+			PushVRMouseButton(right.select);
+		}
+		keyUp = nextUp; keyLeft = nextLeft; keyDown = nextDown; keyRight = nextRight;
 		leftSelect = left.select; rightSelect = right.select;
-		if (right.thumbstickX*right.thumbstickX + right.thumbstickY*right.thumbstickY > 0.04f)
-			PushVRMouseMotion(right.thumbstickX * 12.0f, -right.thumbstickY * 12.0f);
+		if (m_pIInput && (right.thumbstickX*right.thumbstickX + right.thumbstickY*right.thumbstickY > 0.04f))
+		{
+			// Update CryEngine's virtual menu cursor directly. SDL relative-motion
+			// events are consumed before RenderBegin and can be lost/reordered by
+			// the window event pump on Android.
+			IMouse* mouse = m_pIInput->GetIMouse();
+			if (mouse)
+			{
+				float frameTime = m_Time.GetFrameTime();
+				if (frameTime < 0.0f) frameTime = 0.0f;
+				if (frameTime > 0.05f) frameTime = 0.05f;
+				const float cursorSpeed = 500.0f * frameTime;
+				const float x = mouse->GetVScreenX() + right.thumbstickX * cursorSpeed;
+				const float y = mouse->GetVScreenY() - right.thumbstickY * cursorSpeed;
+				mouse->SetVScreenX(x < 0.0f ? 0.0f : (x > 799.0f ? 799.0f : x));
+				mouse->SetVScreenY(y < 0.0f ? 0.0f : (y > 599.0f ? 599.0f : y));
+				if (!loggedRightStickMove)
+				{
+					CryLogAlways("OpenXR mouse motion reached menu: axis=(%.2f,%.2f) cursor=(%.1f,%.1f)",
+						right.thumbstickX, right.thumbstickY, x, y);
+					loggedRightStickMove = true;
+				}
+			}
+		}
 	}
 #endif
 	if (m_pRenderer) 
@@ -962,7 +1030,26 @@ void CSystem::RenderEnd()
 			CryLogAlways("Vulkan: %u scene draw(s) are not yet translated; native Vulkan draws remain visible, but no legacy framebuffer fallback exists.", untranslatedDraws);
 			warnedAboutUntranslatedDraws = true;
 		}
-		m_vulkanFrameRenderer.EndFrame();
+		static bool loggedFrameEndFailure = false;
+		const bool frameSubmitted = m_vulkanFrameRenderer.EndFrame();
+		if (!frameSubmitted && !loggedFrameEndFailure)
+		{
+			CryLogAlways("OpenXR: frame submission failed: %s", m_vulkanFrameRenderer.GetLastError());
+			loggedFrameEndFailure = true;
+		}
+		static unsigned int sceneDiagnosticFrames = 0;
+		if (++sceneDiagnosticFrames >= 120)
+		{
+			sceneDiagnosticFrames = 0;
+			const auto& sceneDiagnostics = m_vulkanFrameRenderer.GetSceneDiagnostics();
+			CryLogAlways("Vulkan scene: queued=%u submitted-eye=%u untranslated=%u texture-fallback=%u reject[input=%u vertex=%u texture=%u combine=%u state=%u pipeline=%u] record[texture=%u transform=%u null-pipeline=%u scissor=%u]",
+				sceneDiagnostics.queuedDraws, sceneDiagnostics.recordedEyeDraws, untranslatedDraws,
+				sceneDiagnostics.textureFallbacks,
+				sceneDiagnostics.rejectedInput, sceneDiagnostics.rejectedVertexFeature, sceneDiagnostics.rejectedTexture,
+				sceneDiagnostics.rejectedCombine, sceneDiagnostics.rejectedPipelineState, sceneDiagnostics.pipelineCreationFailed,
+				sceneDiagnostics.missingTextureAtRecord, sceneDiagnostics.invalidEyeTransform,
+				sceneDiagnostics.nullPipelineAtRecord, sceneDiagnostics.emptyScissor);
+		}
 	}
 }
 
@@ -1059,6 +1146,19 @@ void CSystem::RenderStatistics ()
 //////////////////////////////////////////////////////////////////////
 void CSystem::Render()
 {
+	static unsigned int renderPathAuditCalls = 0;
+	const unsigned int renderPathAuditCall = renderPathAuditCalls++;
+	const bool auditRenderPath = renderPathAuditCall < 12 || (renderPathAuditCall % 120) == 0;
+	if (auditRenderPath && m_vulkanFrameRenderer.IsInitialized())
+	{
+		const Vec3 cameraPosition = m_ViewCamera.GetPos();
+		CryLogAlways("Vulkan render path: call=%u ignore=%u process=%p flags=0x%x camera=(%.3f,%.3f,%.3f) cameraValid=%u engine=%p",
+			renderPathAuditCall, m_bIgnoreUpdates ? 1u : 0u, m_pProcess,
+			m_pProcess ? m_pProcess->GetFlags() : 0,
+			cameraPosition.x, cameraPosition.y, cameraPosition.z,
+			!IsEquivalent(cameraPosition, Vec3(0,0,0), VEC_EPSILON) ? 1u : 0u,
+			m_pI3DEngine);
+	}
 	if (m_bIgnoreUpdates)
 		return;
 
@@ -1081,7 +1181,43 @@ void CSystem::Render()
 		if (!IsEquivalent(m_ViewCamera.GetPos(),Vec3(0,0,0),VEC_EPSILON))		
 		{
 			if (m_pI3DEngine)
-				m_pI3DEngine->SetCamera(m_ViewCamera);
+			{
+				if (m_vulkanFrameRenderer.IsInitialized())
+				{
+					// Keep the engine's scene camera at the game pose. Vulkan applies
+					// the OpenXR orientation once per eye; rotating this camera too
+					// would apply the headset rotation a second time. Expand only the
+					// culling frustum to cover the tracked head direction.
+					CCamera visibilityCamera = m_ViewCamera;
+					const float maxFov = 3.12413936f; // 179 degrees
+					const CryVR::Frame& xrFrame = m_vulkanFrameRenderer.GetCurrentFrame();
+					const float headRotation = m_vulkanFrameRenderer.GetHeadRotationDeltaRadians();
+					float xrVerticalHalfFov = 0.0f;
+					if (xrFrame.viewsValid)
+					{
+						for (uint32_t eye = 0; eye < xrFrame.viewCount; ++eye)
+						{
+							const XrFovf& fov = xrFrame.views[eye].fov;
+						const float verticalHalfFov = fabsf(fov.angleUp) > fabsf(fov.angleDown)
+							? fabsf(fov.angleUp) : fabsf(fov.angleDown);
+						if (verticalHalfFov > xrVerticalHalfFov)
+							xrVerticalHalfFov = verticalHalfFov;
+						}
+					}
+					const float projectionRatio = m_ViewCamera.GetProjRatio() > 0.0f
+						? m_ViewCamera.GetProjRatio() : 0.75f;
+					const float fovForHeadRotation = m_ViewCamera.GetFov() + 2.0f * headRotation;
+					const float fovForEyeProjection =
+						(2.0f * (xrVerticalHalfFov + headRotation)) / projectionRatio;
+					const float expandedFov = fovForEyeProjection > fovForHeadRotation
+						? fovForEyeProjection : fovForHeadRotation;
+					visibilityCamera.SetFov(expandedFov < maxFov ? expandedFov : maxFov);
+					m_pI3DEngine->SetCamera(visibilityCamera, false);
+					m_pRenderer->SetCamera(m_ViewCamera);
+				}
+				else
+					m_pI3DEngine->SetCamera(m_ViewCamera);
+			}
 
 			m_pProcess->Draw();		
 						

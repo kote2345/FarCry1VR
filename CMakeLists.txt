@@ -63,6 +63,9 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE ${CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELE
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_DEBUG ${CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG})
 
 if (MSVC)
+    # The legacy engine tests WIN32 in addition to the compiler-provided
+    # _WIN32. Define it for both Windows architectures; x64 also gets WIN64.
+    add_definitions(-DWIN32)
     if (${ARCH_TYPE} STREQUAL "x64")
         add_definitions(-DWIN64 -D_AMD64_)
     endif()

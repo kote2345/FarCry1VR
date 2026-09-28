@@ -1,6 +1,12 @@
 #include "VulkanContext.h"
 
+#if defined(_WIN32)
+#include <Windows.h>
+#elif defined(__ANDROID__)
 #include <SDL3/SDL_vulkan.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #include <cstdio>
 #include <cstring>
@@ -41,22 +47,64 @@ void VulkanContext::SetError(const char* message)
 
 bool VulkanContext::LoadVulkanLibrary()
 {
+#if defined(_WIN32)
+    m_vulkanLibrary = LoadLibraryA("vulkan-1.dll");
+    if (!m_vulkanLibrary)
+    {
+        SetError("Could not load vulkan-1.dll");
+        return false;
+    }
+    m_getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+        GetProcAddress(static_cast<HMODULE>(m_vulkanLibrary), "vkGetInstanceProcAddr"));
+    if (!m_getInstanceProcAddr)
+    {
+        FreeLibrary(static_cast<HMODULE>(m_vulkanLibrary));
+        m_vulkanLibrary = nullptr;
+        SetError("vulkan-1.dll does not export vkGetInstanceProcAddr");
+        return false;
+    }
+    m_vulkanLibraryLoaded = true;
+#elif defined(__ANDROID__)
     if (!SDL_Vulkan_LoadLibrary(nullptr))
     {
         SetError(SDL_GetError());
         return false;
     }
     m_vulkanLibraryLoaded = true;
-    m_getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
+    m_getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+        SDL_Vulkan_GetVkGetInstanceProcAddr());
     if (!m_getInstanceProcAddr)
     {
         SetError("SDL_Vulkan_GetVkGetInstanceProcAddr returned null");
         return false;
     }
+#else
+    const char* libraryName = "libvulkan.so.1";
+    m_vulkanLibrary = dlopen(libraryName, RTLD_NOW | RTLD_LOCAL);
+    if (!m_vulkanLibrary)
+    {
+        m_vulkanLibrary = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+        if (!m_vulkanLibrary)
+        {
+            SetError(dlerror());
+            return false;
+        }
+    }
+    m_getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+        dlsym(m_vulkanLibrary, "vkGetInstanceProcAddr"));
+    if (!m_getInstanceProcAddr)
+    {
+        dlclose(m_vulkanLibrary);
+        m_vulkanLibrary = nullptr;
+        SetError("Vulkan loader does not export vkGetInstanceProcAddr");
+        return false;
+    }
+    m_vulkanLibraryLoaded = true;
+#endif
     return true;
 }
 
-bool VulkanContext::LoadInstanceFunctions()
+bool VulkanContext::LoadGlobalFunctions()
 {
     m_enumerateInstanceVersion = LoadGlobal<PFN_vkEnumerateInstanceVersion>(m_getInstanceProcAddr, "vkEnumerateInstanceVersion");
     m_createInstance = LoadGlobal<PFN_vkCreateInstance>(m_getInstanceProcAddr, "vkCreateInstance");
@@ -68,19 +116,38 @@ bool VulkanContext::LoadInstanceFunctions()
     return true;
 }
 
+bool VulkanContext::LoadInstanceFunctions()
+{
+    m_destroyInstance = LoadInstance<PFN_vkDestroyInstance>(m_getInstanceProcAddr, m_instance, "vkDestroyInstance");
+    m_enumeratePhysicalDevices = LoadInstance<PFN_vkEnumeratePhysicalDevices>(m_getInstanceProcAddr, m_instance, "vkEnumeratePhysicalDevices");
+    m_getPhysicalDeviceQueueFamilyProperties = LoadInstance<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+        m_getInstanceProcAddr, m_instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+    m_getPhysicalDeviceFeatures = LoadInstance<PFN_vkGetPhysicalDeviceFeatures>(
+        m_getInstanceProcAddr, m_instance, "vkGetPhysicalDeviceFeatures");
+    m_getPhysicalDeviceProperties = LoadInstance<PFN_vkGetPhysicalDeviceProperties>(
+        m_getInstanceProcAddr, m_instance, "vkGetPhysicalDeviceProperties");
+    m_createDevice = LoadInstance<PFN_vkCreateDevice>(m_getInstanceProcAddr, m_instance, "vkCreateDevice");
+    m_getDeviceProcAddr = LoadInstance<PFN_vkGetDeviceProcAddr>(m_getInstanceProcAddr, m_instance, "vkGetDeviceProcAddr");
+    return m_destroyInstance && m_enumeratePhysicalDevices &&
+           m_getPhysicalDeviceQueueFamilyProperties && m_getPhysicalDeviceFeatures &&
+           m_getPhysicalDeviceProperties &&
+           m_createDevice && m_getDeviceProcAddr;
+}
+
 bool VulkanContext::LoadDeviceFunctions()
 {
-    m_destroyDevice = LoadInstance<PFN_vkDestroyDevice>(m_getInstanceProcAddr, m_instance, "vkDestroyDevice");
-    m_getDeviceQueue = LoadInstance<PFN_vkGetDeviceQueue>(m_getInstanceProcAddr, m_instance, "vkGetDeviceQueue");
-    m_deviceWaitIdle = LoadInstance<PFN_vkDeviceWaitIdle>(m_getInstanceProcAddr, m_instance, "vkDeviceWaitIdle");
-    m_destroyInstance = LoadGlobal<PFN_vkDestroyInstance>(m_getInstanceProcAddr, "vkDestroyInstance");
-    return m_destroyDevice && m_getDeviceQueue && m_deviceWaitIdle && m_destroyInstance;
+    if (!m_getDeviceProcAddr)
+        return false;
+    m_destroyDevice = LoadDevice<PFN_vkDestroyDevice>(m_getDeviceProcAddr, m_device, "vkDestroyDevice");
+    m_getDeviceQueue = LoadDevice<PFN_vkGetDeviceQueue>(m_getDeviceProcAddr, m_device, "vkGetDeviceQueue");
+    m_deviceWaitIdle = LoadDevice<PFN_vkDeviceWaitIdle>(m_getDeviceProcAddr, m_device, "vkDeviceWaitIdle");
+    return m_destroyDevice && m_getDeviceQueue && m_deviceWaitIdle;
 }
 
 bool VulkanContext::Initialize(const Runtime& runtime)
 {
     Shutdown();
-    if (!LoadVulkanLibrary() || !LoadInstanceFunctions())
+    if (!LoadVulkanLibrary() || !LoadGlobalFunctions())
         return false;
 
     VkApplicationInfo applicationInfo{};
@@ -129,15 +196,7 @@ bool VulkanContext::Initialize(const Runtime& runtime)
         return false;
     }
 
-    m_destroyInstance = LoadInstance<PFN_vkDestroyInstance>(m_getInstanceProcAddr, m_instance, "vkDestroyInstance");
-    m_enumeratePhysicalDevices = LoadInstance<PFN_vkEnumeratePhysicalDevices>(m_getInstanceProcAddr, m_instance, "vkEnumeratePhysicalDevices");
-    m_getPhysicalDeviceQueueFamilyProperties = LoadInstance<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
-        m_getInstanceProcAddr, m_instance, "vkGetPhysicalDeviceQueueFamilyProperties");
-    m_getPhysicalDeviceFeatures = LoadInstance<PFN_vkGetPhysicalDeviceFeatures>(
-        m_getInstanceProcAddr, m_instance, "vkGetPhysicalDeviceFeatures");
-    m_createDevice = LoadInstance<PFN_vkCreateDevice>(m_getInstanceProcAddr, m_instance, "vkCreateDevice");
-    if (!m_destroyInstance || !m_enumeratePhysicalDevices || !m_getPhysicalDeviceQueueFamilyProperties ||
-        !m_getPhysicalDeviceFeatures || !m_createDevice)
+    if (!LoadInstanceFunctions())
     {
         SetError("required Vulkan instance functions are unavailable");
         Shutdown();
@@ -187,9 +246,22 @@ bool VulkanContext::Initialize(const Runtime& runtime)
 
     VkPhysicalDeviceFeatures availableFeatures{};
     m_getPhysicalDeviceFeatures(m_physicalDevice, &availableFeatures);
+    VkPhysicalDeviceProperties physicalProperties{};
+    m_getPhysicalDeviceProperties(m_physicalDevice, &physicalProperties);
     VkPhysicalDeviceFeatures enabledFeatures{};
     enabledFeatures.fillModeNonSolid = availableFeatures.fillModeNonSolid;
+    enabledFeatures.samplerAnisotropy = availableFeatures.samplerAnisotropy;
     m_supportsWireframe = enabledFeatures.fillModeNonSolid == VK_TRUE;
+    m_supportsAnisotropicFiltering = enabledFeatures.samplerAnisotropy == VK_TRUE;
+    // GL_EYE_RADIAL_NV is the extension path used by XRenderOGL. Its Vulkan
+    // counterpart is selected only on NVIDIA devices; other vendors retain
+    // OpenGL's default eye-space-Z fog distance.
+    m_supportsRadialFog = physicalProperties.vendorID == 0x10de;
+    m_maxSamplerAnisotropy = m_supportsAnisotropicFiltering ?
+        physicalProperties.limits.maxSamplerAnisotropy : 1.0f;
+    m_minUniformBufferOffsetAlignment = physicalProperties.limits.minUniformBufferOffsetAlignment;
+    if (m_minUniformBufferOffsetAlignment == 0)
+        m_minUniformBufferOffsetAlignment = 16;
 
     VkDeviceCreateInfo deviceInfo{};
     deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -232,7 +304,21 @@ void VulkanContext::Shutdown()
     if (m_instance && m_destroyInstance)
         m_destroyInstance(m_instance, nullptr);
     if (m_vulkanLibraryLoaded)
+#if defined(_WIN32)
+    {
+        FreeLibrary(static_cast<HMODULE>(m_vulkanLibrary));
+        m_vulkanLibrary = nullptr;
+    }
+#elif defined(__ANDROID__)
+    {
         SDL_Vulkan_UnloadLibrary();
+    }
+#else
+    {
+        dlclose(m_vulkanLibrary);
+        m_vulkanLibrary = nullptr;
+    }
+#endif
 
     m_device = VK_NULL_HANDLE;
     m_instance = VK_NULL_HANDLE;
@@ -240,12 +326,17 @@ void VulkanContext::Shutdown()
     m_graphicsQueue = VK_NULL_HANDLE;
     m_graphicsQueueFamily = 0;
     m_supportsWireframe = false;
+    m_supportsAnisotropicFiltering = false;
+    m_supportsRadialFog = false;
+    m_maxSamplerAnisotropy = 1.0f;
     m_vulkanLibraryLoaded = false;
     m_getInstanceProcAddr = nullptr;
+    m_getDeviceProcAddr = nullptr;
     m_createInstance = nullptr;
     m_destroyInstance = nullptr;
     m_enumeratePhysicalDevices = nullptr;
     m_getPhysicalDeviceQueueFamilyProperties = nullptr;
+    m_getPhysicalDeviceProperties = nullptr;
     m_createDevice = nullptr;
     m_destroyDevice = nullptr;
     m_getDeviceQueue = nullptr;

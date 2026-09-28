@@ -42,6 +42,7 @@ bool VulkanPipelineFactory::Initialize(VulkanContext& context)
 bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineDesc& desc,
                                                     VkPipeline& pipeline)
 {
+    m_lastResult = VK_SUCCESS;
     pipeline = VK_NULL_HANDLE;
     if (!m_context || !desc.renderPass || !desc.layout || !desc.vertexShader ||
         !desc.fragmentShader || !desc.vertexEntry || !desc.fragmentEntry)
@@ -60,6 +61,8 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
         SetError("legacy vertex format or render state is unsupported");
         return false;
     }
+    if (desc.hasColorWriteMaskOverride)
+        legacyState.colorWriteMask = desc.colorWriteMaskOverride;
     if (legacyState.alphaTest != LegacyAlphaTestNone && !desc.supportsAlphaTest)
     {
         SetError("alpha-test state requires a shader variant that implements it");
@@ -80,17 +83,48 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = desc.fragmentShader;
     stages[1].pName = desc.fragmentEntry;
-    uint32_t specializationData[12] = {
+    uint32_t specializationData[61] = {
         static_cast<uint32_t>(legacyState.alphaTest), desc.stage0ColorMode, desc.stage0AlphaMode,
         desc.stage1ColorMode, desc.stage1AlphaMode, desc.stage0ColorArg, desc.stage0AlphaArg,
         desc.stage0Constant, desc.stage1ColorArg, desc.stage1AlphaArg, desc.stage1Constant,
-        desc.hasSecondaryColor ? 1u : 0u
+        desc.hasSecondaryColor ? 1u : 0u, desc.stage2ColorMode, desc.stage2AlphaMode,
+        desc.stage2ColorArg, desc.stage2AlphaArg, desc.stage2Constant,
+        desc.supportsStage1Combine ? 1u : 0u,
+        desc.stage2UsesTexCoord1 ? 1u : 0u,
+        desc.stage3ColorMode, desc.stage3AlphaMode, desc.stage3ColorArg,
+        desc.stage3AlphaArg, desc.stage3Constant,
+        desc.stage3UsesTexCoord1 ? 1u : 0u,
+        desc.supportsStage3Combine ? 1u : 0u,
+        desc.supportsStage2Combine ? 1u : 0u,
+        desc.stages4To7[0].colorMode, desc.stages4To7[0].alphaMode,
+        desc.stages4To7[0].colorArg, desc.stages4To7[0].alphaArg,
+        desc.stages4To7[0].constant, desc.stages4To7[0].useTexCoord1 ? 1u : 0u,
+        desc.stages4To7[0].enabled ? 1u : 0u,
+        desc.stages4To7[1].colorMode, desc.stages4To7[1].alphaMode,
+        desc.stages4To7[1].colorArg, desc.stages4To7[1].alphaArg,
+        desc.stages4To7[1].constant, desc.stages4To7[1].useTexCoord1 ? 1u : 0u,
+        desc.stages4To7[1].enabled ? 1u : 0u,
+        desc.stages4To7[2].colorMode, desc.stages4To7[2].alphaMode,
+        desc.stages4To7[2].colorArg, desc.stages4To7[2].alphaArg,
+        desc.stages4To7[2].constant, desc.stages4To7[2].useTexCoord1 ? 1u : 0u,
+        desc.stages4To7[2].enabled ? 1u : 0u,
+        desc.stages4To7[3].colorMode, desc.stages4To7[3].alphaMode,
+        desc.stages4To7[3].colorArg, desc.stages4To7[3].alphaArg,
+        desc.stages4To7[3].constant, desc.stages4To7[3].useTexCoord1 ? 1u : 0u,
+        desc.stages4To7[3].enabled ? 1u : 0u,
+        0u, 0u, 0u, 0u
     };
-    VkSpecializationMapEntry specializationEntries[12]{};
+    for (uint32_t stageIndex = 0; stageIndex < 4; ++stageIndex)
+        std::memcpy(&specializationData[55 + stageIndex],
+                    &desc.stages4To7[stageIndex].lodBias, sizeof(uint32_t));
+    VkSpecializationMapEntry specializationEntries[61]{};
     VkSpecializationInfo alphaTestSpecialization{};
-    if (desc.supportsAlphaTest || desc.supportsStage0Combine || desc.supportsStage1Combine)
+    uint32_t specializationCount = 0;
+    if (desc.supportsAlphaTest || desc.supportsStage0Combine || desc.supportsStage1Combine ||
+        desc.supportsStage2Combine || desc.supportsStage3Combine ||
+        desc.stages4To7[0].enabled || desc.stages4To7[1].enabled ||
+        desc.stages4To7[2].enabled || desc.stages4To7[3].enabled)
     {
-        uint32_t specializationCount = 0;
         const auto addSpecialization = [&](uint32_t constantId, uint32_t dataIndex)
         {
             VkSpecializationMapEntry& entry = specializationEntries[specializationCount++];
@@ -103,11 +137,45 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
         {
             addSpecialization(1, 1); addSpecialization(2, 2);
             addSpecialization(5, 5); addSpecialization(6, 6); addSpecialization(7, 7);
+            specializationData[60] = desc.stage0UsesTexCoord1 ? 1u : 0u;
+            addSpecialization(60, 60);
         }
         if (desc.supportsStage1Combine)
         {
             addSpecialization(3, 3); addSpecialization(4, 4);
             addSpecialization(8, 8); addSpecialization(9, 9); addSpecialization(10, 10);
+            specializationData[59] = desc.stage1UsesTexCoord1 ? 1u : 0u;
+            addSpecialization(59, 59);
+        }
+        if (desc.supportsStage2Combine)
+        {
+            addSpecialization(12, 12); addSpecialization(13, 13);
+            addSpecialization(14, 14); addSpecialization(15, 15);
+            addSpecialization(16, 16);
+            addSpecialization(17, 17);
+            addSpecialization(18, 18);
+        }
+        if (desc.supportsStage3Combine)
+        {
+            addSpecialization(19, 19); addSpecialization(20, 20);
+            addSpecialization(21, 21); addSpecialization(22, 22);
+            addSpecialization(23, 23); addSpecialization(24, 24);
+            addSpecialization(25, 25); addSpecialization(26, 26);
+        }
+        for (uint32_t stageIndex = 0; stageIndex < 4; ++stageIndex)
+        {
+            if (!desc.stages4To7[stageIndex].enabled)
+                continue;
+            const uint32_t dataIndex = 27 + stageIndex * 7;
+            const uint32_t constantId = 27 + stageIndex * 7;
+            addSpecialization(constantId + 0, dataIndex + 0);
+            addSpecialization(constantId + 1, dataIndex + 1);
+            addSpecialization(constantId + 2, dataIndex + 2);
+            addSpecialization(constantId + 3, dataIndex + 3);
+            addSpecialization(constantId + 4, dataIndex + 4);
+            addSpecialization(constantId + 5, dataIndex + 5);
+            addSpecialization(constantId + 6, dataIndex + 6);
+            addSpecialization(55 + stageIndex, 55 + stageIndex);
         }
         if (desc.supportsStage0Combine || desc.supportsStage1Combine)
             addSpecialization(11, 11);
@@ -118,7 +186,7 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
         stages[1].pSpecializationInfo = &alphaTestSpecialization;
     }
 
-    VkVertexInputBindingDescription bindings[2]{};
+    VkVertexInputBindingDescription bindings[3]{};
     bindings[0].binding = 0;
     bindings[0].stride = vertexFormat.stride;
     bindings[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
@@ -137,6 +205,48 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
             attribute.binding = 1;
             attribute.format = VK_FORMAT_R32G32B32_SFLOAT;
             attribute.offset = i * sizeof(float) * 3;
+        }
+    }
+    if (desc.hasLightmapTexCoords)
+    {
+        if (!desc.hasTangents)
+        {
+            // Keep binding numbers dense when the lightmap stream occupies
+            // binding 2 but no tangent stream uses binding 1.
+            bindings[1].binding = 1;
+            bindings[1].stride = sizeof(float) * 2;
+            bindings[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        }
+        bindings[2].binding = 2;
+        bindings[2].stride = sizeof(float) * 2;
+        bindings[2].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        bindingCount = 3;
+        bool replacedUv1 = false;
+        for (uint32_t i = 0; i < vertexFormat.attributeCount; ++i)
+        {
+            VkVertexInputAttributeDescription& attribute = vertexFormat.attributes[i];
+            if (attribute.location == 5)
+            {
+                attribute.binding = 2;
+                attribute.offset = 0;
+                replacedUv1 = true;
+                break;
+            }
+        }
+        if (!replacedUv1)
+        {
+            if (vertexFormat.attributeCount >=
+                sizeof(vertexFormat.attributes) / sizeof(vertexFormat.attributes[0]))
+            {
+                SetError("lightmap texture coordinates exceed the vertex attribute limit");
+                return false;
+            }
+            VkVertexInputAttributeDescription& attribute =
+                vertexFormat.attributes[vertexFormat.attributeCount++];
+            attribute.location = 5;
+            attribute.binding = 2;
+            attribute.format = VK_FORMAT_R32G32_SFLOAT;
+            attribute.offset = 0;
         }
     }
     VkPipelineVertexInputStateCreateInfo vertexInput{};
@@ -182,7 +292,9 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
     rasterization.polygonMode = legacyState.polygonLine ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
     rasterization.cullMode = legacyState.cullMode;
     rasterization.frontFace = legacyState.frontFace;
-    rasterization.depthBiasEnable = VK_FALSE;
+    rasterization.depthBiasEnable = desc.depthBias ? VK_TRUE : VK_FALSE;
+    rasterization.depthBiasConstantFactor = desc.depthBiasConstantFactor;
+    rasterization.depthBiasSlopeFactor = desc.depthBiasSlopeFactor;
     rasterization.lineWidth = 1.0f;
 
     VkPipelineMultisampleStateCreateInfo multisample{};
@@ -249,11 +361,14 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
     createInfo.layout = desc.layout;
     createInfo.renderPass = desc.renderPass;
     createInfo.subpass = 0;
-    const VkResult result = m_createGraphicsPipelines(m_context->GetDevice(), VK_NULL_HANDLE,
-                                                       1, &createInfo, nullptr, &pipeline);
-    if (result != VK_SUCCESS)
+    m_lastResult = m_createGraphicsPipelines(m_context->GetDevice(), VK_NULL_HANDLE,
+                                              1, &createInfo, nullptr, &pipeline);
+    if (m_lastResult != VK_SUCCESS)
     {
-        SetError("vkCreateGraphicsPipelines failed");
+        std::snprintf(m_lastError, sizeof(m_lastError),
+                      "vkCreateGraphicsPipelines failed (VkResult %d, vertex format %u, topology %u, specialization entries %u)",
+                      static_cast<int>(m_lastResult), desc.cryVertexFormat,
+                      static_cast<uint32_t>(desc.topology), specializationCount);
         pipeline = VK_NULL_HANDLE;
         return false;
     }

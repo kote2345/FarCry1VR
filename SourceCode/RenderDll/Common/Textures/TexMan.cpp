@@ -887,8 +887,13 @@ STexPic *CTexMan::LoadCubeTex(const char *mapname, uint flags, uint flags2, int 
               for (int j=1; j<6; j++)
               {
                 sprintf(cube, "%s_%s", name, cubefaces[j]);
-                ti = gRenDev->m_TexMan->CreateTexture(cube, ti->m_Width, ti->m_Height, 1, flags, flags2, data, eTT_Cubemap, fAmount);
-                ti->m_ETF = tx->m_ETF;
+                STexPic *cubeSide = gRenDev->m_TexMan->CreateTexture(
+                    cube, tx->m_Width, tx->m_Height, 1, flags, flags2, data,
+                    eTT_Cubemap, fAmount);
+                // A renderer that cannot allocate this cube face may still
+                // return the source image as a useful 2D fallback.
+                if (cubeSide)
+                    cubeSide->m_ETF = tx->m_ETF;
               }
               delete [] data;
             }

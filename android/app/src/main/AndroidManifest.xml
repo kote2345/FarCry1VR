@@ -12,11 +12,15 @@
     <uses-permission android:name="android.permission.READ_LOGS" tools:ignore="ProtectedPermissions" />
     <!-- Needed to install a downloaded APK update from the launcher -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Allow Quest's launch gate to treat controllers as optional when using
+         hand input; the game can still be played with the supported controls. -->
+    <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
 
     <uses-feature android:name="android.hardware.vulkan.level" android:required="false" />
     <uses-feature android:name="android.hardware.vulkan.version" android:required="false" />
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
     <uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="true" />
+    <uses-feature android:name="oculus.software.handtracking" android:required="false" />
 
     <application
         android:allowBackup="true"

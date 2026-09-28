@@ -16,6 +16,8 @@ layout(location = 5) out vec3 binormal;
 layout(location = 6) out vec3 tangentNormal;
 layout(location = 7) out vec4 objectLightPositionRadius;
 layout(location = 8) out vec4 lightColorAmbient;
+layout(location = 9) out vec3 clipPosition;
+layout(location = 11) out vec3 projectorDirection;
 layout(push_constant) uniform SceneTransform {
     mat4 mvp;
     vec4 uv0Row0;
@@ -24,6 +26,8 @@ layout(push_constant) uniform SceneTransform {
     vec4 lightColorAmbient;
 } transformData;
 void main() {
+    clipPosition = inPosition;
+    projectorDirection = inPosition - transformData.objectLightPositionRadius.xyz;
     vec3 uv = vec3(inTexCoord, 1.0);
     texCoord = vec2(dot(transformData.uv0Row0.xyz, uv), dot(transformData.uv0Row1.xyz, uv));
     gl_Position = transformData.mvp * vec4(inPosition, 1.0);
