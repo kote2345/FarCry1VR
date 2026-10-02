@@ -361,6 +361,19 @@ private:
 
         StockDrawAux() : linearEnabled{} {}
     };
+    struct StockDrawTextureStage
+    {
+        int textureId;
+        int colorOp;
+        int alphaOp;
+        uint32_t colorArg;
+        uint32_t alphaArg;
+        uint32_t constant;
+        float lodBias;
+        bool useTexCoord1;
+        int wrapMode;
+        float uvTransform[9];
+    };
     struct StockDraw
     {
         bool profilePlants = false;
@@ -408,10 +421,10 @@ private:
         float projectorFrustumScale = 1.0f;
         int textureId1 = 0;
         int textureWrapMode[4];
-        VulkanStockTextureStage textureStages4To7[4]{};
+        StockDrawTextureStage textureStages4To7[4];
         bool useTextureStages4To7[4];
-        VulkanStockTextureStage textureStage2;
-        VulkanStockTextureStage textureStage3;
+        StockDrawTextureStage textureStage2;
+        StockDrawTextureStage textureStage3;
         bool useSecondTexture = false;
         bool useThirdTexture = false;
         bool useFourthTexture = false;

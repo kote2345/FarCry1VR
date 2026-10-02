@@ -1829,15 +1829,31 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
     draw.textureWrapMode[1] = textureWrapMode1;
     draw.textureWrapMode[2] = textureWrapMode2;
     draw.textureWrapMode[3] = textureWrapMode3;
-    draw.textureStage2 = textureStage2 ? *textureStage2 : VulkanStockTextureStage{};
-    draw.textureStage3 = textureStage3 ? *textureStage3 : VulkanStockTextureStage{};
+    const auto copyTextureStage = [](StockDrawTextureStage& destination,
+                                     const VulkanStockTextureStage& source)
+    {
+        destination.textureId = source.textureId;
+        destination.colorOp = source.colorOp;
+        destination.alphaOp = source.alphaOp;
+        destination.colorArg = source.colorArg;
+        destination.alphaArg = source.alphaArg;
+        destination.constant = source.constant;
+        destination.lodBias = source.lodBias;
+        destination.useTexCoord1 = source.useTexCoord1;
+        destination.wrapMode = source.wrapMode;
+        std::memcpy(destination.uvTransform, source.uvTransform,
+                    sizeof(destination.uvTransform));
+    };
+    if (textureStage2) copyTextureStage(draw.textureStage2, *textureStage2);
+    if (textureStage3) copyTextureStage(draw.textureStage3, *textureStage3);
     draw.useThirdTexture = useThirdTexture;
     draw.useFourthTexture = useFourthTexture;
     for (uint32_t stageIndex = 0; stageIndex < 4; ++stageIndex)
     {
         draw.useTextureStages4To7[stageIndex] = useTextureStages4To7[stageIndex];
         if (textureStages4To7)
-            draw.textureStages4To7[stageIndex] = textureStages4To7[stageIndex];
+            copyTextureStage(draw.textureStages4To7[stageIndex],
+                             textureStages4To7[stageIndex]);
     }
     draw.useSecondTexture = useSecondTexture;
     draw.useNormalMap = useNormalMap;
@@ -2363,8 +2379,8 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
     {
         StockDraw& current = m_stockDraws.back();
         StockDraw& previous = m_stockDraws[m_stockDraws.size() - 2];
-        const auto sameStage = [](const VulkanStockTextureStage& a,
-                                  const VulkanStockTextureStage& b)
+        const auto sameStage = [](const StockDrawTextureStage& a,
+                                  const StockDrawTextureStage& b)
         {
             return a.textureId == b.textureId && a.colorOp == b.colorOp &&
                 a.alphaOp == b.alphaOp && a.colorArg == b.colorArg &&
@@ -2425,8 +2441,8 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                 std::memcmp(a.textureWrapMode, b.textureWrapMode, sizeof(a.textureWrapMode)) != 0 ||
                 std::memcmp(a.useTextureStages4To7, b.useTextureStages4To7,
                             sizeof(a.useTextureStages4To7)) != 0 ||
-                !sameStage(a.textureStage2, b.textureStage2) ||
-                !sameStage(a.textureStage3, b.textureStage3) ||
+                (a.useThirdTexture && !sameStage(a.textureStage2, b.textureStage2)) ||
+                (a.useFourthTexture && !sameStage(a.textureStage3, b.textureStage3)) ||
                 std::memcmp(a.projectorBasis, b.projectorBasis, sizeof(a.projectorBasis)) != 0 ||
                 a.projectorFrustumScale != b.projectorFrustumScale ||
                 a.stage0ColorArg != b.stage0ColorArg || a.stage0AlphaArg != b.stage0AlphaArg ||
@@ -2457,7 +2473,8 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                 a.nearPlane != b.nearPlane || a.farPlane != b.farPlane)
                 return false;
             for (uint32_t stage = 0; stage < 4; ++stage)
-                if (!sameStage(a.textureStages4To7[stage], b.textureStages4To7[stage]))
+                if (a.useTextureStages4To7[stage] &&
+                    !sameStage(a.textureStages4To7[stage], b.textureStages4To7[stage]))
                     return false;
             return true;
         };
@@ -4974,7 +4991,7 @@ bool VulkanFrameRenderer::RecordShadowMapDraws(VkCommandBuffer commandBuffer,
         for (uint32_t stage = 0; stage < 4; ++stage)
         {
             if (!draw.useTextureStages4To7[stage]) continue;
-            const VulkanStockTextureStage& textureStage = draw.textureStages4To7[stage];
+            const StockDrawTextureStage& textureStage = draw.textureStages4To7[stage];
             textureSets[stage + 4] = GetLegacyTextureDescriptorSet(
                 textureStage.textureId, textureStage.wrapMode);
             if (!textureSets[stage + 4]) missingTexture = true;
@@ -6086,7 +6103,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
             {
                 if (!draw.useTextureStages4To7[stageIndex])
                     continue;
-                const VulkanStockTextureStage& stage = draw.textureStages4To7[stageIndex];
+                const StockDrawTextureStage& stage = draw.textureStages4To7[stageIndex];
                 std::map<int, LegacyTexture>::const_iterator texture = m_legacyTextures.find(stage.textureId);
                 if (texture == m_legacyTextures.end())
                 {
