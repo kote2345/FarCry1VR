@@ -2207,9 +2207,14 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
         !m_dynamicVertexBuffer.buffer || !m_dynamicIndexBuffer.buffer)
         return auditFailure("missing resources, vertices, count, or dynamic buffer");
     const uint16_t* sourceIndices = indices;
-    if (!lightmapTexCoords && !terrainProjection && reusePreviousClientGeometry && sourceIndices && m_reusableClientGeometry.valid &&
+    // VulkanRenderer sets reusePreviousClientGeometry only on later light
+    // contributions from the same DrawBuffer call. Its vertex, index and
+    // optional lightmap-UV arrays remain alive and unchanged through that
+    // loop, so reuse the first contribution's GPU copies as one unit.
+    if (reusePreviousClientGeometry && sourceIndices && m_reusableClientGeometry.valid &&
         vertices == m_reusableClientGeometry.sourceVertices &&
         sourceIndices == m_reusableClientGeometry.sourceIndices &&
+        lightmapTexCoords == m_reusableClientGeometry.sourceLightmapTexCoords &&
         vertexCount == m_reusableClientGeometry.vertexCount &&
         indexCount == m_reusableClientGeometry.indexCount &&
         vertexFormat == m_reusableClientGeometry.vertexFormat &&
@@ -2233,7 +2238,9 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                                   polygonOffset, polygonOffsetFactor, polygonOffsetUnits, clipPlane,
                                   m_reusableClientGeometry.vertexBufferOffset,
                                   textureWrapMode0, textureWrapMode1, textureWrapMode2, textureWrapMode3,
-                                  textureStages4To7, nullptr, 0,
+                                  textureStages4To7,
+                                  lightmapTexCoords ? &m_reusableClientGeometry.vertexBuffer : nullptr,
+                                  lightmapTexCoords ? m_reusableClientGeometry.lightmapTexCoordOffset : 0,
                                   textureStage1UsesTexCoord1,
                                   textureStage0UsesTexCoord1,
                                   invertVertexRgb, nearestObject, waterEffect,
@@ -2287,8 +2294,6 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
         ++outOfRangeIndexAuditCount;
         return auditFailure("index exceeds uploaded vertex count");
     }
-    if (lightmapTexCoords || terrainProjection)
-        m_reusableClientGeometry.valid = false;
     VulkanVertexFormat format{};
     if (!GetVulkanVertexFormat(static_cast<uint32_t>(vertexFormat), format))
         return auditFailure("unsupported vertex format");
@@ -2522,11 +2527,12 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
     ++clientDrawAuditCount;
     m_dynamicVertexUsed = dynamicVertexEnd;
     m_dynamicIndexUsed += indexBytes;
-    if (sourceIndices && !lightmapTexCoords && !terrainProjection)
+    if (sourceIndices)
     {
         m_reusableClientGeometry.valid = true;
         m_reusableClientGeometry.sourceVertices = vertices;
         m_reusableClientGeometry.sourceIndices = sourceIndices;
+        m_reusableClientGeometry.sourceLightmapTexCoords = lightmapTexCoords;
         m_reusableClientGeometry.vertexCount = vertexCount;
         m_reusableClientGeometry.indexCount = indexCount;
         m_reusableClientGeometry.vertexFormat = vertexFormat;
@@ -2536,6 +2542,7 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
         m_reusableClientGeometry.firstIndex = firstIndex;
         m_reusableClientGeometry.vertexOffset = uploadBaseVertex;
         m_reusableClientGeometry.vertexBufferOffset = vertexBufferOffset;
+        m_reusableClientGeometry.lightmapTexCoordOffset = lightmapOffset;
     }
     return true;
 }

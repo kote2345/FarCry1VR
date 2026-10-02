@@ -534,6 +534,7 @@ private:
         bool valid = false;
         const void* sourceVertices = nullptr;
         const uint16_t* sourceIndices = nullptr;
+        const void* sourceLightmapTexCoords = nullptr;
         uint32_t vertexCount = 0;
         uint32_t indexCount = 0;
         int vertexFormat = 0;
@@ -543,6 +544,7 @@ private:
         uint32_t firstIndex = 0;
         int32_t vertexOffset = 0;
         VkDeviceSize vertexBufferOffset = 0;
+        VkDeviceSize lightmapTexCoordOffset = 0;
     };
 
     bool LoadFunctions();
