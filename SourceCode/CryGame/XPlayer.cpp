@@ -1795,6 +1795,27 @@ void CPlayer::ProcessMovements(CXEntityProcessingCmd &cmd, bool bScheduled)
 	//lets remove the action flag every frame if in crouching mode.
 	if(m_pGame->IsServer())
 	{
+		// The VR A button is a one-shot stance cycle. Read the real player stance
+		// each time so other game-driven stance changes cannot desynchronise an
+		// input-side toggle counter.
+		if (cmd.CheckAction(ACTION_VR_POSTURE_CYCLE))
+		{
+			if (!m_pVehicle && !m_pMountedWeapon && !m_bSwimming &&
+				!m_stats.onLadder)
+			{
+				if (m_CurStance == eCrouch)
+					GoProne();
+				else if (m_CurStance == eProne)
+					GoStand();
+				else
+				{
+					if (GoCrouch())
+						m_bStayCrouch = true;
+				}
+			}
+			cmd.RemoveAction(ACTION_VR_POSTURE_CYCLE);
+		}
+
 		//crouch toggle
 		if (cmd.CheckAction(ACTION_MOVEMODE_TOGGLE))
 		{
@@ -1993,6 +2014,11 @@ void CPlayer::ProcessMovements(CXEntityProcessingCmd &cmd, bool bScheduled)
 		m_pGame->GetSystem()->GetIRenderer()->GetType() == R_VULKAN_RENDERER)
 	{
 		dirangle[ROLL] += RAD2DEG(m_pGame->GetSystem()->GetVRHeadYawDeltaRadians());
+		// Command angles store pitch in x. PITCH (1) names the converted
+		// physics angle, after ConvertToRad maps -x + 90 degrees into y.
+		// Use the same HMD-only pitch as rendering while climbing.
+		if (m_stats.onLadder)
+			dirangle.x = -RAD2DEG(m_pGame->GetSystem()->GetVRHeadPitchDeltaRadians());
 	}
 	 dirangle=ConvertToRad(dirangle);
 
@@ -5141,7 +5167,11 @@ void CPlayer::OnDraw(const SRendParams & _RendParams)
 		
 		if (pInst && pInst->GetFlags()&CS_FLAG_DRAW_MODEL)
 		{
+			Matrix34 controller;
+			const bool trackedWeapon = IsMyPlayer() && m_pGame->GetSystem()->GetVRControllerTransform(false, controller);
+			if (trackedWeapon) pWeapon->MoveToFirstPersonPos(m_pEntity);
 			SRendParams RendParams      = _RendParams;
+			if (trackedWeapon) RendParams.fScale = 1.0f;
 			RendParams.vPos             = pWeapon->GetPos();
 			RendParams.vAngles          = pWeapon->GetAngles();
 

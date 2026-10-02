@@ -32,6 +32,9 @@
         android:theme="@style/AppTheme"
         tools:targetApi="31">
 
+        <!-- Permit CPU sampling through adb without a debug build. -->
+        <profileable android:shell="true" />
+
         <!-- Keep the configuration screen available by explicit intent, but do
              not make it the app/Quest entry point. -->
         <activity

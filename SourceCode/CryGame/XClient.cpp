@@ -847,8 +847,23 @@ void CXClient::Update()
 
 		}
 
+		IInput* pInput = m_pGame->GetSystem()->GetIInput();
+		const bool vrPostureCycle = pInput && pInput->ConsumeVRPostureCycle();
+		const bool vrFireReleased = pInput && pInput->ConsumeVRFireReleased();
 		if((!m_pGame->m_pSystem->GetIConsole()->IsOpened()) && (!m_pGame->m_bMenuOverlay) && m_pIActionMapManager)
+		{
 			m_pIActionMapManager->Update((unsigned int)(time*1000.f));
+			if (pInput && pInput->HasVRFireState())
+			{
+				// Override synthetic mouse state on both press and release. A
+				// lost SDL button-up must not leave semi-auto waiting forever.
+				m_PlayerProcessingCmd.RemoveAction(ACTION_FIRE0);
+				if (pInput->IsVRFireHeld()) m_PlayerProcessingCmd.AddAction(ACTION_FIRE0);
+			}
+			if (vrFireReleased) m_PlayerProcessingCmd.AddAction(ACTION_FIRECANCEL);
+			if (vrPostureCycle && pPlayer)
+				m_PlayerProcessingCmd.AddAction(ACTION_VR_POSTURE_CYCLE);
+		}
 
 		if(en==NULL)
 			return;

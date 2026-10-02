@@ -999,6 +999,13 @@ struct IInput
 	// Optional VR axes. Appended to preserve the existing IInput vtable layout
 	// for implementations that do not provide this hook.
 	virtual void SetVRControllerAxes(const Vec3& moveAxes, const Vec3& lookAxes) { }
+	// One-shot gameplay input is latched until the game command update consumes it.
+	virtual void QueueVRPostureCycle() { }
+	virtual void SetVRFireState(bool held) { }
+	virtual bool IsVRFireHeld() const { return false; }
+	virtual bool HasVRFireState() const { return false; }
+	virtual bool ConsumeVRFireReleased() { return false; }
+	virtual bool ConsumeVRPostureCycle() { return false; }
 };
 
 

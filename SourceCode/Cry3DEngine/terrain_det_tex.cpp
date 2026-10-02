@@ -28,6 +28,11 @@ void CTerrain::MakeSplatVertex(const int & x,
 	vert.xyz.x = (float)x;
 	vert.xyz.y = (float)y;
 	vert.xyz.z = /*0.075f+*/GetZSafe(x,y);
+	// Simple detail layers do not call SetDetailVertNormal below. Their
+	// Vulkan vertex program still reads NORMAL for the overlay displacement.
+	// Do not send the previous contents of this reused stack vertex to the GPU.
+	if(GetRenderer()->GetType() == R_VULKAN_RENDERER)
+		vert.normal = Vec3d(0,0,1);
 	vert.color.bcolor[3] = alpha;
 	vert.xyz += vDetTexOffset;
 	m_DetailTexInfo[nTexID].lstVertArray.Add(vert);
@@ -97,8 +102,16 @@ void CTerrain::DrawDetailTextures(float _fFogNearDistance, float _fFogFarDistanc
 
 	Matrix44 mat;
 	GetRenderer()->GetModelViewMatrix(mat.GetData());
+	// Vulkan applies the tracked orientation later, per OpenXR eye.
+	// Its renderer matrix therefore points along the body camera rather than
+	// the camera used by terrain visibility. Generate the detail footprint
+	// in front of that visibility camera so head turns do not reveal bare
+	// low-resolution terrain outside a footprint aimed elsewhere.
+	if(GetRenderer()->GetType() == R_VULKAN_RENDERER)
+		mat = m_pViewCamera->GetVCMatrixD3D9();
 	Vec3d vForward = -mat.GetColumn(2);
 	vForward.Normalize();
+	const bool vrTerrain = GetRenderer()->GetType() == R_VULKAN_RENDERER;
 
 	const float fGeometryUpdateStep = 4;
 	const float fMaxViewDistSq = DETAIL_TEXTURE_VIEW_DIST*DETAIL_TEXTURE_VIEW_DIST;
@@ -111,6 +124,11 @@ void CTerrain::DrawDetailTextures(float _fFogNearDistance, float _fFogFarDistanc
 	// find new focus
 	int X = (int)(vCamPos.x + vForward.x*fFocusDist);
 	int Y = (int)(vCamPos.y + vForward.y*fFocusDist);
+	// The eye orientation is applied after scene submission. A footprint
+	// aimed at the earlier visibility camera can miss the actual eye frustum.
+	// Cover the complete fading radius around the viewer in Vulkan, so a head
+	// turn neither drops detail geometry nor rebuilds all its leaf buffers.
+	if(vrTerrain) { X = (int)vCamPos.x; Y = (int)vCamPos.y; }
 
 	// align to grid
 	X = X/CTerrain::GetHeightMapUnitSize()*CTerrain::GetHeightMapUnitSize();
@@ -162,14 +180,22 @@ void CTerrain::DrawDetailTextures(float _fFogNearDistance, float _fFogFarDistanc
 				vDetTexOffset *= 0.75f;
 				if(m_DetailTexInfo[nTexID].ucProjAxis != 'Z')
 					vDetTexOffset.z *= 4;
+				if(vrTerrain)
+					vDetTexOffset = Vec3d(0,0,0.015f*0.75f);
 
 				float fDistRatio = (1.f + (fZProjMaxDistRatio*fZProjMaxDistRatio-1.f)*(m_DetailTexInfo[nTexID].ucProjAxis == 'Z'))/1.7f;
+				const int vrRadius = ((int)ceilf(cry_sqrtf(fMaxViewDistSq/fDistRatio)) /
+					CTerrain::GetHeightMapUnitSize()+1)*CTerrain::GetHeightMapUnitSize();
+				const int layerX1 = vrTerrain ? X-vrRadius : x1;
+				const int layerY1 = vrTerrain ? Y-vrRadius : y1;
+				const int layerX2 = vrTerrain ? X+vrRadius : x2;
+				const int layerY2 = vrTerrain ? Y+vrRadius : y2;
 
-				for(int x=x1; x<x2; x+=CTerrain::GetHeightMapUnitSize())
+				for(int x=layerX1; x<layerX2; x+=CTerrain::GetHeightMapUnitSize())
 				{
 					bool bPreviousFacePresent = 0; // for vertex sharing
 
-					for(int y=y1; y<y2; y+=CTerrain::GetHeightMapUnitSize())
+					for(int y=layerY1; y<layerY2; y+=CTerrain::GetHeightMapUnitSize())
 					{
 						const float dx = (float)x - vCamPos.x;
 						const float dy = (float)y - vCamPos.y;

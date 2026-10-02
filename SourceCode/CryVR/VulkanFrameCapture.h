@@ -29,6 +29,9 @@ bool BuildOpenXrEyeMvp(const XrView& eyeView, const XrPosef& referenceHeadPose,
                        const float referenceModelView[16],
                        float nearPlane, float farPlane, float mvp[16],
                        float eyeModelView[16] = 0, bool nearestObject = false);
+// Apply an already prepared eye transform to another material/object draw.
+void ApplyOpenXrEyeMatrices(const float eyeView[16], const float eyeViewProjection[16],
+                           const float modelView[16], float mvp[16], float viewModel[16]);
 }
 
 #endif

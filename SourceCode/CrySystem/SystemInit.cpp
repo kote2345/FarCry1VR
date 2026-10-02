@@ -166,6 +166,19 @@ bool MirrorVulkanRgbaTexture(void* drawUserData, int textureId, unsigned int wid
         rgbaPixels, clampU, clampV, dynamicTexture, noMipmaps, filterMode, maxAnisotropy);
 }
 
+bool MirrorVulkanRgbaTextureMipChain(void* drawUserData, int textureId,
+                                     unsigned int width, unsigned int height,
+                                     const unsigned char* const* rgbaMipPixels,
+                                     unsigned int mipCount,
+                                     bool clampU, bool clampV, int filterMode,
+                                     float maxAnisotropy)
+{
+	CryVR::VulkanFrameRenderer* renderer = static_cast<CryVR::VulkanFrameRenderer*>(drawUserData);
+	return renderer && renderer->RegisterLegacyRgbaTexture(textureId, width, height,
+		rgbaMipPixels ? rgbaMipPixels[0] : nullptr, clampU, clampV, false, false,
+		filterMode, maxAnisotropy, rgbaMipPixels, mipCount);
+}
+
 bool MirrorVulkanRgbaCubeTexture(void* drawUserData, int textureId, unsigned int width,
                                  unsigned int height, const unsigned char* const facePixels[6],
                                  bool noMipmaps, int filterMode, float maxAnisotropy)
@@ -760,6 +773,7 @@ bool CSystem::InitRenderer(WIN_HINSTANCE hinst, WIN_HWND hwnd,const char *szCmdL
 			bufferCallbacks.queueClientIndexedDraw = QueueVulkanClientStockDraw;
 			bufferCallbacks.requirePanelFallback = RequireVulkanPanelFallback;
 			bufferCallbacks.mirrorRgbaTexture = MirrorVulkanRgbaTexture;
+			bufferCallbacks.mirrorRgbaTextureMipChain = MirrorVulkanRgbaTextureMipChain;
 			bufferCallbacks.mirrorRgbaCubeTexture = MirrorVulkanRgbaCubeTexture;
 			bufferCallbacks.mirrorRgbaTextureRegion = MirrorVulkanRgbaTextureRegion;
 			bufferCallbacks.releaseMirroredTexture = ReleaseMirroredVulkanTexture;

@@ -793,19 +793,24 @@ RenderLMData * CLMSerializationManager2::CreateLightmap(const char *pszFileName,
 
   if (GetCVars()->e_light_maps_quality==0 || bLow)
   {
-    ITexPic *pColorLerpTex = pIRenderer->EF_GetTextureByID(iColorLerpTex);
-    byte *pDataLerpTex = pColorLerpTex->GetData32();
-    ITexPic *pDomDirectionTex = pIRenderer->EF_GetTextureByID(iDomDirectionTex);
-    byte *pDataDirectionTex = pDomDirectionTex->GetData32();
-    int Width = pColorLerpTex->GetWidth();
-    int Height = pColorLerpTex->GetHeight();
-    assert(Width == pDomDirectionTex->GetWidth() && Height == pDomDirectionTex->GetHeight());
+    // These maps were uploaded immediately above. Use their original RGBA
+    // bytes for the low-quality bake; Vulkan has no GL texture readback behind
+    // STexPic::GetData32(). The direction source is RGB unless DOT3 alpha is
+    // enabled, exactly as in the upload path.
+    int Width = iWidth;
+    int Height = iHeight;
     byte *pDst = new byte[Width*Height*4];
     for (int i=0; i<Height; i++)
     {
       byte *pDs = &pDst[i*Width*4];  
-      byte *pSr0 = &pDataLerpTex[i*Width*4]; 
-      byte *pSr1 = &pDataDirectionTex[i*Width*4]; 
+      byte *pSr0 = &pColorLerp4[i*Width*4];
+#ifdef USE_DOT3_ALPHA
+      byte *pSr1 = &pDomDirection3[i*Width*4];
+      const int directionStride = 4;
+#else
+      byte *pSr1 = &pDomDirection3[i*Width*3];
+      const int directionStride = 3;
+#endif
       for (int j=0; j<Width; j++)
       {
         Vec3d v;
@@ -815,9 +820,14 @@ RenderLMData * CLMSerializationManager2::CreateLightmap(const char *pszFileName,
         float lmColor[4];
 
 #ifdef APPLY_COLOUR_FIX
-			lmColor[0] = (float)pSr0[0] * (float)pSr1[3] / 255.0f / 255.0f;
-			lmColor[1] = (float)pSr0[1] * (float)pSr1[3] / 255.0f / 255.0f;
-			lmColor[2] = (float)pSr0[2] * (float)pSr1[3] / 255.0f / 255.0f;
+#ifdef USE_DOT3_ALPHA
+            const float directionAlpha = (float)pSr1[3];
+#else
+            const float directionAlpha = 0.0f;
+#endif
+			lmColor[0] = (float)pSr0[0] * directionAlpha / 255.0f / 255.0f;
+			lmColor[1] = (float)pSr0[1] * directionAlpha / 255.0f / 255.0f;
+			lmColor[2] = (float)pSr0[2] * directionAlpha / 255.0f / 255.0f;
 #else
 			lmColor[0] = (float)pSr0[0] / 255.0f;
 			lmColor[1] = (float)pSr0[1] / 255.0f;
@@ -832,11 +842,12 @@ RenderLMData * CLMSerializationManager2::CreateLightmap(const char *pszFileName,
 
         pDs += 4;
         pSr0 += 4;
-        pSr1 += 4;
+        pSr1 += directionStride;
       }
     }
-    pColorLerpTex->Release();
-    pDomDirectionTex->Release();
+    // Release the renderer's mirrored images as well as the texture records.
+    pIRenderer->RemoveTexture(iColorLerpTex);
+    pIRenderer->RemoveTexture(iDomDirectionTex);
     if (pszFileName)
     {
       char szCacheName[512];
@@ -845,6 +856,7 @@ RenderLMData * CLMSerializationManager2::CreateLightmap(const char *pszFileName,
     }
     else
       iColorLerpTex = pIRenderer->DownLoadToVideoMemory(pDst, Width, Height, eTF_8888, eTF_8888, 0, false, FILTER_BILINEAR, 0, NULL);
+    delete [] pDst;
     iDomDirectionTex = 0;
   }
 

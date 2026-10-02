@@ -39,8 +39,13 @@ struct VulkanSwapchain
 
 struct ControllerState
 {
+    bool poseValid = false;
+    XrPosef gripPose{};
     bool active = false;
     bool select = false;
+    bool posture = false;
+    bool jump = false;
+    bool use = false;
     float thumbstickX = 0.0f;
     float thumbstickY = 0.0f;
 };
@@ -117,6 +122,7 @@ private:
     PFN_xrSuggestInteractionProfileBindings m_suggestBindings = nullptr;
     PFN_xrAttachSessionActionSets m_attachActionSets = nullptr;
     PFN_xrCreateActionSpace m_createActionSpace = nullptr;
+    PFN_xrLocateSpace m_locateSpace = nullptr;
     PFN_xrSyncActions m_syncActions = nullptr;
     PFN_xrGetActionStateBoolean m_getBoolean = nullptr;
     PFN_xrGetActionStateFloat m_getFloat = nullptr;
@@ -140,7 +146,12 @@ private:
     XrActionSet m_gameplayActionSet = XR_NULL_HANDLE;
     XrAction m_selectAction = XR_NULL_HANDLE;
     XrAction m_triggerAction = XR_NULL_HANDLE;
+    XrAction m_postureAction = XR_NULL_HANDLE;
+    XrAction m_jumpAction = XR_NULL_HANDLE;
+    XrAction m_useAction = XR_NULL_HANDLE;
     XrAction m_moveAction = XR_NULL_HANDLE;
+    XrAction m_gripPoseAction = XR_NULL_HANDLE;
+    XrSpace m_gripSpaces[2]{};
     XrPath m_leftHandPath = 0;
     XrPath m_rightHandPath = 0;
     XrViewConfigurationView m_viewConfig[2]{};
@@ -149,6 +160,7 @@ private:
     bool m_sessionRunning = false;
     bool m_shouldExit = false;
     bool m_metaTouchPlusEnabled = false;
+    bool m_displayRefreshRateEnabled = false;
     ControllerState m_leftController;
     ControllerState m_rightController;
     char m_lastError[256]{};

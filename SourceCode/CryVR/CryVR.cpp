@@ -151,6 +151,7 @@ bool Runtime::LoadInstanceFunctions()
     XR_LOAD(suggestBindings, "xrSuggestInteractionProfileBindings")
     XR_LOAD(attachActionSets, "xrAttachSessionActionSets")
     XR_LOAD(createActionSpace, "xrCreateActionSpace")
+    XR_LOAD(locateSpace, "xrLocateSpace")
     XR_LOAD(syncActions, "xrSyncActions")
     XR_LOAD(getBoolean, "xrGetActionStateBoolean")
     XR_LOAD(getFloat, "xrGetActionStateFloat")
@@ -207,10 +208,13 @@ bool Runtime::Initialize(const char* applicationName, const char* engineName)
     extensionNames.push_back("XR_KHR_vulkan_enable2");
     Platform::AppendRequiredInstanceExtensions(extensionNames);
     m_metaTouchPlusEnabled = false;
+    m_displayRefreshRateEnabled = false;
     for (uint32_t i = 0; i < extensionCount; ++i)
     {
         if (strcmp(properties[i].extensionName, "XR_META_touch_controller_plus") == 0)
             m_metaTouchPlusEnabled = true;
+        if (strcmp(properties[i].extensionName, "XR_FB_display_refresh_rate") == 0)
+            m_displayRefreshRateEnabled = true;
     }
     for (const char* required : extensionNames)
     {
@@ -231,6 +235,8 @@ bool Runtime::Initialize(const char* applicationName, const char* engineName)
     }
     if (m_metaTouchPlusEnabled)
         extensionNames.push_back("XR_META_touch_controller_plus");
+    if (m_displayRefreshRateEnabled)
+        extensionNames.push_back("XR_FB_display_refresh_rate");
 
     XrInstanceCreateInfo createInfo{};
     createInfo.type = XR_TYPE_INSTANCE_CREATE_INFO;
@@ -361,6 +367,7 @@ bool Runtime::CreateActions()
     if (!Check(m_stringToPath(m_instance, "/user/hand/left", &m_leftHandPath), "xrStringToPath(left hand)")) return false;
     if (!Check(m_stringToPath(m_instance, "/user/hand/right", &m_rightHandPath), "xrStringToPath(right hand)")) return false;
     const XrPath hands[] = { m_leftHandPath, m_rightHandPath };
+    const XrPath* handSubactions = hands;
 
     XrActionCreateInfo selectInfo{};
     selectInfo.type = XR_TYPE_ACTION_CREATE_INFO;
@@ -380,6 +387,30 @@ bool Runtime::CreateActions()
     triggerInfo.subactionPaths = hands;
     if (!Check(m_createAction(m_gameplayActionSet, &triggerInfo, &m_triggerAction), "xrCreateAction(trigger)")) return false;
 
+    const auto createBooleanAction = [this, handSubactions](const char* name, const char* localizedName, XrAction* action)
+    {
+        XrActionCreateInfo info{};
+        info.type = XR_TYPE_ACTION_CREATE_INFO;
+        strcpy(info.actionName, name);
+        strcpy(info.localizedActionName, localizedName);
+        info.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+        info.countSubactionPaths = 2;
+        info.subactionPaths = handSubactions;
+        return Check(m_createAction(m_gameplayActionSet, &info, action), name);
+    };
+    if (!createBooleanAction("posture", "Change Stance", &m_postureAction) ||
+        !createBooleanAction("jump", "Jump", &m_jumpAction))
+        return false;
+
+    XrActionCreateInfo useInfo{};
+    useInfo.type = XR_TYPE_ACTION_CREATE_INFO;
+    strcpy(useInfo.actionName, "use");
+    strcpy(useInfo.localizedActionName, "Use");
+    useInfo.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
+    useInfo.countSubactionPaths = 2;
+    useInfo.subactionPaths = hands;
+    if (!Check(m_createAction(m_gameplayActionSet, &useInfo, &m_useAction), "xrCreateAction(use)")) return false;
+
     XrActionCreateInfo moveInfo{};
     moveInfo.type = XR_TYPE_ACTION_CREATE_INFO;
     strcpy(moveInfo.actionName, "move");
@@ -395,6 +426,15 @@ bool Runtime::CreateActions()
         m_stringToPath(m_instance, text, &value);
         return value;
     };
+    XrPath handPaths[2] = { m_leftHandPath, m_rightHandPath };
+    XrActionCreateInfo poseInfo{};
+    poseInfo.type = XR_TYPE_ACTION_CREATE_INFO;
+    poseInfo.actionType = XR_ACTION_TYPE_POSE_INPUT;
+    strcpy(poseInfo.actionName, "grip_pose");
+    strcpy(poseInfo.localizedActionName, "Controller grip pose");
+    poseInfo.countSubactionPaths = 2;
+    poseInfo.subactionPaths = handPaths;
+    if (!Check(m_createAction(m_gameplayActionSet, &poseInfo, &m_gripPoseAction), "xrCreateAction(grip_pose)")) return false;
     const XrPath leftSelect = path("/user/hand/left/input/select/click");
     const XrPath rightSelect = path("/user/hand/right/input/select/click");
     const XrPath leftThumb = path("/user/hand/left/input/thumbstick");
@@ -402,9 +442,12 @@ bool Runtime::CreateActions()
     // The Oculus Touch profile does not define the generic select/click path.
     // Use its standard face-button and analog-trigger components instead.
     const XrPath leftTouchSelect = path("/user/hand/left/input/x/click");
-    const XrPath rightTouchSelect = path("/user/hand/right/input/a/click");
+    const XrPath rightTouchPosture = path("/user/hand/right/input/a/click");
+    const XrPath rightTouchJump = path("/user/hand/right/input/b/click");
     const XrPath leftTouchTrigger = path("/user/hand/left/input/trigger/value");
     const XrPath rightTouchTrigger = path("/user/hand/right/input/trigger/value");
+    const XrPath leftTouchGrip = path("/user/hand/left/input/squeeze/value");
+    const XrPath rightTouchGrip = path("/user/hand/right/input/squeeze/value");
     const auto suggest = [this](const char* profileName, const XrActionSuggestedBinding* bindings,
                                 uint32_t count)
     {
@@ -427,20 +470,30 @@ bool Runtime::CreateActions()
     };
 
     const XrActionSuggestedBinding oculusBindings[] = {
-        {m_selectAction, leftTouchSelect}, {m_selectAction, rightTouchSelect},
+        {m_gripPoseAction, path("/user/hand/left/input/grip/pose")},
+        {m_gripPoseAction, path("/user/hand/right/input/grip/pose")},
+        {m_selectAction, leftTouchSelect},
         {m_triggerAction, leftTouchTrigger}, {m_triggerAction, rightTouchTrigger},
-        {m_moveAction, leftThumb}, {m_moveAction, rightThumb}
+        {m_moveAction, leftThumb}, {m_moveAction, rightThumb},
+        {m_postureAction, rightTouchPosture}, {m_jumpAction, rightTouchJump},
+        {m_useAction, leftTouchGrip}, {m_useAction, rightTouchGrip}
     };
-    suggest("/interaction_profiles/oculus/touch_controller", oculusBindings, 6);
+    suggest("/interaction_profiles/oculus/touch_controller", oculusBindings, 11);
 
     const XrPath leftMetaTrigger = path("/user/hand/left/input/trigger/value");
     const XrPath rightMetaTrigger = path("/user/hand/right/input/trigger/value");
+    const XrPath leftMetaGrip = path("/user/hand/left/input/squeeze/value");
+    const XrPath rightMetaGrip = path("/user/hand/right/input/squeeze/value");
     const XrActionSuggestedBinding metaBindings[] = {
+        {m_gripPoseAction, path("/user/hand/left/input/grip/pose")},
+        {m_gripPoseAction, path("/user/hand/right/input/grip/pose")},
         {m_triggerAction, leftMetaTrigger}, {m_triggerAction, rightMetaTrigger},
-        {m_moveAction, leftThumb}, {m_moveAction, rightThumb}
+        {m_moveAction, leftThumb}, {m_moveAction, rightThumb},
+        {m_postureAction, rightTouchPosture}, {m_jumpAction, rightTouchJump},
+        {m_useAction, leftMetaGrip}, {m_useAction, rightMetaGrip}
     };
     if (m_metaTouchPlusEnabled)
-        suggest("/interaction_profiles/meta/touch_controller_plus", metaBindings, 4);
+        suggest("/interaction_profiles/meta/touch_controller_plus", metaBindings, 10);
 
     const XrActionSuggestedBinding simpleBindings[] = {
         {m_selectAction, leftSelect}, {m_selectAction, rightSelect}
@@ -494,6 +547,16 @@ bool Runtime::CreateVulkanSession(const VulkanBinding& binding)
             return false;
     }
     XrSessionActionSetsAttachInfo attach{};
+    XrPath handPaths[2] = { m_leftHandPath, m_rightHandPath };
+    for (int hand = 0; hand < 2; ++hand)
+    {
+        XrActionSpaceCreateInfo grip{};
+        grip.type = XR_TYPE_ACTION_SPACE_CREATE_INFO;
+        grip.action = m_gripPoseAction;
+        grip.subactionPath = handPaths[hand];
+        grip.poseInActionSpace = IdentityPose();
+        if (!Check(m_createActionSpace(m_session, &grip, &m_gripSpaces[hand]), "xrCreateActionSpace(grip)")) return false;
+    }
     attach.type = XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO;
     attach.countActionSets = 1;
     attach.actionSets = &m_gameplayActionSet;
@@ -603,6 +666,17 @@ bool Runtime::BeginSession()
     if (!Check(m_beginSession(m_session, &beginInfo), "xrBeginSession"))
         return false;
     m_sessionRunning = true;
+    if (m_displayRefreshRateEnabled)
+    {
+        using RequestRefreshRate = XrResult (*)(XrSession, float);
+        RequestRefreshRate requestRefreshRate = nullptr;
+        if (LoadInstanceProc(m_getInstanceProcAddr, m_instance,
+                             "xrRequestDisplayRefreshRateFB", requestRefreshRate))
+        {
+            const XrResult result = requestRefreshRate(m_session, 72.0f);
+            LogRuntime("OpenXR display refresh rate request: 72 Hz, result=%d", result);
+        }
+    }
     return true;
 }
 
@@ -699,6 +773,15 @@ bool Runtime::BeginFrame(Frame& frame)
         ControllerState* states[2] = { &m_leftController, &m_rightController };
         for (int i = 0; i < 2; ++i)
         {
+            XrSpaceLocation location{};
+            location.type = XR_TYPE_SPACE_LOCATION;
+            const XrSpaceLocationFlags valid = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+            if (m_gripSpaces[i] && m_locateSpace(m_gripSpaces[i], m_stageSpace,
+                    m_predictedDisplayTime, &location) >= 0 && (location.locationFlags & valid) == valid)
+            {
+                states[i]->gripPose = location.pose;
+                states[i]->poseValid = true;
+            }
             XrActionStateGetInfo getInfo{};
             getInfo.type = XR_TYPE_ACTION_STATE_GET_INFO;
             getInfo.action = m_selectAction;
@@ -714,6 +797,30 @@ bool Runtime::BeginFrame(Frame& frame)
                     LogRuntime("OpenXR input %s select active=%d pressed=%d",
                         i == 0 ? "left" : "right", select.isActive, select.currentState);
                 selecting[i] = select.currentState == XR_TRUE;
+            }
+            getInfo.action = m_postureAction;
+            XrActionStateBoolean posture{};
+            posture.type = XR_TYPE_ACTION_STATE_BOOLEAN;
+            if (m_getBoolean(m_session, &getInfo, &posture) >= 0)
+            {
+                states[i]->posture = posture.isActive == XR_TRUE && posture.currentState == XR_TRUE;
+                states[i]->active = states[i]->active || posture.isActive == XR_TRUE;
+            }
+            getInfo.action = m_jumpAction;
+            XrActionStateBoolean jump{};
+            jump.type = XR_TYPE_ACTION_STATE_BOOLEAN;
+            if (m_getBoolean(m_session, &getInfo, &jump) >= 0)
+            {
+                states[i]->jump = jump.isActive == XR_TRUE && jump.currentState == XR_TRUE;
+                states[i]->active = states[i]->active || jump.isActive == XR_TRUE;
+            }
+            getInfo.action = m_useAction;
+            XrActionStateFloat use{};
+            use.type = XR_TYPE_ACTION_STATE_FLOAT;
+            if (m_getFloat(m_session, &getInfo, &use) >= 0)
+            {
+                states[i]->use = use.isActive == XR_TRUE && use.currentState > 0.55f;
+                states[i]->active = states[i]->active || use.isActive == XR_TRUE;
             }
             getInfo.action = m_triggerAction;
             XrActionStateFloat trigger{};
@@ -773,6 +880,12 @@ void Runtime::Shutdown()
         m_endSession(m_session);
     m_sessionRunning = false;
     m_predictedDisplayTime = 0;
+    for (int hand = 0; hand < 2; ++hand)
+    {
+        if (m_gripSpaces[hand] && m_destroySpace) m_destroySpace(m_gripSpaces[hand]);
+        m_gripSpaces[hand] = XR_NULL_HANDLE;
+    }
+    m_gripPoseAction = XR_NULL_HANDLE;
     if (m_stageSpace && m_destroySpace) m_destroySpace(m_stageSpace);
     if (m_session && m_destroySession) m_destroySession(m_session);
     if (m_gameplayActionSet && m_destroyActionSet) m_destroyActionSet(m_gameplayActionSet);

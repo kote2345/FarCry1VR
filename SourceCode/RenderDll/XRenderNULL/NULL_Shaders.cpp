@@ -55,7 +55,10 @@ bool CShader::mfCompileHWShadeLayer(SShader *ef, char *scr, TArray<SShaderPassHW
          eIgnoreLights, eIgnoreProjectors, eNoAlpha, eRendState,
          eSecondPassRendState, eOcclusionMap, eBump, eDivideAmb4,
          eDivideAmb2, eDivideDif4, eDivideDif2, eColorMaterial,
-         eSamples1, eSamples2, eSamples3, eSamples4, eArray, eMatrix };
+         eHasAmbient, eHasDOT3LM, eAmbMaxLights,
+         eSamples1, eSamples2, eSamples3, eSamples4, eArray, eMatrix,
+         eCGVProgram, eCGPShader, eCGVPParam, eCGPSParam, eCGPSParmRect,
+         eDeformVertexes, eAffectMask };
   static tokenDesc commands[] =
   {
     {eLayer, "Layer"}, {eLightType, "LightType"}, {eNoLights, "NoLight"},
@@ -69,17 +72,110 @@ bool CShader::mfCompileHWShadeLayer(SShader *ef, char *scr, TArray<SShaderPassHW
     {eDivideDif4, "LMDivideDif4"}, {eDivideDif2, "LMDivideDif2"},
     {eColorMaterial, "ColorMaterial"}, {eSamples1, "1Samples"},
     {eSamples2, "2Samples"}, {eSamples3, "3Samples"}, {eSamples4, "4Samples"},
+    {eHasAmbient, "HasAmbient"}, {eHasDOT3LM, "HasDOT3LM"},
+    {eAmbMaxLights, "AmbMaxLights"},
     {eArray, "Array"}, {eMatrix, "Matrix"}, {eRendState, "RendState"},
     {eSecondPassRendState, "SecondPassRendState"},
-    {eOcclusionMap, "OcclusionMap"}, {0, 0}
+    {eOcclusionMap, "OcclusionMap"},
+    {eCGVProgram, "CGVProgram"}, {eCGPShader, "CGPShader"},
+    {eCGVPParam, "CGVPParam"}, {eCGPSParam, "CGPSParam"},
+    {eCGPSParmRect, "CGPSParmRect"},
+    {eDeformVertexes, "DeformVertexes"}, {eAffectMask, "AffectMask"},
+    {0, 0}
   };
   char *name = NULL, *params = NULL, *data = NULL;
+  bool hasVertexProgram = false;
+  bool vertexLight = false;
+  bool parametersOnly = false;
   long command;
   while ((command = shGetObject(&scr, commands, &name, &params)) > 0)
   {
+    // Full CG pass translation is not implemented for all stock techniques.
+    // Keep their established fallback until each program is translated;
+    // surface decals have a verified fixed combiner path and need their
+    // Layer/Blend statements after CGVProgram.
+    if (command >= eCGVProgram && ef->m_eSort != eS_Decal)
+      parametersOnly = true;
+    // Keep the same expanded program mask OpenGL uses at the declaration.
+    // Object LM IDs alone cannot identify a shader's lightmap variant.
+    if (command == eCGVProgram || command == eCGPShader)
+    {
+      const char* program = name ? name : params;
+      char* target = command == eCGVProgram ? pass->m_StockVertexProgram :
+                                            pass->m_StockFragmentProgram;
+      if (program) snprintf(target, 96, "%s", program);
+      if (command == eCGPShader)
+      {
+        // Programs without generated variants need no macro snapshot (GL
+        // also omits the lookup when AffectMask is zero). Such declarations
+        // can legitimately be absent from m_LocalMacros.
+        const int offset = static_cast<int>(pCurCommand - m_pCurScript);
+        for (int macro = 0; macro < m_LocalMacros.Num(); ++macro)
+          if (m_LocalMacros[macro].m_nOffset == offset)
+          {
+            pass->m_StockProgramMask = mfScriptPreprocessorMask(ef, offset);
+            const ShaderMacro& macros = *m_LocalMacros[macro].m_Macros;
+            ShaderMacro::const_iterator colors = macros.find("%VERTCOLORS");
+            pass->m_StockUsesVertexColors = colors != macros.end() &&
+                strtoull(colors->second.c_str(), nullptr, 0) != 0;
+            break;
+          }
+      }
+    }
+    // Retain CG pixel parameters without changing the established fallback
+    // state/stream metadata of untranslated programs.
+    const bool translatedLayers = !stricmp(pass->m_StockFragmentProgram, "CGRCPlants") ||
+      strstr(pass->m_StockFragmentProgram, "_Particle") != nullptr ||
+      !stricmp(pass->m_StockFragmentProgram, "CGRCCaust") ||
+      !stricmp(pass->m_StockFragmentProgram, "CGRCFog") ||
+      !stricmp(pass->m_StockFragmentProgram, "CGRCTerrainLayerTempl") ||
+      !stricmp(pass->m_StockFragmentProgram, "CGRCTerrainShadow") ||
+      !strnicmp(pass->m_StockFragmentProgram, "CGRCTerrain", 11) ||
+      !stricmp(ef->GetName(), "WaterVolume") ||
+      !strnicmp(ef->GetName(), "TerrainWaterBottom", 18) ||
+      !strnicmp(pass->m_StockFragmentProgram, "CGRCOcean", 9) ||
+      !stricmp(pass->m_StockFragmentProgram, "CGRCWater") ||
+      !stricmp(pass->m_StockFragmentProgram, "CGRCWater_Beach_Refr") ||
+      !stricmp(pass->m_StockFragmentProgram, "CGRCWater_Beach") ||
+      !strnicmp(pass->m_StockVertexProgram, "CGVProgWater_Beach_Shift", 25);
+    if (parametersOnly && !translatedLayers && command != eCGPSParam &&
+        command != eCGPSParmRect && command != eCGVPParam)
+      continue;
     data = name ? name : params;
     switch (command)
     {
+      // shGetObject returns zero on an unknown token, ending this loop.
+      // Consume the complete GL grammar even though Vulkan translates the
+      // programs itself; otherwise CGVProgram silently discards Layer/Blend.
+      case eCGVProgram:
+        hasVertexProgram = true;
+        break;
+      case eCGPShader:
+      case eAffectMask:
+        break;
+      case eCGVPParam:
+        mfCompileCGParam(params, ef, &pass->m_VPParamsNoObj);
+        break;
+      case eCGPSParam:
+      case eCGPSParmRect:
+      {
+        if (!pass->m_CGFSParamsNoObj)
+          pass->m_CGFSParamsNoObj = new TArray<SCGParam4f>;
+        const int first = pass->m_CGFSParamsNoObj->Num();
+        mfCompileCGParam(params, ef, pass->m_CGFSParamsNoObj);
+        if (command == eCGPSParmRect)
+          for (int i = first; i < pass->m_CGFSParamsNoObj->Num(); ++i)
+            pass->m_CGFSParamsNoObj->Get(i).m_dwBind |= 0x80000;
+        break;
+      }
+      case eDeformVertexes:
+      {
+        if (!pass->m_Deforms) pass->m_Deforms = new TArray<SDeform>;
+        const int index = pass->m_Deforms->Num();
+        pass->m_Deforms->ReserveNew(index + 1);
+        mfCompileDeform(ef, &pass->m_Deforms->Get(index), name, params);
+        break;
+      }
       case eLayer:
         mfCompileLayer(ef, name ? atoi(name) : 0, params, pass);
         break;
@@ -102,7 +198,7 @@ bool CShader::mfCompileHWShadeLayer(SShader *ef, char *scr, TArray<SShaderPassHW
         break;
       case eNoLights: pass->m_LMFlags |= LMF_DISABLE; break;
       case eNoBump: pass->m_LMFlags |= LMF_NOBUMP; break;
-      case eVertexLight: break;
+      case eVertexLight: vertexLight = true; break;
       case ePolyOffset: pass->m_LMFlags |= LMF_POLYOFFSET; break;
       case eNoAmbient: pass->m_LMFlags |= LMF_NOAMBIENT; break;
       case eNoSpecular: pass->m_LMFlags |= LMF_NOSPECULAR; break;
@@ -122,6 +218,14 @@ bool CShader::mfCompileHWShadeLayer(SShader *ef, char *scr, TArray<SShaderPassHW
       case eSamples2: pass->m_LMFlags |= LMF_2SAMPLES; break;
       case eSamples3: pass->m_LMFlags |= LMF_3SAMPLES; break;
       case eSamples4: pass->m_LMFlags |= LMF_4SAMPLES; break;
+      // Keep the NULL-backed Vulkan renderer's technique metadata in sync
+      // with the OpenGL/D3D shader parsers. These flags select the ambient
+      // lightmap path and gate directional-lightmap rendering at runtime.
+      case eHasAmbient: pass->m_LMFlags |= LMF_HASAMBIENT; break;
+      case eHasDOT3LM: pass->m_LMFlags |= LMF_HASDOT3LM; break;
+      case eAmbMaxLights:
+        pass->m_nAmbMaxLights = shGetInt(data);
+        break;
       case eArray: mfCompileArrayPointer(pass->m_Pointers, params, ef); break;
       case eMatrix:
         if (!pass->m_MatrixOps)
@@ -129,6 +233,21 @@ bool CShader::mfCompileHWShadeLayer(SShader *ef, char *scr, TArray<SShaderPassHW
         mfCompileMatrixOp(pass->m_MatrixOps, params, name, ef);
         break;
     }
+  }
+  // Match GL's distinction between shader-managed bump lighting and
+  // LMVertexLight/fixed-function material lighting.
+  if (hasVertexProgram && !vertexLight) pass->m_LMFlags |= LMF_BUMPMATERIAL;
+  // GLShaders.cpp applies this template default after parsing the pass.
+  // A zero second state overwrites earlier lighting instead of adding to it.
+  if (ef->m_Flags & EF_TEMPLNAMES)
+    pass->m_SecondRenderState = GS_BLSRC_ONE | GS_BLDST_ONE | GS_DEPTHFUNC_EQUAL;
+  mfCheckObjectDependParams(&pass->m_VPParamsNoObj, &pass->m_VPParamsObj);
+  if (pass->m_CGFSParamsNoObj)
+  {
+    TArray<SCGParam4f>* objectParams = new TArray<SCGParam4f>;
+    mfCheckObjectDependParams(pass->m_CGFSParamsNoObj, objectParams);
+    if (objectParams->Num()) pass->m_CGFSParamsObj = objectParams;
+    else delete objectParams;
   }
   return true;
 }

@@ -168,6 +168,9 @@ typedef unsigned char ACTIONTYPE;
 
 #define ACTION_MOVEMODE_TOGGLE 63
 #define ACTION_AIM_TOGGLE	64
+// Internal one-shot used by the Vulkan/OpenXR A button. Cycles the player's
+// actual stance in game logic instead of maintaining a separate VR-side state.
+#define ACTION_VR_POSTURE_CYCLE 52
 
 //////////////////////////////////////////////////////////////////////////////////////////////
 #define PLAYER_MAX_WEAPONS 9

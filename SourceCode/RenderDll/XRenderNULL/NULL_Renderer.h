@@ -229,6 +229,15 @@ private:
   void EF_Eval_DeformVerts(TArray<SDeform>* Defs);
   void EF_Eval_TexGen(SShaderPass *sfm);
   void EF_Eval_RGBAGen(SShaderPass *sfm);
+  bool m_LastRGBAGenSetGlobal = false;
+protected:
+  bool EvaluateCpuDrawColor(SShaderPass* pass)
+  {
+    EF_InitEvalFuncs(m_RP.m_pRE ? 1 : 0);
+    EF_Eval_RGBAGen(pass);
+    return m_LastRGBAGenSetGlobal;
+  }
+private:
   void EF_EvalNormalsRB(SShader *ef);
 
   void EF_DrawIndexedMesh (int nPrimType);

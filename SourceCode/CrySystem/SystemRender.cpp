@@ -14,6 +14,46 @@
 #include "StdAfx.h"
 #include "System.h"
 
+bool CSystem::GetVRControllerTransform(bool left, Matrix34& transform) const
+{
+    const CryVR::ControllerState& controller = left ? m_vrRuntime.GetLeftController() : m_vrRuntime.GetRightController();
+    XrPosef reference{};
+    if (!controller.poseValid || !m_vulkanFrameRenderer.GetReferenceHeadPose(reference)) return false;
+    const XrQuaternionf& orientation = controller.gripPose.orientation;
+    Quat referenceRotation(reference.orientation.w,
+        Vec3(reference.orientation.x, -reference.orientation.z, reference.orientation.y));
+    Quat rotation(orientation.w, Vec3(orientation.x, -orientation.z, orientation.y));
+    Quat inverseReference = !referenceRotation;
+    // The eye renderer anchors the head at the game camera and preserves only
+    // the current eye offsets (IPD). Use that same current head origin for the
+    // hands; subtracting the startup position makes the weapon drift whenever
+    // the headset moves in tracking space.
+    XrVector3f headPosition = reference.position;
+    const CryVR::Frame& frame = m_vulkanFrameRenderer.GetCurrentFrame();
+    if (frame.viewsValid && frame.viewPositionsValid && frame.viewCount >= 2)
+    {
+        headPosition.x = 0.5f * (frame.views[0].pose.position.x + frame.views[1].pose.position.x);
+        headPosition.y = 0.5f * (frame.views[0].pose.position.y + frame.views[1].pose.position.y);
+        headPosition.z = 0.5f * (frame.views[0].pose.position.z + frame.views[1].pose.position.z);
+    }
+    Vec3 delta(controller.gripPose.position.x - headPosition.x,
+        -(controller.gripPose.position.z - headPosition.z),
+        controller.gripPose.position.y - headPosition.y);
+    Matrix34 local(Matrix33(inverseReference * rotation));
+    local.SetTranslation(inverseReference * delta);
+    CCamera bodyCamera = m_vrUsingVisibilityCamera ? m_vrUntrackedRenderCamera : m_ViewCamera;
+    Vec3 angles = bodyCamera.GetAngles();
+    angles.x = angles.y = 0.0f;
+    bodyCamera.SetAngle(angles);
+    bodyCamera.Update();
+    // The Cry camera's local forward is +Y. Its inverse view matrix also
+    // contains the engine's yaw convention and neutral 180-degree rotation.
+    Matrix34 bodyView = bodyCamera.GetVMatrix();
+    transform = bodyView.GetInverted() * local;
+    return true;
+}
+#include "System.h"
+
 #ifndef _XBOX
 #ifdef WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -908,6 +948,8 @@ void CSystem::RenderBegin()
 		// events on the next system input update, keeping game bindings intact.
 		static bool keyUp = false, keyLeft = false, keyDown = false, keyRight = false;
 		static bool leftSelect = false, rightSelect = false;
+		static bool jumpDown = false, useDown = false;
+		static bool posturePressed = false;
 		static bool loggedControllerAvailability = false;
 		static bool loggedRightStickMove = false;
 		const CryVR::ControllerState& left = m_vrRuntime.GetLeftController();
@@ -943,8 +985,21 @@ void CSystem::RenderBegin()
 			CryLogAlways("OpenXR menu click from right controller: %s", right.select ? "pressed" : "released");
 			PushVRMouseButton(right.select);
 		}
+		if (m_pIInput) m_pIInput->SetVRFireState(right.active && right.select);
+        // Latch the A-button rising edge directly for the next game command update.
+		// A synthetic held keyboard key can be observed in multiple simulation
+		// ticks and accidentally advance through more than one stance.
+		if (right.posture && !posturePressed && m_pIInput)
+			m_pIInput->QueueVRPostureCycle();
+		if (jumpDown != right.jump)
+			PushVRKey(SDLK_SPACE, SDL_SCANCODE_SPACE, right.jump);
+		const bool use = left.use || right.use;
+		if (useDown != use)
+			PushVRKey(SDLK_F, SDL_SCANCODE_F, use);
 		keyUp = nextUp; keyLeft = nextLeft; keyDown = nextDown; keyRight = nextRight;
 		leftSelect = left.select; rightSelect = right.select;
+		jumpDown = right.jump; useDown = use;
+		posturePressed = right.posture;
 		if (m_pIInput && (right.thumbstickX*right.thumbstickX + right.thumbstickY*right.thumbstickY > 0.04f))
 		{
 			// Update CryEngine's virtual menu cursor directly. SDL relative-motion
@@ -1038,7 +1093,7 @@ void CSystem::RenderEnd()
 			loggedFrameEndFailure = true;
 		}
 		static unsigned int sceneDiagnosticFrames = 0;
-		if (++sceneDiagnosticFrames >= 120)
+		if (m_vulkanFrameRenderer.IsDiagnosticLoggingEnabled() && ++sceneDiagnosticFrames >= 120)
 		{
 			sceneDiagnosticFrames = 0;
 			const auto& sceneDiagnostics = m_vulkanFrameRenderer.GetSceneDiagnostics();
@@ -1149,7 +1204,8 @@ void CSystem::Render()
 	static unsigned int renderPathAuditCalls = 0;
 	const unsigned int renderPathAuditCall = renderPathAuditCalls++;
 	const bool auditRenderPath = renderPathAuditCall < 12 || (renderPathAuditCall % 120) == 0;
-	if (auditRenderPath && m_vulkanFrameRenderer.IsInitialized())
+	if (auditRenderPath && m_vulkanFrameRenderer.IsInitialized() &&
+		m_vulkanFrameRenderer.IsDiagnosticLoggingEnabled())
 	{
 		const Vec3 cameraPosition = m_ViewCamera.GetPos();
 		CryLogAlways("Vulkan render path: call=%u ignore=%u process=%p flags=0x%x camera=(%.3f,%.3f,%.3f) cameraValid=%u engine=%p",
@@ -1194,7 +1250,15 @@ void CSystem::Render()
 					// Keep the renderer camera at the game pose because Vulkan applies
 					// the OpenXR orientation once per eye. The 3D engine needs its own
 					// culling camera aimed in the tracked head direction.
-					CCamera visibilityCamera = gameCameraToRestore;
+					CCamera renderCamera = gameCameraToRestore;
+					Vec3 bodyAngles = renderCamera.GetAngles();
+					bodyAngles.x = 0.0f;
+					bodyAngles.y = 0.0f;
+					renderCamera.SetAngle(bodyAngles);
+			renderCamera.Update();
+                    m_vrUntrackedRenderCamera = renderCamera;
+                    m_vrUsingVisibilityCamera = true;
+					CCamera visibilityCamera = renderCamera;
 					const float maxFov = 3.12413936f; // 179 degrees
 					const CryVR::Frame& xrFrame = m_vulkanFrameRenderer.GetCurrentFrame();
 					const float headYaw = RAD2DEG(m_vulkanFrameRenderer.GetHeadYawDeltaRadians());
@@ -1239,20 +1303,25 @@ void CSystem::Render()
 						visibilityCamera.SetFov(expandedFov < maxFov ? expandedFov : maxFov);
 					}
 					m_pI3DEngine->SetCamera(visibilityCamera, false);
-					m_pRenderer->SetCamera(gameCameraToRestore);
+					m_pRenderer->SetCamera(renderCamera);
 					restoreGameCameraAfterDraw = true;
 				}
 				else
 					m_pI3DEngine->SetCamera(m_ViewCamera);
 			}
 
-			m_pProcess->Draw();		
-			if (restoreGameCameraAfterDraw)
-				m_ViewCamera = gameCameraToRestore;
-						
-			if (m_pAISystem)		
-				m_pAISystem->DebugDraw(g_pRenderer);		
 		}
+		// A 3D process can be in its startup/menu state before it has assigned
+		// a non-zero game camera. Still draw that process; otherwise the OpenXR
+		// targets are cleared and submitted as black frames until gameplay starts.
+		m_pProcess->Draw();
+		if (restoreGameCameraAfterDraw)
+        {
+            m_ViewCamera = gameCameraToRestore;
+            m_vrUsingVisibilityCamera = false;
+        }
+		if (m_pAISystem)
+			m_pAISystem->DebugDraw(g_pRenderer);
   }
   else
   {

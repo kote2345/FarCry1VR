@@ -251,6 +251,12 @@ private:
 	// position
 	Vec3								m_vAngles;
 	Vec3								m_vPos;
+    Matrix34 m_vrGripInverse;
+    bool m_vrGripInitialized = false;
+    const char* GetVRHandBoneName(bool left) const;
+    void InitializeVRWeaponGrip();
+    void UpdateVRWeaponHands(CPlayer* player);
+    void HideVRUpperArms(bool left);
 	Vec3								m_fpvPos;
 	Vec3								m_fpvAngles;
 	Vec3								m_fpvPosOffset;

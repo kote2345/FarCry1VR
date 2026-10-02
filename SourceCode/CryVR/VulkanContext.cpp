@@ -251,6 +251,10 @@ bool VulkanContext::Initialize(const Runtime& runtime)
     VkPhysicalDeviceFeatures enabledFeatures{};
     enabledFeatures.fillModeNonSolid = availableFeatures.fillModeNonSolid;
     enabledFeatures.samplerAnisotropy = availableFeatures.samplerAnisotropy;
+#if defined(__ANDROID__)
+    enabledFeatures.pipelineStatisticsQuery = availableFeatures.pipelineStatisticsQuery;
+#endif
+    m_supportsPipelineStatistics = enabledFeatures.pipelineStatisticsQuery == VK_TRUE;
     m_supportsWireframe = enabledFeatures.fillModeNonSolid == VK_TRUE;
     m_supportsAnisotropicFiltering = enabledFeatures.samplerAnisotropy == VK_TRUE;
     // GL_EYE_RADIAL_NV is the extension path used by XRenderOGL. Its Vulkan
@@ -264,7 +268,26 @@ bool VulkanContext::Initialize(const Runtime& runtime)
         m_minUniformBufferOffsetAlignment = 16;
 
     VkDeviceCreateInfo deviceInfo{};
+    VkPhysicalDeviceMultiviewFeatures multiviewFeatures{};
+    multiviewFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES;
+    VkPhysicalDeviceFeatures2 features2{};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &multiviewFeatures;
+    const auto getFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+        m_getInstanceProcAddr(m_instance, "vkGetPhysicalDeviceFeatures2"));
+    if (getFeatures2 && applicationInfo.apiVersion >= VK_API_VERSION_1_1)
+        getFeatures2(m_physicalDevice, &features2);
+    m_supportsMultiview = multiviewFeatures.multiview == VK_TRUE;
+    if (!m_supportsMultiview)
+    {
+        SetError("Vulkan stereo renderer requires Vulkan 1.1 multiview support");
+        Shutdown();
+        return false;
+    }
+    multiviewFeatures.multiviewGeometryShader = VK_FALSE;
+    multiviewFeatures.multiviewTessellationShader = VK_FALSE;
     deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    deviceInfo.pNext = &multiviewFeatures;
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
     deviceInfo.pEnabledFeatures = &enabledFeatures;
@@ -326,8 +349,10 @@ void VulkanContext::Shutdown()
     m_graphicsQueue = VK_NULL_HANDLE;
     m_graphicsQueueFamily = 0;
     m_supportsWireframe = false;
+    m_supportsMultiview = false;
     m_supportsAnisotropicFiltering = false;
     m_supportsRadialFog = false;
+    m_supportsPipelineStatistics = false;
     m_maxSamplerAnisotropy = 1.0f;
     m_vulkanLibraryLoaded = false;
     m_getInstanceProcAddr = nullptr;

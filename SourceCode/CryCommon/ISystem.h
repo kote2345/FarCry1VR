@@ -379,6 +379,7 @@ struct ISystem
 	// Keep VR extensions at the end so existing ISystem vtable slots stay stable.
 	virtual float GetVRHeadYawDeltaRadians() const { return 0.0f; }
 	virtual float GetVRHeadPitchDeltaRadians() const { return 0.0f; }
+    virtual bool GetVRControllerTransform(bool left, Matrix34& transform) const { return false; }
 };
 
 //////////////////////////////////////////////////////////////////////////

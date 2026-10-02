@@ -1,11 +1,13 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 layout(constant_id = 0) const int alphaTestMode = 0;
+layout(constant_id = 64) const uint stockDecalSimpleMode = 0u;
 layout(constant_id = 60) const uint stage0UsesTexCoord1 = 0u;
 layout(constant_id = 1) const int stage0ColorMode = 1;
 layout(constant_id = 2) const int stage0AlphaMode = 1;
 layout(constant_id = 5) const uint stage0ColorArg = 0x0a1u;
 layout(constant_id = 6) const uint stage0AlphaArg = 0x0a1u;
-layout(constant_id = 7) const uint stage0Constant = 0xffffffffu;
+#define stage0Constant textureStageTransforms.textureConstants[0][0]
 layout(constant_id = 11) const uint hasSecondaryColor = 0u;
 layout(set = 0, binding = 0) uniform sampler2D baseColorTexture;
 layout(set = 0, binding = 1, std140) uniform TextureStageTransforms {
@@ -20,7 +22,23 @@ layout(set = 0, binding = 1, std140) uniform TextureStageTransforms {
     vec4 primaryColorMask;
     vec4 textureLodBias;
     vec4 clipPlane;
+    vec4 objectLightPositionRadius;
+    vec4 lightColorAmbient;
+    vec4 materialAmbient;
+    vec4 shadowRow0[8];
+    vec4 shadowRow1[8];
+    vec4 shadowRow2[8];
+    vec4 shadowRow3[8];
+    vec4 shadowMapStageMask[2];
+    vec4 terrainProjectionS[8];
+    vec4 terrainProjectionT[8];
+    vec4 linearPlanes[32];
+    vec4 linearMatrixRows[32];
+    vec4 linearControls[8];
+    vec4 fixedLights[32];
+    vec4 fixedLightInfo; mat4 fixedMatrices[2]; uvec4 textureConstants[2];
 } textureStageTransforms;
+#include "scene_lighting.glsl"
 #ifdef VR_BUMP_MAP
 layout(set = 1, binding = 0) uniform sampler2D bumpTexture;
 layout(location = 3) in vec3 objectPosition;
@@ -34,6 +52,12 @@ layout(location = 0) in vec2 texCoord;
 layout(location = 1) in vec4 vertexColor;
 layout(location = 2) in vec4 secondaryColor;
 layout(location = 9) in vec3 clipPosition;
+layout(location = 15) in vec3 stockSeparateSpecular;
+#ifndef VR_BUMP_MAP
+layout(location = 12) in vec3 objectPosition;
+layout(location = 13) in vec3 objectNormal;
+layout(location = 14) flat in uint hasMaterialLighting;
+#endif
 layout(location = 11) in vec3 projectorDirection;
 layout(set = 0, binding = 2) uniform sampler2D projectorCookieTexture;
 #ifndef VR_BUMP_MAP
@@ -41,12 +65,13 @@ layout(location = 10) in vec2 lightmapTexCoord;
 #endif
 layout(location = 0) out vec4 outColor;
 vec4 sampleBaseTexture(vec2 uv) {
-    float scale = exp2(clamp(textureStageTransforms.textureLodBias.x, -16.0, 16.0));
-    return textureGrad(baseColorTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+    float scale = textureStageTransforms.textureLodBias.x;
+    vec4 sampled = textureGrad(baseColorTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+    return compareStockShadowStage(0u, baseColorTexture, sampled, objectPosition);
 }
 #ifdef VR_BUMP_MAP
 vec4 sampleBumpTexture(vec2 uv) {
-    float scale = exp2(clamp(textureStageTransforms.textureLodBias.y, -16.0, 16.0));
+    float scale = textureStageTransforms.textureLodBias.y;
     return textureGrad(bumpTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
 }
 #endif
@@ -86,26 +111,32 @@ vec3 safeNormalize(vec3 value) {
 vec4 applyMaterialOverrides(vec4 c) {
     if (textureStageTransforms.materialParams.z > 0.5) c.rgb *= textureStageTransforms.materialParams.x;
     else c.a *= textureStageTransforms.materialParams.x;
-    if (textureStageTransforms.materialParams.y > 0.0 && c.a < textureStageTransforms.materialParams.y) discard;
     return c;
 }
 float radialEyeDistance(float eyeZ) {
     vec2 viewportSize = max(vec2(textureStageTransforms.uvRowQ[0].w,
                                  textureStageTransforms.uvRowQ[1].w), vec2(1.0));
-    vec2 ndc = 2.0 * gl_FragCoord.xy / viewportSize - 1.0;
+    vec2 viewportOrigin = vec2(textureStageTransforms.linearControls[2].w,
+                               textureStageTransforms.linearControls[3].w);
+    vec2 ndc = 2.0 * (gl_FragCoord.xy - viewportOrigin) / viewportSize - 1.0;
     float tangentX = mix(textureStageTransforms.uvRow0[0].w,
                          textureStageTransforms.uvRow1[0].w, (ndc.x + 1.0) * 0.5);
     float tangentY = mix(textureStageTransforms.uvRow0[1].w,
                          textureStageTransforms.uvRow1[1].w, (ndc.y + 1.0) * 0.5);
     return eyeZ * sqrt(1.0 + tangentX * tangentX + tangentY * tangentY);
 }
+float sceneFogDepth() {
+    float depthMin = textureStageTransforms.linearControls[0].w;
+    float depthMax = textureStageTransforms.linearControls[1].w;
+    return (gl_FragCoord.z - depthMin) / max(depthMax - depthMin, 1.0e-7);
+}
 vec4 applySceneFog(vec4 c) {
     if (textureStageTransforms.fogModeDensityStart.x < 0.5) return c;
     float n=textureStageTransforms.fogEndDepthRange.y, f=textureStageTransforms.fogEndDepthRange.z;
-    float d=n*f/max(f-gl_FragCoord.z*(f-n),1.0e-7);
+    float d=n*f/max(f-sceneFogDepth()*(f-n),1.0e-7);
     d=radialEyeDistance(d);
     int m=int(textureStageTransforms.fogModeDensityStart.y+0.5); float a;
-    if(m==1) a=(d-textureStageTransforms.fogModeDensityStart.w)/max(textureStageTransforms.fogEndDepthRange.x-textureStageTransforms.fogModeDensityStart.w,1.0e-6);
+    if(m==1) a=(d-textureStageTransforms.fogModeDensityStart.w)/(textureStageTransforms.fogEndDepthRange.x-textureStageTransforms.fogModeDensityStart.w);
     else if(m==2){float x=textureStageTransforms.fogModeDensityStart.z*d;a=1.0-exp(-min(x*x,80.0));}
     else a=1.0-exp(-min(textureStageTransforms.fogModeDensityStart.z*d,80.0));
     c.rgb=mix(c.rgb,textureStageTransforms.fogColor.rgb,clamp(a,0.0,1.0));return c;
@@ -146,8 +177,8 @@ vec3 combineRgb(int mode, vec3 a, vec3 b, float blendFactor, vec3 third, float a
 }
 float combineAlpha(int mode, float a, float b, float third, float blendFactor) {
     if (mode == 0) return a;
-    if (mode == 2) return a * b * 2.0;
-    if (mode == 3) return a * b * 4.0;
+    // GL EF_SetColorOp scales RGB only; alpha 2X/4X remains MODULATE.
+    if (mode == 2 || mode == 3) return a * b;
     if (mode == 6 || mode == 7) return mix(b, a, blendFactor);
     if (mode == 4) return a + b;
     if (mode == 5) return a + b - 0.5;
@@ -158,17 +189,23 @@ float combineAlpha(int mode, float a, float b, float third, float blendFactor) {
     return a * b;
 }
 void main() {
-    if (dot(vec4(clipPosition, 1.0), textureStageTransforms.clipPlane) < 0.0) discard;
+    if (stockFragmentDiscardEnabled && dot(vec4(clipPosition, 1.0), textureStageTransforms.clipPlane) < 0.0) discard;
     vec2 baseTexCoord = texCoord;
 #ifndef VR_BUMP_MAP
     if (stage0UsesTexCoord1 != 0u) baseTexCoord = lightmapTexCoord;
 #endif
+    baseTexCoord = stockTerrainStageTexCoord(0u, baseTexCoord, objectPosition);
     vec4 texel = sampleBaseTexture(baseTexCoord);
     vec4 generatedVertexColor = vertexColor;
-    if (textureStageTransforms.materialParams.w > 0.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
+    if (textureStageTransforms.materialParams.w > 0.5 && textureStageTransforms.materialParams.w < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
     vec4 primaryColor = mix(generatedVertexColor, textureStageTransforms.primaryColor, textureStageTransforms.primaryColorMask);
+#ifndef VR_BUMP_MAP
+    if (stockDecalSimpleMode == 0u)
+        primaryColor.rgb *= evaluateStockLighting(objectPosition, objectNormal,
+            stockTerrainStageTexCoord(1u, lightmapTexCoord, objectPosition), hasMaterialLighting);
+#endif
 #ifdef VR_BUMP_MAP
-    vec3 mapNormal = sampleBumpTexture(texCoord).xyz * 2.0 - 1.0;
+    vec3 mapNormal = sampleBumpTexture(baseTexCoord).xyz * 2.0 - 1.0;
     vec3 mappedNormal = safeNormalize(safeNormalize(tangent) * mapNormal.x +
                                       safeNormalize(binormal) * mapNormal.y +
                                       safeNormalize(tangentNormal) * mapNormal.z);
@@ -180,9 +217,7 @@ void main() {
     if (!specularPass && objectLightPositionRadius.w > 0.0) {
         toLight -= objectPosition;
         float normalizedDistance = length(toLight) / objectLightPositionRadius.w;
-        attenuation = normalizedDistance >= 1.0 ? 0.0 :
-            2.0 * (2.0 * normalizedDistance * normalizedDistance * normalizedDistance -
-                   3.0 * normalizedDistance * normalizedDistance + 1.0);
+        attenuation = stockProgramAttenuation(normalizedDistance, projectedPass);
         if (projectedPass) {
             vec3 projectorDirection = safeNormalize(vec3(textureStageTransforms.uvRow0[7].w,
                 textureStageTransforms.uvRow1[7].w, textureStageTransforms.uvRowQ[6].w));
@@ -190,15 +225,18 @@ void main() {
                                 dot(-safeNormalize(toLight), projectorDirection));
         }
     }
-    float diffuse = specularPass ?
-        pow(max(dot(mappedNormal, safeNormalize(toLight)), 0.0),
-            max(-objectLightPositionRadius.w, 1.0)) :
+    float halfAngle = max(dot(mappedNormal, safeNormalize(toLight)), 0.0);
+    float specular = clamp((halfAngle - 0.75) * 4.0, 0.0, 1.0);
+    specular *= specular;
+    if (specularPass)
+        specular = stockProgramSpecular(objectPosition, mappedNormal, toLight);
+    float diffuse = specularPass ? specular :
         max(dot(mappedNormal, safeNormalize(toLight)), 0.0) * attenuation;
     vec3 ambientColor = projectedPass ? vec3(0.0) : vec3(textureStageTransforms.uvRow0[7].w,
                              textureStageTransforms.uvRow1[7].w,
                              textureStageTransforms.uvRowQ[6].w) * lightColorAmbient.w;
-    primaryColor.rgb *= specularPass ? lightColorAmbient.rgb * diffuse :
-        ambientColor + lightColorAmbient.rgb * diffuse;
+    vec3 encodedDiffuse = lightColorAmbient.rgb * diffuse * 2.0;
+    primaryColor.rgb *= specularPass ? encodedDiffuse : ambientColor + encodedDiffuse;
 #endif
     vec4 envColor = unpackUnorm4x8(stage0Constant);
     vec3 rgb0 = sourceRgb(stage0ColorArg & 7u, texel, primaryColor, primaryColor, envColor);
@@ -214,6 +252,31 @@ void main() {
                       combineAlpha(stage0AlphaMode, alpha0, alpha1, alphaThird,
                                    stage0AlphaMode == 6 ? primaryColor.a : texel.a));
     color = clamp(color, 0.0, 1.0);
+    if (stockDecalSimpleMode != 0u) {
+        color = applyMaterialOverrides(color);
+        if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(color.a,
+                textureStageTransforms.materialParams.y, alphaTestMode)) discard;
+        if (textureStageTransforms.materialAmbient.w > 1.5)
+            color.rgb = clamp(color.rgb, 0.0, 1.0);
+        outColor = applySceneFog(color);
+        return;
+    }
+    if (stockTerrainAmbientMode() == 1)
+        color = vec4(texel.rgb * textureStageTransforms.materialAmbient.rgb * 2.0, texel.a);
+    if (stockTerrainOnlyCount() == 1) {
+        color = vec4(mix(vec3(0.5), texel.rgb, vertexColor.b), 1.0);
+    }
+    // CGRCTerrain supplies WorldColor through its Ambient parameter and
+    // encodes the base albedo/vertex-lighting product separately (x2).
+    // This terrain shader does not pass through the generic lightmap branch.
+    if (stockTerrainProgram() && stockTerrainLayerCount() == 0 &&
+        stockTerrainOnlyCount() == 0 && stockTerrainAmbientMode() == 0)
+        color.rgb *= textureStageTransforms.materialAmbient.rgb;
+    if (textureStageTransforms.materialParams.w > 2.5 && stockTerrainOnlyCount() == 0) {
+        color = vec4(mix(vec3(0.5), texel.rgb, secondaryColor.r), 1.0);
+        outColor = color;
+        return;
+    }
 #ifndef VR_BUMP_MAP
     if (textureStageTransforms.uvRow1[5].w > 0.5)
         color.rgb *= sampleProjectorCookie(projectorDirection);
@@ -249,12 +312,18 @@ void main() {
         color.rgb *= texture(projectorCookieTexture,(tile+localUv)/vec2(3.0,2.0)).rgb;
     }
 #endif
-    color = applyMaterialOverrides(color);
-    if (textureStageTransforms.materialParams.y <= 0.0) {
-        if (alphaTestMode == 1 && !(color.a > 0.0)) discard;
-        if (alphaTestMode == 2 && !(color.a < 0.5)) discard;
-        if (alphaTestMode == 3 && !(color.a >= 0.5)) discard;
-        if (alphaTestMode == 4 && !(color.a >= 0.25)) discard;
+    if (textureStageTransforms.terrainProjectionT[7].w < -11.5 &&
+        textureStageTransforms.terrainProjectionT[7].w > -12.5) {
+        // CGRCAmbient_Particle: ambient is added to the vertex light,
+        // while its independent opacity multiplies texture and vertex alpha.
+        vec4 ambient = textureStageTransforms.terrainProjectionS[6];
+        color = vec4(texel.rgb * (vertexColor.rgb + ambient.rgb),
+                     texel.a * vertexColor.a * ambient.a);
     }
-    outColor = applySceneFog(color);
+    color = applyMaterialOverrides(color);
+    if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(color.a, textureStageTransforms.materialParams.y, alphaTestMode)) discard;
+    color.rgb += stockSeparateSpecular;
+    if (textureStageTransforms.materialAmbient.w > 1.5)
+        color.rgb = clamp(color.rgb, 0.0, 1.0);
+    outColor = stockTerrainProgram() ? color : applySceneFog(color);
 }

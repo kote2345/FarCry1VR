@@ -53,6 +53,7 @@ set(CRYVR_SCENE_COLOR_VERTEX_SPV "${CRYVR_GENERATED_DIR}/vr_scene_color.vert.spv
 set(CRYVR_SCENE_COLOR_FRAGMENT_SPV "${CRYVR_GENERATED_DIR}/vr_scene_color.frag.spv")
 set(CRYVR_SCENE_TEXTURE_VERTEX_SPV "${CRYVR_GENERATED_DIR}/vr_scene_texture.vert.spv")
 set(CRYVR_SCENE_TEXTURE_FRAGMENT_SPV "${CRYVR_GENERATED_DIR}/vr_scene_texture.frag.spv")
+set(CRYVR_SCENE_WATER_FRAGMENT_SPV "${CRYVR_GENERATED_DIR}/vr_scene_water.frag.spv")
 set(CRYVR_SCENE_TEXTURE_COLOR_VERTEX_SPV "${CRYVR_GENERATED_DIR}/vr_scene_texture_color.vert.spv")
 set(CRYVR_SCENE_TEXTURE_COLOR_FRAGMENT_SPV "${CRYVR_GENERATED_DIR}/vr_scene_texture_color.frag.spv")
 set(CRYVR_SCENE_MULTITEXTURE_COLOR_VERTEX_SPV "${CRYVR_GENERATED_DIR}/vr_scene_multitexture_color.vert.spv")
@@ -74,6 +75,7 @@ add_custom_command(
     COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_scene_color.frag" -o "${CRYVR_SCENE_COLOR_FRAGMENT_SPV}"
     COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_scene_texture.vert" -o "${CRYVR_SCENE_TEXTURE_VERTEX_SPV}"
     COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_scene_texture.frag" -o "${CRYVR_SCENE_TEXTURE_FRAGMENT_SPV}"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_scene_water.frag" -o "${CRYVR_SCENE_WATER_FRAGMENT_SPV}"
     COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_scene_texture_color.vert" -o "${CRYVR_SCENE_TEXTURE_COLOR_VERTEX_SPV}"
     COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_scene_texture_color.frag" -o "${CRYVR_SCENE_TEXTURE_COLOR_FRAGMENT_SPV}"
     COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_scene_multitexture_color.vert" -o "${CRYVR_SCENE_MULTITEXTURE_COLOR_VERTEX_SPV}"
@@ -89,6 +91,8 @@ add_custom_command(
     COMMAND "${CMAKE_COMMAND}" "-DVERTEX_SPV=${CRYVR_SCENE_VERTEX_SPV}" "-DFRAGMENT_SPV=${CRYVR_SCENE_FRAGMENT_SPV}"
             "-DEXTRA_VERTEX_SPV=${CRYVR_SCENE_COLOR_VERTEX_SPV}" "-DEXTRA_FRAGMENT_SPV=${CRYVR_SCENE_COLOR_FRAGMENT_SPV}"
             "-DTHIRD_VERTEX_SPV=${CRYVR_SCENE_TEXTURE_VERTEX_SPV}" "-DTHIRD_FRAGMENT_SPV=${CRYVR_SCENE_TEXTURE_FRAGMENT_SPV}"
+            "-DTWELFTH_FRAGMENT_SPV=${CRYVR_SCENE_WATER_FRAGMENT_SPV}"
+            "-DTWELFTH_FRAGMENT_ARRAY_NAME=kVrSceneWaterFragmentSpirv"
             "-DFOURTH_VERTEX_SPV=${CRYVR_SCENE_TEXTURE_COLOR_VERTEX_SPV}" "-DFOURTH_FRAGMENT_SPV=${CRYVR_SCENE_TEXTURE_COLOR_FRAGMENT_SPV}"
             "-DFIFTH_VERTEX_SPV=${CRYVR_SCENE_MULTITEXTURE_COLOR_VERTEX_SPV}" "-DFIFTH_FRAGMENT_SPV=${CRYVR_SCENE_MULTITEXTURE_COLOR_FRAGMENT_SPV}"
             "-DTENTH_FRAGMENT_SPV=${CRYVR_SCENE_THREE_TEXTURE_COLOR_FRAGMENT_SPV}"
@@ -112,8 +116,10 @@ add_custom_command(
             "-DSIXTH_FRAGMENT_ARRAY_NAME=kVrSceneTextureBumpFragmentSpirv"
             "-DFRAGMENT_ARRAY_NAME=kVrSceneFragmentSpirv" "-DHEADER_GUARD=CRY_VR_SCENE_SHADERS_H"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
-    DEPENDS shaders/vr_scene.vert shaders/vr_scene.frag shaders/vr_scene_color.vert
+    DEPENDS shaders/scene_stereo.glsl shaders/scene_lighting.glsl shaders/scene_alpha_test.glsl shaders/scene_vertex_lighting.glsl
+            shaders/vr_scene.vert shaders/vr_scene.frag shaders/vr_scene_color.vert
             shaders/vr_scene_color.frag shaders/vr_scene_texture.vert shaders/vr_scene_texture.frag
+            shaders/vr_scene_water.frag
             shaders/vr_scene_texture_color.vert shaders/vr_scene_texture_color.frag
             shaders/vr_scene_multitexture_color.vert shaders/vr_scene_multitexture_color.frag
             shaders/vr_scene_three_texture_color.frag
@@ -123,6 +129,80 @@ add_custom_command(
             shaders/vr_scene_texture_color.frag
             cmake/EmbedSpirv.cmake VERBATIM)
 add_custom_target(CryVRSceneShaders DEPENDS "${CRYVR_SCENE_SHADER_HEADER}")
+
+# Linear texgen must also work for position formats without a mesh UV stream.
+set(CRYVR_GENERATED_TEXGEN_SPVS "")
+set(CRYVR_GENERATED_EXTERNAL_UV_SPVS "")
+set(CRYVR_GENERATED_EXTERNAL_UV_NAMES "")
+foreach(_generated_variant RANGE 0 23)
+    set(_generated_defines "")
+    math(EXPR _generated_layout_variant "${_generated_variant} % 12")
+    if (_generated_variant GREATER_EQUAL 12)
+        list(APPEND _generated_defines -DVR_GENERATED_EXTERNAL_UV=1)
+    endif()
+    if (_generated_layout_variant GREATER_EQUAL 8)
+        list(APPEND _generated_defines -DVR_GENERATED_SECONDARY=1 -DVR_GENERATED_COLOR=1)
+        math(EXPR _generated_base_variant "(${_generated_variant} % 2) * 2")
+    else()
+        math(EXPR _generated_base_variant "${_generated_variant} % 4")
+    endif()
+    if (_generated_base_variant GREATER_EQUAL 2)
+        list(APPEND _generated_defines -DVR_GENERATED_NORMAL=1)
+    endif()
+    if ((_generated_layout_variant GREATER_EQUAL 4 AND _generated_layout_variant LESS 8) OR _generated_layout_variant GREATER_EQUAL 10)
+        list(APPEND _generated_defines -DVR_GENERATED_MULTI=1)
+    endif()
+    math(EXPR _generated_has_color "${_generated_variant} % 2")
+    if (_generated_has_color)
+        list(APPEND _generated_defines -DVR_GENERATED_COLOR=1)
+    endif()
+    set(_generated_spv "${CRYVR_GENERATED_DIR}/vr_scene_generated_texture_${_generated_variant}.vert.spv")
+    add_custom_command(OUTPUT "${_generated_spv}"
+        COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O ${_generated_defines}
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_scene_generated_texture.vert" -o "${_generated_spv}"
+        DEPENDS shaders/scene_stereo.glsl shaders/vr_scene_generated_texture.vert shaders/scene_vertex_lighting.glsl VERBATIM)
+    list(APPEND CRYVR_GENERATED_TEXGEN_SPVS "${_generated_spv}")
+    if (_generated_variant GREATER_EQUAL 12)
+        list(APPEND CRYVR_GENERATED_EXTERNAL_UV_SPVS "${_generated_spv}")
+        list(APPEND CRYVR_GENERATED_EXTERNAL_UV_NAMES "kVrGeneratedExternalUvVertex${_generated_variant}Spirv")
+    endif()
+endforeach()
+set(CRYVR_GENERATED_TEXGEN_HEADER "${CRYVR_GENERATED_DIR}/VulkanGeneratedTexgenShaders.h")
+add_custom_command(OUTPUT "${CRYVR_GENERATED_TEXGEN_HEADER}"
+    COMMAND "${CMAKE_COMMAND}"
+        "-DVERTEX_SPV=${CRYVR_GENERATED_DIR}/vr_scene_generated_texture_0.vert.spv"
+        "-DEXTRA_VERTEX_SPV=${CRYVR_GENERATED_DIR}/vr_scene_generated_texture_1.vert.spv"
+        "-DTHIRD_VERTEX_SPV=${CRYVR_GENERATED_DIR}/vr_scene_generated_texture_2.vert.spv"
+        "-DFOURTH_VERTEX_SPV=${CRYVR_GENERATED_DIR}/vr_scene_generated_texture_3.vert.spv"
+        "-DFIFTH_VERTEX_SPV=${CRYVR_GENERATED_DIR}/vr_scene_generated_texture_4.vert.spv"
+        "-DSIXTH_VERTEX_SPV=${CRYVR_GENERATED_DIR}/vr_scene_generated_texture_5.vert.spv"
+        "-DSEVENTH_VERTEX_SPV=${CRYVR_GENERATED_DIR}/vr_scene_generated_texture_6.vert.spv"
+        "-DEIGHTH_VERTEX_SPV=${CRYVR_GENERATED_DIR}/vr_scene_generated_texture_7.vert.spv"
+        "-DNINTH_VERTEX_SPV=${CRYVR_GENERATED_DIR}/vr_scene_generated_texture_8.vert.spv"
+        "-DTENTH_VERTEX_SPV=${CRYVR_GENERATED_DIR}/vr_scene_generated_texture_9.vert.spv"
+        "-DELEVENTH_VERTEX_SPV=${CRYVR_GENERATED_DIR}/vr_scene_generated_texture_10.vert.spv"
+        "-DTWELFTH_VERTEX_SPV=${CRYVR_GENERATED_DIR}/vr_scene_generated_texture_11.vert.spv"
+        "-DVERTEX_ARRAY_NAME=kVrGeneratedTextureVertexSpirv"
+        "-DEXTRA_VERTEX_ARRAY_NAME=kVrGeneratedTextureColorVertexSpirv"
+        "-DTHIRD_VERTEX_ARRAY_NAME=kVrGeneratedTextureNormalVertexSpirv"
+        "-DFOURTH_VERTEX_ARRAY_NAME=kVrGeneratedTextureNormalColorVertexSpirv"
+        "-DFIFTH_VERTEX_ARRAY_NAME=kVrGeneratedMultiTextureVertexSpirv"
+        "-DSIXTH_VERTEX_ARRAY_NAME=kVrGeneratedMultiTextureColorVertexSpirv"
+        "-DSEVENTH_VERTEX_ARRAY_NAME=kVrGeneratedMultiTextureNormalVertexSpirv"
+        "-DEIGHTH_VERTEX_ARRAY_NAME=kVrGeneratedMultiTextureNormalColorVertexSpirv"
+        "-DNINTH_VERTEX_ARRAY_NAME=kVrGeneratedSecondaryVertexSpirv"
+        "-DTENTH_VERTEX_ARRAY_NAME=kVrGeneratedSecondaryNormalVertexSpirv"
+        "-DELEVENTH_VERTEX_ARRAY_NAME=kVrGeneratedMultiSecondaryVertexSpirv"
+        "-DTWELFTH_VERTEX_ARRAY_NAME=kVrGeneratedMultiSecondaryNormalVertexSpirv"
+        "-DFRAGMENT_SPV=${CRYVR_SCENE_TEXTURE_FRAGMENT_SPV}"
+        "-DFRAGMENT_ARRAY_NAME=kVrGeneratedTextureFragmentSpirv"
+        "-DOUTPUT_HEADER=${CRYVR_GENERATED_TEXGEN_HEADER}"
+        "-DADDITIONAL_VERTEX_SPVS=${CRYVR_GENERATED_EXTERNAL_UV_SPVS}"
+        "-DADDITIONAL_VERTEX_NAMES=${CRYVR_GENERATED_EXTERNAL_UV_NAMES}"
+        -DHEADER_GUARD=CRY_VR_GENERATED_TEXGEN_SHADERS_H
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
+    DEPENDS ${CRYVR_GENERATED_TEXGEN_SPVS} "${CRYVR_SCENE_SHADER_HEADER}" cmake/EmbedSpirv.cmake VERBATIM)
+add_custom_target(CryVRGeneratedTexgenShaders ALL DEPENDS "${CRYVR_GENERATED_TEXGEN_HEADER}")
 
 # Multitexture stages previously bypassed the normal-lighting vertex path and
 # read vertex-color attributes even for formats that do not provide them.
@@ -154,7 +234,8 @@ add_custom_command(
             "-DTHIRD_VERTEX_ARRAY_NAME=kVrMultiTextureNoColorVertexSpirv"
             "-DHEADER_GUARD=CRY_VR_MULTITEXTURE_LIT_SHADERS_H"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
-    DEPENDS shaders/vr_scene_multitexture_lit.vert
+    DEPENDS shaders/scene_vertex_lighting.glsl shaders/scene_stereo.glsl
+            shaders/vr_scene_multitexture_lit.vert
             shaders/vr_scene_multitexture_lit_nocolor.vert
             shaders/vr_scene_multitexture_nocolor.vert
             cmake/EmbedSpirv.cmake VERBATIM)
@@ -176,9 +257,76 @@ add_custom_command(
             "-DVERTEX_ARRAY_NAME=kVrLitVertexSpirv" "-DEXTRA_VERTEX_ARRAY_NAME=kVrLitColorVertexSpirv"
             "-DFRAGMENT_ARRAY_NAME=kVrLitFragmentSpirv" "-DHEADER_GUARD=CRY_VR_LIT_SCENE_SHADERS_H"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
-    DEPENDS shaders/vr_scene_lit.vert shaders/vr_scene_lit_color.vert shaders/vr_scene_lit.frag
+    DEPENDS shaders/scene_stereo.glsl shaders/scene_lighting.glsl shaders/scene_alpha_test.glsl shaders/scene_vertex_lighting.glsl
+            shaders/vr_scene_lit.vert shaders/vr_scene_lit_color.vert shaders/vr_scene_lit.frag
             cmake/EmbedSpirv.cmake VERBATIM)
 add_custom_target(CryVRLitSceneShaders DEPENDS "${CRYVR_LIT_SHADER_HEADER}")
+
+set(CRYVR_WATER_SHADER_HEADER "${CRYVR_GENERATED_DIR}/VulkanWaterShaders.h")
+add_custom_command(
+    OUTPUT "${CRYVR_WATER_SHADER_HEADER}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CRYVR_GENERATED_DIR}"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_water.vert" -o "${CRYVR_GENERATED_DIR}/water.vert.spv"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O -DWATER_COLOR=1 "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_water.vert" -o "${CRYVR_GENERATED_DIR}/water_color.vert.spv"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O -DWATER_COLOR=1 -DWATER_OCEAN=1 "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_water.vert" -o "${CRYVR_GENERATED_DIR}/ocean.vert.spv"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O -DWATER_COLOR=1 -DWATER_UV=1 "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_water.vert" -o "${CRYVR_GENERATED_DIR}/beach.vert.spv"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O -DWATER_SEA=1 "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_scene_water.frag" -o "${CRYVR_GENERATED_DIR}/sea.frag.spv"
+    COMMAND "${CMAKE_COMMAND}"
+        "-DVERTEX_SPV=${CRYVR_GENERATED_DIR}/water.vert.spv"
+        "-DFRAGMENT_SPV=${CRYVR_SCENE_WATER_FRAGMENT_SPV}"
+        "-DEXTRA_VERTEX_SPV=${CRYVR_GENERATED_DIR}/water_color.vert.spv"
+        "-DTHIRD_VERTEX_SPV=${CRYVR_GENERATED_DIR}/ocean.vert.spv"
+        "-DFOURTH_VERTEX_SPV=${CRYVR_GENERATED_DIR}/beach.vert.spv"
+        "-DFOURTH_VERTEX_ARRAY_NAME=kVrBeachVertexSpirv"
+        "-DEXTRA_FRAGMENT_SPV=${CRYVR_GENERATED_DIR}/sea.frag.spv"
+        "-DEXTRA_FRAGMENT_ARRAY_NAME=kVrSeaFragmentSpirv"
+        "-DVERTEX_ARRAY_NAME=kVrWaterVertexSpirv"
+        "-DFRAGMENT_ARRAY_NAME=kVrWaterUnusedFragmentSpirv"
+        "-DEXTRA_VERTEX_ARRAY_NAME=kVrWaterColorVertexSpirv"
+        "-DTHIRD_VERTEX_ARRAY_NAME=kVrOceanVertexSpirv"
+        "-DHEADER_GUARD=CRY_VR_WATER_SHADERS_H"
+        "-DOUTPUT_HEADER=${CRYVR_WATER_SHADER_HEADER}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
+    DEPENDS shaders/scene_stereo.glsl shaders/vr_water.vert shaders/scene_water.glsl shaders/scene_alpha_test.glsl "${CRYVR_SCENE_SHADER_HEADER}" cmake/EmbedSpirv.cmake VERBATIM)
+add_custom_target(CryVRWaterShaders DEPENDS "${CRYVR_WATER_SHADER_HEADER}")
+
+set(CRYVR_STOCK_PROGRAM_HEADER "${CRYVR_GENERATED_DIR}/VulkanStockPrograms.h")
+add_custom_command(
+    OUTPUT "${CRYVR_STOCK_PROGRAM_HEADER}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CRYVR_GENERATED_DIR}"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_terrain_layer.vert" -o "${CRYVR_GENERATED_DIR}/terrain_layer.vert.spv"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_terrain_layer.frag" -o "${CRYVR_GENERATED_DIR}/terrain_layer.frag.spv"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_caustics.vert" -o "${CRYVR_GENERATED_DIR}/caustics.vert.spv"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_caustics.frag" -o "${CRYVR_GENERATED_DIR}/caustics.frag.spv"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_plants.vert" -o "${CRYVR_GENERATED_DIR}/plants.vert.spv"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_plants.frag" -o "${CRYVR_GENERATED_DIR}/plants.frag.spv"
+    COMMAND "${CMAKE_COMMAND}"
+        "-DVERTEX_SPV=${CRYVR_GENERATED_DIR}/terrain_layer.vert.spv"
+        "-DFRAGMENT_SPV=${CRYVR_GENERATED_DIR}/terrain_layer.frag.spv"
+        "-DVERTEX_ARRAY_NAME=kVrTerrainLayerVertexSpirv"
+        "-DFRAGMENT_ARRAY_NAME=kVrTerrainLayerFragmentSpirv"
+        "-DEXTRA_VERTEX_SPV=${CRYVR_GENERATED_DIR}/caustics.vert.spv"
+        "-DEXTRA_FRAGMENT_SPV=${CRYVR_GENERATED_DIR}/caustics.frag.spv"
+        "-DEXTRA_VERTEX_ARRAY_NAME=kVrCausticsVertexSpirv"
+        "-DEXTRA_FRAGMENT_ARRAY_NAME=kVrCausticsFragmentSpirv"
+        "-DTHIRD_VERTEX_SPV=${CRYVR_GENERATED_DIR}/plants.vert.spv"
+        "-DTHIRD_FRAGMENT_SPV=${CRYVR_GENERATED_DIR}/plants.frag.spv"
+        "-DTHIRD_VERTEX_ARRAY_NAME=kVrPlantsVertexSpirv"
+        "-DTHIRD_FRAGMENT_ARRAY_NAME=kVrPlantsFragmentSpirv"
+        "-DHEADER_GUARD=CRY_VR_STOCK_PROGRAMS_H"
+        "-DOUTPUT_HEADER=${CRYVR_STOCK_PROGRAM_HEADER}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
+    DEPENDS shaders/vr_terrain_layer.vert shaders/vr_terrain_layer.frag
+        shaders/vr_plants.vert shaders/vr_plants.frag shaders/scene_plants_uniforms.glsl
+        shaders/vr_caustics.vert shaders/vr_caustics.frag
+        shaders/scene_stereo.glsl shaders/scene_water.glsl shaders/scene_alpha_test.glsl cmake/EmbedSpirv.cmake VERBATIM)
+add_custom_target(CryVRStockPrograms DEPENDS "${CRYVR_STOCK_PROGRAM_HEADER}")
 
 add_library(${PROJECT_NAME} STATIC
     CryVR.cpp
@@ -192,11 +340,13 @@ add_library(${PROJECT_NAME} STATIC
     VulkanVertexFormat.cpp
     VulkanShaderLibrary.cpp
     VulkanFrameCapture.cpp
+    "${CRYVR_STOCK_PROGRAM_HEADER}"
     "${CRYVR_PANEL_SHADER_HEADER}"
     "${CRYVR_SCENE_SHADER_HEADER}"
+    "${CRYVR_GENERATED_TEXGEN_HEADER}"
     "${CRYVR_LIT_SHADER_HEADER}"
 )
-add_dependencies(${PROJECT_NAME} CryVRPanelShaders CryVRSceneShaders CryVRLitSceneShaders CryVRMultiTextureLitShaders)
+add_dependencies(${PROJECT_NAME} CryVRPanelShaders CryVRSceneShaders CryVRLitSceneShaders CryVRMultiTextureLitShaders CryVRWaterShaders CryVRStockPrograms)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_11)

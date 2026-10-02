@@ -162,6 +162,7 @@ public class GameActivity extends SDLActivity {
         // Quest builds enter the native OpenXR/Vulkan path. On devices without
         // an OpenXR runtime the engine keeps its normal 2D renderer fallback.
         args.add("-vr");
+        args.add("\"e_dynamic_light 0\"");
 
         // FOV
         int fov = prefs.getInt(LauncherActivity.KEY_FOV, 90);

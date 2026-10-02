@@ -1,5 +1,6 @@
 #include "VulkanVertexFormat.h"
 
+#include <array>
 #include <stddef.h>
 #include <string.h>
 
@@ -28,9 +29,7 @@ void Color4(VulkanVertexFormat& f, uint32_t location, uint32_t offset)
 { Add(f, location, VK_FORMAT_R8G8B8A8_UNORM, offset); }
 void UV(VulkanVertexFormat& f, uint32_t location, uint32_t offset)
 { Add(f, location, VK_FORMAT_R32G32_SFLOAT, offset); }
-}
-
-bool GetVulkanVertexFormat(uint32_t format, VulkanVertexFormat& out)
+bool BuildVulkanVertexFormat(uint32_t format, VulkanVertexFormat& out)
 {
     memset(&out, 0, sizeof(out));
     switch (format)
@@ -57,6 +56,22 @@ bool GetVulkanVertexFormat(uint32_t format, VulkanVertexFormat& out)
     case 16: out.stride = 32; Position3(out); Color4(out, Color, 12); UV(out, UV0, 16); UV(out, UV1, 24); break;
     default: return false;
     }
+    return true;
+}
+}
+
+bool GetVulkanVertexFormat(uint32_t format, VulkanVertexFormat& out)
+{
+    static const std::array<VulkanVertexFormat, 17> formats = []()
+    {
+        std::array<VulkanVertexFormat, 17> values{};
+        for (uint32_t index = 1; index < values.size(); ++index)
+            BuildVulkanVertexFormat(index, values[index]);
+        return values;
+    }();
+    if (format >= formats.size() || !formats[format].stride)
+        return false;
+    out = formats[format];
     return true;
 }
 }

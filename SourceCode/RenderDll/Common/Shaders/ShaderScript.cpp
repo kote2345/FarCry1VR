@@ -1179,7 +1179,36 @@ char *CShader::mfPreprCheckConditions(char *buf, const char *nameFile)
     else
     if (!stricmp(ni, "PROJECTEDENVBUMP"))
     {
-      if (gRenDev->GetFeatures() & RFT_HW_ENVBUMPPROJECTED)
+      // Vulkan translates WaterVolume's projected refraction and reflection
+      // programs explicitly. Retain those passes without advertising support
+      // for every legacy projected-bump program in other materials. Scripts
+      // contain several shaders, so identify the enclosing declaration rather
+      // than using the script file name.
+      bool translatedWaterVolume = false;
+      if (gRenDev->GetType() == R_VULKAN_RENDERER)
+      {
+        for (const char *line = buf; line < posStart; )
+        {
+          const char *token = line;
+          while (token < posStart && (*token == ' ' || *token == '\t'))
+            ++token;
+          if (posStart - token >= 7 && !strnicmp(token, "Shader", 6) &&
+              (token[6] == ' ' || token[6] == '\t'))
+          {
+            token += 6;
+            while (token < posStart && (*token == ' ' || *token == '\t'))
+              ++token;
+            translatedWaterVolume = posStart - token >= 13 &&
+                (*token == '\'' || *token == '"') &&
+                !strnicmp(token + 1, "WaterVolume", 11) && token[12] == *token;
+          }
+          const char *next = strchr(line, '\n');
+          if (!next || next >= posStart)
+            break;
+          line = next + 1;
+        }
+      }
+      if ((gRenDev->GetFeatures() & RFT_HW_ENVBUMPPROJECTED) || translatedWaterVolume)
       {
         nPos = mfRemoveScript_ifdef(posStart, posEnd, false, nPos, buf, nameFile);
         bAccept = true;
@@ -1745,7 +1774,7 @@ uint64 CShader::mfScriptPreprocessorMask(SShader *pSH, int nOffset)
   }
   if (i == m_LocalMacros.Num())
   {
-    iLog->Log("Warning: couldn't find Local macros state for offset %d in shader '%s'", pSH->GetName());
+    iLog->Log("Warning: couldn't find Local macros state for offset %d in shader '%s'", nOffset, pSH->GetName());
     return nMask;
   }
   m_Macros = *m_LocalMacros[i].m_Macros;
@@ -1765,7 +1794,7 @@ uint64 CShader::mfScriptPreprocessorMask(SShader *pSH, int nOffset)
         iLog->Log("Warning: zero mask for parameter macro '%s' in shader '%s'", itor->first.c_str(), pSH->GetName());
       if (n & nMask)
       {
-        iLog->Log("Warning: mask 0x%llx already exist for parameter macro in shader '%s'", n, itor->first.c_str(), pSH->GetName());
+        iLog->Log("Warning: mask 0x%llx already exists for parameter macro '%s' in shader '%s'", n, itor->first.c_str(), pSH->GetName());
 	      ShaderMacroItor itor=m_LocalMacros[i].m_Macros->begin();
         while(itor!=m_LocalMacros[i].m_Macros->end())
         {

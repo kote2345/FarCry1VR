@@ -108,6 +108,7 @@ bool CWeaponClass::Init(const string& sName)
 void CWeaponClass::Reset()
 {
 	m_bIsLoaded = false;
+    m_vrGripInitialized = false;
 
 	// release loaded weapon models, if necessary
 	if (m_pObject)
@@ -370,8 +371,136 @@ void CWeaponClass::SetFirstPersonOffset( const Vec3 &posOfs,const Vec3 &angOfs )
 	m_fpvAngleOffset = angOfs;
 }
 
+namespace
+{
+// Grip settings from fholger/farcry_vrmod's weapon Lua scripts. Stock
+// game scripts lack these fields; explicit script values take precedence.
+struct VRWeaponGripProfile
+{
+    const char* weapon;
+    const char* rightBone;
+    const char* leftBone;
+    Vec3 offset;
+    Vec3 angles;
+};
+const VRWeaponGripProfile vrWeaponGrips[] = {
+    {"Falcon", "Bone03", "Bone19", Vec3(0,-.1f,-.018f), Vec3(0,0,0)},
+    {"Machete", "Bone03", "Bone19", Vec3(0,-.1f,-.018f), Vec3(0,0,0)},
+    {"EngineerTool", "Bone03", "Bone19", Vec3(0,-.1f,-.018f), Vec3(0,0,0)},
+    {"MedicTool", "Bone03", "Bone19", Vec3(0,-.1f,-.018f), Vec3(0,0,0)},
+    {"ScoutTool", "Bone03", "Bone19", Vec3(0,-.1f,-.018f), Vec3(0,0,0)},
+    {"Shocker", "Bone03", "Bone19", Vec3(0,-.1f,-.018f), Vec3(0,0,0)},
+    {"Wrench", "Bone03", "Bone19", Vec3(0,-.1f,-.018f), Vec3(0,0,0)},
+    {"M4", "Bone20", "Bone03", Vec3(0,-.1f,-.018f), Vec3(0,0,0)},
+    {"MP5", "weapon", "Bone19", Vec3(-.1f,-.1f,-.018f), Vec3(0,0,0)},
+    {"Shotgun", "weapon", "Bone19", Vec3(-.13f,-.34f,0), Vec3(0,0,0)},
+    {"RL", "weapon", "Bone03", Vec3(-.1f,-.07f,0), Vec3(0,0,0)},
+    {"AG36", "Bone67", "Bone19", Vec3(0,-.1f,-.018f), Vec3(-2,-8,2)},
+    {"M249", "Bone67", "Bone19", Vec3(0,-.1f,-.018f), Vec3(0,0,0)},
+    {"OICW", "Bone67", "Bone19", Vec3(0,-.1f,-.018f), Vec3(-34.5f,18,-2)},
+    {"P90", "Bone67", "Bone19", Vec3(0,-.08f,0), Vec3(-30,0,0)},
+    {"SniperRifle", "Bone67", "Bone19", Vec3(0,-.08f,-.018f), Vec3(-4,0,0)}
+};
+const VRWeaponGripProfile* FindVRWeaponGrip(const char* name)
+{
+    for (const auto& profile : vrWeaponGrips)
+        if (!stricmp(name, profile.weapon)) return &profile;
+    return nullptr;
+}
+}
+
+const char* CWeaponClass::GetVRHandBoneName(bool left) const
+{
+    const char* boneName = "";
+    m_soWeaponClass->GetValue(left ? "BoneLeftHand" : "BoneRightHand", boneName);
+    if (boneName && boneName[0]) return boneName;
+    const VRWeaponGripProfile* profile = FindVRWeaponGrip(m_sName.c_str());
+    return profile ? (left ? profile->leftBone : profile->rightBone) : "";
+}
+
+void CWeaponClass::InitializeVRWeaponGrip()
+{
+    if (!GetCharacter()) return;
+    ICryBone* bone = GetCharacter()->GetBoneByName(GetVRHandBoneName(false));
+    if (!bone) return;
+    const VRWeaponGripProfile* profile = FindVRWeaponGrip(m_sName.c_str());
+    Vec3 gripOffset = profile ? profile->offset : Vec3(0,-.1f,-.018f);
+    Vec3 gripAngles = profile ? profile->angles : Vec3(0,0,0);
+    _SmartScriptObject values(m_pScriptSystem, true);
+    if (m_soWeaponClass->GetValue("RHOffset", values))
+    {
+        values->GetAt(1, gripOffset.x); values->GetAt(2, gripOffset.y); values->GetAt(3, gripOffset.z);
+    }
+    if (m_soWeaponClass->GetValue("RHOffsetAngles", values))
+    {
+        values->GetAt(1, gripAngles.x); values->GetAt(2, gripAngles.y); values->GetAt(3, gripAngles.z);
+    }
+    Matrix33 mirrorCorrection;
+    mirrorCorrection.SetIdentity();
+    if (m_rWeaponSystem.IsLeftHanded())
+    {
+        mirrorCorrection.SetScale(Vec3(-1,1,1));
+        mirrorCorrection *= Matrix33::CreateRotationY(gf_PI);
+    }
+    Matrix34 offset = Matrix34::CreateRotationXYZ(Deg2Rad(gripAngles), gripOffset);
+    m_vrGripInverse = (Matrix34(GetTransposed44(bone->GetAbsoluteMatrix())) * offset * mirrorCorrection).GetInverted();
+    m_vrGripInitialized = true;
+}
+
+void CWeaponClass::UpdateVRWeaponHands(CPlayer* player)
+{
+    ICryBone* bone = GetCharacter()->GetBoneByName(GetVRHandBoneName(true));
+    if (!bone || !bone->GetParent()) return;
+    bone = bone->GetParent()->GetParent();
+    if (!bone) return;
+    if (!player->m_stats.reloading)
+    {
+        bone->DoNotCalculateBoneRelativeMatrix(true);
+        const_cast<Matrix44&>(bone->GetRelativeMatrix()) = Matrix44(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1);
+    }
+    else bone->UnfixBoneMatrix();
+}
+
+void CWeaponClass::HideVRUpperArms(bool left)
+{
+    ICryBone* bone = GetCharacter()->GetBoneByName(GetVRHandBoneName(left));
+    if (!bone) return;
+    Vec3 position = bone->GetAbsoluteMatrix().GetTranslationOLD();
+    bone = bone->GetParent();
+    for (int parent = 0; parent < 3 && bone; ++parent, bone = bone->GetParent())
+    {
+        Matrix44& matrix = const_cast<Matrix44&>(bone->GetAbsoluteMatrix());
+        matrix = Matrix44(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1);
+        matrix.SetTranslationOLD(position);
+    }
+}
+
 void CWeaponClass::MoveToFirstPersonPos(IEntity *pIEntity)
 {
+    Matrix34 controller;
+    if (GetCharacter() && m_rWeaponSystem.GetGame()->GetSystem()->GetVRControllerTransform(false, controller))
+    {
+        if (!m_vrGripInitialized) InitializeVRWeaponGrip();
+        if (m_vrGripInitialized)
+        {
+            IConsole* console = m_rWeaponSystem.GetGame()->GetSystem()->GetIConsole();
+            static float weaponPitchOffset = 15.0f, weaponYawOffset = 0.0f;
+            if (console && !console->GetCVar("vr_weapon_pitch_offset"))
+                console->Register("vr_weapon_pitch_offset", &weaponPitchOffset, 15.0f, VF_DUMPTODISK);
+            if (console && !console->GetCVar("vr_weapon_yaw_offset"))
+                console->Register("vr_weapon_yaw_offset", &weaponYawOffset, 0.0f, VF_DUMPTODISK);
+            const float pitch = console ? console->GetCVar("vr_weapon_pitch_offset")->GetFVal() : 15.0f;
+            const float yaw = console ? console->GetCVar("vr_weapon_yaw_offset")->GetFVal() : 0.0f;
+            Matrix34 tracked = controller * Matrix33::CreateRotationY(-gf_PI_DIV_2) *
+                Matrix33::CreateRotationZ(DEG2RAD(pitch)) *
+                Matrix33::CreateRotationX(DEG2RAD(yaw)) * m_vrGripInverse;
+            m_vPos = tracked.GetTranslation();
+            Ang3 trackedAngles;
+            trackedAngles.SetAnglesXYZ(Matrix33(tracked));
+            m_vAngles = RAD2DEG(trackedAngles);
+            return;
+        }
+    }
 	Vec3 pos = m_fpvPos+m_fpvPosOffset;
 
 	Matrix44 m=Matrix34::CreateRotationXYZ( Deg2Rad(pIEntity->GetCamera()->GetAngles()), pIEntity->GetCamera()->GetPos() );	//set rotation and translation in one function call
@@ -601,6 +730,7 @@ bool CWeaponClass::InitModels()
 			m_pCharacter->StartAnimation("Idle11",ccap);
 			m_pCharacter->Update();
 			m_pCharacter->ForceUpdate(); 
+			InitializeVRWeaponGrip();
 			//m_pCharacter->SetAnimationFrame("idle",1);			
 			//m_pCharacter->StopAnimation(0);
 		}
@@ -710,7 +840,15 @@ void CWeaponClass::Update(CPlayer *pPlayer)
 	if (pPlayer->IsMyPlayer() && m_pCharacter && pChar)		
 	{
 		FRAME_PROFILER( "CWeaponClass::UpdateCharacter",GetISystem(),PROFILE_GAME );
+		Matrix34 controller;
+		const bool trackedWeapon = m_rWeaponSystem.GetGame()->GetSystem()->GetVRControllerTransform(false, controller);
+		if (trackedWeapon) UpdateVRWeaponHands(pPlayer);
 		pChar->Update(GetPos());
+		if (trackedWeapon)
+		{
+			HideVRUpperArms(false);
+			HideVRUpperArms(true);
+		}
 	}
 }
 
@@ -718,8 +856,27 @@ void CWeaponClass::Update(CPlayer *pPlayer)
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 //weapon fire,play sounds and perform collision check
 //////////////////////////////////////////////////////////////////////
-int CWeaponClass::Fire(const Vec3d &origin, const Vec3d &angles, CPlayer *pPlayer, WeaponInfo &winfo, IPhysicalEntity *pIRedirected)
+int CWeaponClass::Fire(const Vec3d &originalOrigin, const Vec3d &originalAngles, CPlayer *pPlayer, WeaponInfo &winfo, IPhysicalEntity *pIRedirected)
 {
+    Vec3d origin = originalOrigin, angles = originalAngles;
+    Matrix34 controller;
+    if (pPlayer && pPlayer->IsMyPlayer() && m_vrGripInitialized &&
+        m_rWeaponSystem.GetGame()->GetSystem()->GetVRControllerTransform(false, controller))
+    {
+        MoveToFirstPersonPos(pPlayer->GetEntity());
+        const char* muzzleName = "spitfire";
+        m_soWeaponClass->GetValue("SpitFireBone", muzzleName);
+        if (ICryBone* muzzle = GetCharacter()->GetBoneByName(muzzleName))
+        {
+            Matrix34 model = Matrix34::CreateRotationXYZ(Deg2Rad(m_vAngles), m_vPos);
+            Matrix34 muzzleTransform = model * Matrix34(GetTransposed44(muzzle->GetAbsoluteMatrix())) *
+                Matrix33::CreateRotationY(gf_PI_DIV_2);
+            origin = muzzleTransform.GetTranslation();
+            Ang3 muzzleAngles;
+            muzzleAngles.SetAnglesXYZ(Matrix33(muzzleTransform));
+            angles = RAD2DEG(muzzleAngles);
+        }
+    }
 	FUNCTION_PROFILER( GetISystem(),PROFILE_GAME );
 #ifdef FIRE_DEBUG
 	CryLog("CWeaponClass::Fire");

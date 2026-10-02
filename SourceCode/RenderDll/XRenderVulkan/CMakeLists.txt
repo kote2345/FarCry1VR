@@ -10,4 +10,6 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 target_link_libraries(${PROJECT_NAME} PRIVATE XRenderNULL CryVR)
 if (ANDROID)
     target_link_libraries(${PROJECT_NAME} PRIVATE log)
+    # Reject missing common-renderer symbols at build time, before dlopen.
+    target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--no-undefined")
 endif()

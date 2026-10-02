@@ -17,7 +17,8 @@ layout(location = 1) out vec4 color;
 void main()
 {
     gl_Position = transform.mvp * vec4(position, 1.0);
-    // Legacy 2D batches use a top-left origin and top-down texture V.
-    uv = vec2(vertexUv.x, 1.0 - vertexUv.y) * transform.uvTransform.xy + transform.uvTransform.zw;
+    // These are the explicit UVs supplied to GL's vertex array. Callers
+    // which need 1-V (DrawImage) have already applied it when building vertices.
+    uv = vertexUv * transform.uvTransform.xy + transform.uvTransform.zw;
     color = vertexColor;
 }

@@ -15,6 +15,15 @@
 
 void *CVertexBuffer::GetStream(int nStream, int *nOffs)
 {
+  // Vulkan uses these CPU streams as the source of its per-frame upload.
+  // CheckUpdate must see an existing tangent stream; returning NULL makes
+  // it allocate it again on every draw and abandon the previous allocation.
+  if (gRenDev && gRenDev->GetType() == R_VULKAN_RENDERER &&
+      nStream >= 0 && nStream < VSF_NUM)
+  {
+    if (nOffs) *nOffs = 0;
+    return m_VS[nStream].m_VData;
+  }
   return NULL;
 }
 
@@ -39,6 +48,8 @@ void CNULLRenderer::CreateBuffer(int size, int vertexformat, CVertexBuffer *buf,
   void *data;
 
   // System buffer 
+  if (gRenDev && gRenDev->GetType() == R_VULKAN_RENDERER)
+    SAFE_DELETE_ARRAY(buf->m_VS[Type].m_VData);
   data=new unsigned char [size];
   buf->m_VS[Type].m_VData = data;
 }

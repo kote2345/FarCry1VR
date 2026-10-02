@@ -26,9 +26,11 @@ public:
     VkQueue GetGraphicsQueue() const { return m_graphicsQueue; }
     uint32_t GetGraphicsQueueFamily() const { return m_graphicsQueueFamily; }
     bool SupportsWireframe() const { return m_supportsWireframe; }
+    bool SupportsMultiview() const { return m_supportsMultiview; }
     bool SupportsAnisotropicFiltering() const { return m_supportsAnisotropicFiltering; }
     bool SupportsRadialFog() const { return m_supportsRadialFog; }
     bool SupportsOcclusionQueries() const { return m_device != VK_NULL_HANDLE; }
+    bool SupportsPipelineStatistics() const { return m_supportsPipelineStatistics; }
     float GetMaxSamplerAnisotropy() const { return m_maxSamplerAnisotropy; }
     VkDeviceSize GetMinUniformBufferOffsetAlignment() const { return m_minUniformBufferOffsetAlignment; }
     PFN_vkGetInstanceProcAddr GetInstanceProcAddr() const { return m_getInstanceProcAddr; }
@@ -65,8 +67,10 @@ private:
     VkQueue m_graphicsQueue = VK_NULL_HANDLE;
     uint32_t m_graphicsQueueFamily = 0;
     bool m_supportsWireframe = false;
+    bool m_supportsMultiview = false;
     bool m_supportsAnisotropicFiltering = false;
     bool m_supportsRadialFog = false;
+    bool m_supportsPipelineStatistics = false;
     float m_maxSamplerAnisotropy = 1.0f;
     VkDeviceSize m_minUniformBufferOffsetAlignment = 16;
     char m_lastError[256]{};

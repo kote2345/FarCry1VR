@@ -45,10 +45,10 @@ static bool ConvertVulkanMirrorPixels(const unsigned char* source, int width, in
       rgba[i * 4 + 2] = source[i * 4 + 0];
       rgba[i * 4 + 3] = source[i * 4 + 3];
       break;
-    case eTF_RGBA:
-      rgba[i * 4 + 0] = source[i * 4 + 0];
+    case eTF_RGBA: // GL upload interprets this engine format as BGRA too
+      rgba[i * 4 + 0] = source[i * 4 + 2];
       rgba[i * 4 + 1] = source[i * 4 + 1];
-      rgba[i * 4 + 2] = source[i * 4 + 2];
+      rgba[i * 4 + 2] = source[i * 4 + 0];
       rgba[i * 4 + 3] = source[i * 4 + 3];
       break;
     case eTF_0888: // GL upload interprets this as BGR

@@ -3807,6 +3807,12 @@ enum EShaderPassType
 // Shader pass definition for HW shaders
 struct SShaderPassHW : public SShaderPass
 { 
+  // Preserve the actual program variant for backends translating stock CG
+  // semantics. Plain storage also supports TArray's zero/copy allocation.
+  char m_StockVertexProgram[96];
+  char m_StockFragmentProgram[96];
+  uint64 m_StockProgramMask;
+  bool m_StockUsesVertexColors;
   EShaderPassType m_ePassType;
   int m_LMFlags;                  // Light material flags (LMF_)
   int m_LightFlags;               // Dynamic light sources flag (DLF_)

@@ -21,11 +21,11 @@
 
 
 SShader *CShader::m_DefaultShader;
+SShader *CShader::m_ShaderFogCaust;
 #ifndef NULL_RENDERER
 SShader *CShader::m_ShaderVFog;
 SShader *CShader::m_ShaderVFogCaust;
 SShader *CShader::m_ShaderFog;
-SShader *CShader::m_ShaderFogCaust;
 SShader *CShader::m_ShaderFog_FP;
 SShader *CShader::m_ShaderFogCaust_FP;
 SShader *CShader::m_ShaderStateNoCull;
@@ -302,6 +302,10 @@ SShader& SShader::operator = (const SShader& src)
 
 SShaderPassHW::SShaderPassHW()
 {
+  m_StockVertexProgram[0] = 0;
+  m_StockFragmentProgram[0] = 0;
+  m_StockProgramMask = 0;
+  m_StockUsesVertexColors = false;
   m_ePassType = eSHP_General;
   m_VProgram = NULL;
   m_FShader = NULL;
@@ -657,6 +661,8 @@ void CShader::mfShutdown(void)
   SAFE_RELEASE_FORCE(m_ShaderCGVProgramms);
 #endif
 
+#else
+  SAFE_RELEASE_FORCE(m_ShaderFogCaust);
 #endif
   SAFE_RELEASE(gRenDev->m_RP.m_RCDetail);
   SAFE_RELEASE(gRenDev->m_RP.m_RCSprites_Heat);
@@ -1146,6 +1152,10 @@ void CShader::mfSetDefaults (void)
   m_ShaderFogCaust_FP = ef;
 
   mfRegisterDefaultTemplates();
+#else
+  // Vulkan needs the same parsed animation sequence as OpenGL.
+  if (gRenDev->GetType() != R_NULL_RENDERER)
+    m_ShaderFogCaust = mfForName("TemplFogCaustics", eSH_Misc, EF_SYSTEM);
 #endif
 
   if (!b)
@@ -1207,13 +1217,19 @@ void CShader::mfOptimizeShaderHW(SShader *ef, TArray<SShaderPassHW>& Layers, int
       {
         pCounts[Layers[i].m_Pointers[j]->ePT]++;
       }
-      if (!Layers[i].m_TUnits.Num())
+      // Vulkan retains Cg program names and resolves their sampler bindings
+      // when translating draws. An empty legacy texture-unit list therefore
+      // does not mean that this hardware pass has no material. Classify it
+      // from its depth/blend state so opaque geometry precedes water.
+      if (!Layers[i].m_TUnits.Num() &&
+          !(gRenDev->GetType() == R_VULKAN_RENDERER &&
+            Layers[i].m_StockFragmentProgram[0]))
         continue;
 
       if (Layers[i].m_RenderState & GS_DEPTHWRITE)
         bOpaq = true;
 
-      if (!Layers[i].m_TUnits[0].m_eGenTC)
+      if (Layers[i].m_TUnits.Num() && !Layers[i].m_TUnits[0].m_eGenTC)
         Layers[i].m_TUnits[0].m_eGenTC = eGTC_Base;
       
       if ((Layers[i].m_RenderState & GS_BLEND_MASK) && (Layers[0].m_RenderState & GS_BLEND_MASK))
@@ -1349,6 +1365,21 @@ void CShader::mfOptimizeShaderHW(SShader *ef, TArray<SShaderPassHW>& Layers, int
             Layers[i].m_LMFlags |= LMF_BUMPMATERIAL;
         }
         int nT = 0;
+        if (gRenDev->GetType() == R_VULKAN_RENDERER)
+        {
+          // OpenGL obtains these stream requirements from mfHasPointer on
+          // the compiled Cg vertex program. Vulkan keeps its name instead.
+          const char* vp = Layers[i].m_StockVertexProgram;
+          if (!stricmp(vp, "CGVProgAmbientTempl") || !stricmp(vp, "CGVProgLightTempl"))
+          {
+            m_nTC = crymax(m_nTC, 1);
+            if (!stricmp(vp, "CGVProgLightTempl"))
+            {
+              Layers[i].m_Flags |= SHPF_TANGENTS;
+              m_bNeedTangents = true;
+            }
+          }
+        }
         if (sNeedColorArray(Layers[i].m_eEvalRGB, Layers[i].m_eEvalAlpha))
           m_bNeedCol = true;
         for (j=0; j<Layers[i].m_Pointers.Num(); j++)

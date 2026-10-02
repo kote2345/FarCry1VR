@@ -485,8 +485,60 @@ public:
   void EF_TransformDLights();
   void EF_IdentityDLights();
 
+  // A scoped CPU draw stream used by backends whose generated data is a
+  // private upload copy. Shared evaluators still access it through the
+  // same EF_GetPointer entry point as the OpenGL render elements.
+  struct SCpuDrawStream
+  {
+    const byte* source = nullptr;
+    byte* destination = nullptr;
+    const byte* tangents = nullptr;
+    int stride = 0;
+    int tangentStride = 0;
+    int firstVertex = 0;
+    int positionOffset = -1;
+    int normalOffset = -1;
+    int colorOffset = -1;
+    int secondaryColorOffset = -1;
+    int texCoordOffset = -1;
+    int sourceStride = 0;
+    int sourcePositionOffset = -1;
+    int sourceNormalOffset = -1;
+    int sourceColorOffset = -1;
+    int sourceSecondaryColorOffset = -1;
+    int sourceTexCoordOffset = -1;
+  };
+  const SCpuDrawStream* m_pCpuDrawStream = nullptr;
+
   _inline void *EF_GetPointer(ESrcPointer ePT, int *Stride, int Type, ESrcPointer Dst, int Flags)
   {
+    if (m_pCpuDrawStream)
+    {
+      const SCpuDrawStream& stream = *m_pCpuDrawStream;
+      int offset = -1;
+      const byte* data = (Flags & FGP_SRC) ? stream.source : stream.destination;
+      int stride = stream.stride;
+      const bool separateSource = (Flags & FGP_SRC) && stream.sourceStride > 0;
+      if (separateSource) stride = stream.sourceStride;
+      switch (ePT)
+      {
+        case eSrcPointer_Vert: offset = separateSource ? stream.sourcePositionOffset : stream.positionOffset; break;
+        case eSrcPointer_Normal: offset = separateSource ? stream.sourceNormalOffset : stream.normalOffset; break;
+        case eSrcPointer_Color: offset = separateSource ? stream.sourceColorOffset : stream.colorOffset; break;
+        case eSrcPointer_SecColor: offset = separateSource ? stream.sourceSecondaryColorOffset : stream.secondaryColorOffset; break;
+        case eSrcPointer_Tex: offset = separateSource ? stream.sourceTexCoordOffset : stream.texCoordOffset; break;
+        case eSrcPointer_Tangent: offset = 0; data = stream.tangents; stride = stream.tangentStride; break;
+        case eSrcPointer_Binormal: offset = 12; data = stream.tangents; stride = stream.tangentStride; break;
+        case eSrcPointer_TNormal: offset = 24; data = stream.tangents; stride = stream.tangentStride; break;
+        default: break;
+      }
+      // A missing stream is a missing CPU pointer, not an OpenGL buffer
+      // offset. Never fall through to the original shared leaf buffer.
+      if (Stride) *Stride = stride;
+      if (!data || offset < 0 || stride <= 0) return nullptr;
+      const int firstVertex = (Flags & FGP_REAL) ? stream.firstVertex : 0;
+      return const_cast<byte*>(data + firstVertex * stride + offset);
+    }
     void *p;
     
     if (m_RP.m_pRE)

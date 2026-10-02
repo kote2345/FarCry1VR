@@ -146,6 +146,7 @@ public:
 	CryVR::VulkanFrameRenderer* GetVulkanFrameRenderer() { return &m_vulkanFrameRenderer; }
 	float GetVRHeadYawDeltaRadians() const override { return m_vulkanFrameRenderer.GetHeadYawDeltaRadians(); }
 	float GetVRHeadPitchDeltaRadians() const override { return m_vulkanFrameRenderer.GetHeadPitchDeltaRadians(); }
+    bool GetVRControllerTransform(bool left, Matrix34& transform) const override;
 	CryVR::VulkanResourceManager* GetVulkanResources() { return &m_vulkanResources; }
 	CryVR::VulkanShaderLibrary* GetVulkanShaders() { return &m_vulkanShaders; }
 	const char			*GetGameMOD() { if (m_szGameMOD[0]) return (m_szGameMOD);return (NULL); }
@@ -318,6 +319,8 @@ private: // ------------------------------------------------------
 
 	CTimer								m_Time;								//!<
 	CCamera								m_ViewCamera;					//!<
+	CCamera m_vrUntrackedRenderCamera;
+	bool m_vrUsingVisibilityCamera = false;
 	CXConsole *						m_pConsole;						//!<
 	bool									m_bQuit;							//!< if is true the system is quitting
 	bool									m_bRelaunch;					//!< relaunching the app or not (true beforerelaunch)

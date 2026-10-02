@@ -100,7 +100,7 @@ void CLeafBuffer::CompactBuffer(struct_VERTEX_FORMAT_P3F_N_COL4UB_TEX2F * _vbuff
       continue;
 
     uint nMInfo = uiInfo ? uiInfo[idxI] : 0;
-    uint nMatId = nMInfo & 127;
+    uint nMatId = nMInfo & 255;
     bool bCanShare = bShareVerts ? bShareVerts[nMatId] : true;
 
     int newUniqueId = (int)unique_vbuff.size();
@@ -141,17 +141,34 @@ void CLeafBuffer::CompactBuffer(struct_VERTEX_FORMAT_P3F_N_COL4UB_TEX2F * _vbuff
     }
   }
 
+  // The sorted references accelerate duplicate lookup only. The original
+  // OpenGL compactor emits vertices in first-occurrence order, which is also
+  // the order of the independently baked lightmap coordinate stream. Emitting
+  // the X-sorted vertices breaks that association even without vertex sharing.
+  std::vector<int> orderedIds(unique_vbuff.size(), -1);
+  std::vector<struct_VERTEX_FORMAT_P3F_N_COL4UB_TEX2F> orderedVertices;
+  std::vector<SPipTangents> orderedTangents;
+  orderedVertices.reserve(unique_vbuff.size());
+  if (_tbuff) orderedTangents.reserve(unique_tbuff.size());
+
   pindices->Free();
   for (int i = 0; i < vert_num_before; ++i)
   {
-    pindices->AddElem((unsigned short)remap[i]);
+    const int sortedId = remap[i];
+    if (orderedIds[sortedId] == -1)
+    {
+      orderedIds[sortedId] = static_cast<int>(orderedVertices.size());
+      orderedVertices.push_back(unique_vbuff[sortedId]);
+      if (_tbuff) orderedTangents.push_back(unique_tbuff[sortedId]);
+    }
+    pindices->AddElem((unsigned short)orderedIds[sortedId]);
   }
 
   int uniqueCount = (int)unique_vbuff.size();
   *_vcount = uniqueCount;
-  cryMemcpy(_vbuff, unique_vbuff.data(), uniqueCount * sizeof(struct_VERTEX_FORMAT_P3F_N_COL4UB_TEX2F));
-  if (_tbuff && !unique_tbuff.empty())
-    cryMemcpy(_tbuff, unique_tbuff.data(), uniqueCount * sizeof(SPipTangents));
+  cryMemcpy(_vbuff, orderedVertices.data(), uniqueCount * sizeof(struct_VERTEX_FORMAT_P3F_N_COL4UB_TEX2F));
+  if (_tbuff && !orderedTangents.empty())
+    cryMemcpy(_tbuff, orderedTangents.data(), uniqueCount * sizeof(SPipTangents));
 
   int ratio = 100 * (*_vcount) / vert_num_before;
   CryLogComment("  Size after compression = %d %s ( %d -> %d )", ratio, "%", vert_num_before, *_vcount);

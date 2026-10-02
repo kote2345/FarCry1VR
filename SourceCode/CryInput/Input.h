@@ -161,6 +161,27 @@ public:
 		m_vrLookAxes = lookAxes;
 		m_vrAxesActive = true;
 	}
+	void QueueVRPostureCycle() override { m_vrPostureCyclePending = true; }
+	void SetVRFireState(bool held) override
+	{
+		m_vrFireStateAvailable = true;
+		if (m_vrFireHeld && !held) m_vrFireReleased = true;
+		m_vrFireHeld = held;
+	}
+	bool IsVRFireHeld() const override { return m_vrFireHeld; }
+	bool HasVRFireState() const override { return m_vrFireStateAvailable; }
+	bool ConsumeVRFireReleased() override
+	{
+		const bool released = m_vrFireReleased;
+		m_vrFireReleased = false;
+		return released;
+	}
+	bool ConsumeVRPostureCycle() override
+	{
+		const bool pending = m_vrPostureCyclePending;
+		m_vrPostureCyclePending = false;
+		return pending;
+	}
 
 	bool JoyIsXKeyPressed(int idCtrl,int idXKey);
 	bool JoyIsXKeyDown(int idCtrl,int idXKey);
@@ -286,6 +307,10 @@ private:
 	Vec3 m_vrMoveAxes = Vec3(0, 0, 0);
 	Vec3 m_vrLookAxes = Vec3(0, 0, 0);
 	bool m_vrAxesActive = false;
+	bool m_vrPostureCyclePending = false;
+	bool m_vrFireHeld = false;
+	bool m_vrFireStateAvailable = false;
+	bool m_vrFireReleased = false;
 #ifdef _XBOX
   CXGamepad m_Gamepad;
 #endif

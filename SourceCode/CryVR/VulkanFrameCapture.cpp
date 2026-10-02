@@ -178,12 +178,19 @@ bool BuildOpenXrEyeMvp(const XrView& eye, const XrPosef& referenceHeadPose,
     float eyeView[16], projection[16], viewModel[16];
     if (!BuildEyeView(relativeEye, eyeView) ||
         !BuildProjection(eye.fov, nearPlane, farPlane, projection,
-                         nearestObject ? 0.6666f : 1.0f)) return false;
+                         1.0f)) return false;
     MultiplyColumnMajor(eyeView, referenceModelView, viewModel);
     MultiplyColumnMajor(projection, viewModel, mvp);
     if (eyeModelView)
         for (int i = 0; i < 16; ++i) eyeModelView[i] = viewModel[i];
     return true;
+}
+
+void ApplyOpenXrEyeMatrices(const float eyeView[16], const float eyeViewProjection[16],
+                           const float modelView[16], float mvp[16], float viewModel[16])
+{
+    MultiplyColumnMajor(eyeViewProjection, modelView, mvp);
+    MultiplyColumnMajor(eyeView, modelView, viewModel);
 }
 
 bool BuildFlatPanelMvp(const XrView& leftView, const XrView& rightView,

@@ -47,6 +47,11 @@ struct VulkanGraphicsPipelineDesc
     float depthBiasSlopeFactor = 0.0f;
     float depthBiasConstantFactor = 0.0f;
     bool supportsAlphaTest = false;
+    bool supportsDiscardSpecialization = false;
+    bool fragmentDiscardEnabled = true;
+    bool simpleDecalMode = false;
+    bool supportsStereoTransform = false;
+    bool multiview = false;
     bool supportsStage1Combine = false;
     bool supportsStage0Combine = false;
     bool hasSecondaryColor = false;
@@ -76,6 +81,7 @@ struct VulkanGraphicsPipelineDesc
     uint32_t stage3AlphaArg = 0x0a1u;
     uint32_t stage3Constant = 0xffffffffu;
     bool stage3UsesTexCoord1 = true;
+    bool directionalLightmap = false;
     std::array<VulkanPipelineTextureStage, 4> stages4To7{};
     bool supportsWireframe = false;
     bool dynamicStencil = false;
@@ -101,6 +107,10 @@ private:
     VulkanContext* m_context = nullptr;
     PFN_vkCreateGraphicsPipelines m_createGraphicsPipelines = nullptr;
     PFN_vkDestroyPipeline m_destroyPipeline = nullptr;
+    PFN_vkCreatePipelineCache m_createPipelineCache = nullptr;
+    PFN_vkDestroyPipelineCache m_destroyPipelineCache = nullptr;
+    PFN_vkGetPipelineCacheData m_getPipelineCacheData = nullptr;
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
     char m_lastError[256]{};
     VkResult m_lastResult = VK_SUCCESS;
 };

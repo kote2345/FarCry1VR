@@ -1,4 +1,8 @@
 #version 450
+#extension GL_EXT_multiview : require
+#extension GL_GOOGLE_include_directive : require
+// Multipass depth equality requires identical clip positions across variants.
+invariant gl_Position;
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec4 inColor;
@@ -18,6 +22,7 @@ layout(location = 7) out vec4 objectLightPositionRadius;
 layout(location = 8) out vec4 lightColorAmbient;
 layout(location = 9) out vec3 clipPosition;
 layout(location = 11) out vec3 projectorDirection;
+layout(location = 15) out vec3 stockSeparateSpecular;
 layout(push_constant) uniform SceneTransform {
     mat4 mvp;
     vec4 uv0Row0;
@@ -25,12 +30,13 @@ layout(push_constant) uniform SceneTransform {
     vec4 objectLightPositionRadius;
     vec4 lightColorAmbient;
 } transformData;
+#include "scene_stereo.glsl"
 void main() {
+    stockSeparateSpecular = vec3(0.0);
     clipPosition = inPosition;
     projectorDirection = inPosition - transformData.objectLightPositionRadius.xyz;
-    vec3 uv = vec3(inTexCoord, 1.0);
-    texCoord = vec2(dot(transformData.uv0Row0.xyz, uv), dot(transformData.uv0Row1.xyz, uv));
-    gl_Position = transformData.mvp * vec4(inPosition, 1.0);
+    texCoord = inTexCoord;
+    gl_Position = stockStereoMvp() * vec4(inPosition, 1.0);
     vertexColor = inColor;
     secondaryColor = inSecondaryColor;
     objectPosition = inPosition;

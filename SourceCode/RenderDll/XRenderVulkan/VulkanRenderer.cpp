@@ -5,6 +5,9 @@
 #include "VulkanTextureDecode.h"
 #include "../../CryCommon/CryHeaders.h"
 #include "../../CryCommon/ICryAnimation.h"
+#include "../../CryCommon/IStatObj.h"
+#include <IEntityRenderState.h>
+#include "I3DEngine.h"
 #include "../../CryCommon/CREOcLeaf.h"
 #include "../Common/RendElements/CREBeam.h"
 #include "../../CryCommon/CREPolyMesh.h"
@@ -12,19 +15,29 @@
 #include "../Common/RendElements/CREFlares.h"
 #include "../../CryCommon/CRETriMeshShadow.h"
 #include "../../CryCommon/LeafBuffer.h"
+#include "../Common/Shadow_Renderer.h"
 #include "../Common/NvTriStrip/NvTriStrip.h"
 #include <array>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <deque>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace
 {
+// Dynamic-light passes complement the baked lightmap path, as they do in the
+// stock OpenGL renderer. Their Vulkan implementation uses the translated
+// stock lighting path below, including DLF_LM specular occlusion sampling.
+constexpr bool kVulkanDynamicLightingEnabled = true;
+
 float g_vulkanPolygonOffsetFactor = -1.0f;
 float g_vulkanPolygonOffsetUnits = -4.0f;
 int g_vulkanClipPlanes = 1;
+int g_vulkanAudit = 0;
 
 const uint16_t g_vulkanFlareIndices[54] = {
     0, 4, 5, 0, 5, 6, 0, 6, 7, 0, 7, 1,
@@ -133,6 +146,54 @@ bool DecodeSpecialTexture(ETEX_Format format, const byte* pixels, size_t pixelCo
         return false;
 
     rgba.resize(pixelCount * 4);
+    const auto encodeSignedNormal = [](float value)
+    {
+        const float normalized = value < -1.0f ? -1.0f : (value > 1.0f ? 1.0f : value);
+        return static_cast<uint8_t>(std::lround((normalized * 0.5f + 0.5f) * 255.0f));
+    };
+    if (format == eTF_SIGNED_HILO8 || format == eTF_V8U8 ||
+        format == eTF_SIGNED_HILO16 || format == eTF_V16U16)
+    {
+        const bool use16Bit = format == eTF_SIGNED_HILO16 || format == eTF_V16U16;
+        for (size_t i = 0; i < pixelCount; ++i)
+        {
+            float x, y;
+            if (use16Bit)
+            {
+                int16_t pair[2]{};
+                std::memcpy(pair, pixels + i * sizeof(pair), sizeof(pair));
+                x = std::max(-1.0f, static_cast<float>(pair[0]) / 32767.0f);
+                y = std::max(-1.0f, static_cast<float>(pair[1]) / 32767.0f);
+            }
+            else
+            {
+                const int8_t* pair = reinterpret_cast<const int8_t*>(pixels + i * 2);
+                x = std::max(-1.0f, static_cast<float>(pair[0]) / 127.0f);
+                y = std::max(-1.0f, static_cast<float>(pair[1]) / 127.0f);
+            }
+            const float z = std::sqrt(std::max(0.0f, 1.0f - x * x - y * y));
+            rgba[i * 4 + 0] = encodeSignedNormal(x);
+            rgba[i * 4 + 1] = encodeSignedNormal(y);
+            rgba[i * 4 + 2] = encodeSignedNormal(z);
+            rgba[i * 4 + 3] = 255;
+        }
+        return true;
+    }
+    if (format == eTF_SIGNED_RGB8)
+    {
+        const int8_t* source = reinterpret_cast<const int8_t*>(pixels);
+        for (size_t i = 0; i < pixelCount; ++i)
+        {
+            rgba[i * 4 + 0] = encodeSignedNormal(std::max(-1.0f,
+                static_cast<float>(source[i * 3 + 0]) / 127.0f));
+            rgba[i * 4 + 1] = encodeSignedNormal(std::max(-1.0f,
+                static_cast<float>(source[i * 3 + 1]) / 127.0f));
+            rgba[i * 4 + 2] = encodeSignedNormal(std::max(-1.0f,
+                static_cast<float>(source[i * 3 + 2]) / 127.0f));
+            rgba[i * 4 + 3] = 255;
+        }
+        return true;
+    }
     if (format == eTF_RGB8 || format == eTF_0088)
     {
         for (size_t i = 0; i < pixelCount; ++i)
@@ -163,13 +224,14 @@ bool DecodeSpecialTexture(ETEX_Format format, const byte* pixels, size_t pixelCo
         uint8_t r, g, b, a = 255;
         if (format == eTF_4444)
         {
-            // Match the legacy GL conversion in GLTextures.cpp: its packed
-            // byte order is R/G followed by B/A, with the nibble in the high
-            // four bits of each expanded channel.
-            r = static_cast<uint8_t>((packed & 0x000fu) << 4);
-            g = static_cast<uint8_t>((packed & 0x00f0u));
-            b = static_cast<uint8_t>((packed & 0x0f00u) >> 4);
-            a = static_cast<uint8_t>((packed & 0xf000u) >> 8);
+            // SOcclusionMapTexel stores B/G/R/A in successive low-to-high
+            // nibbles. GLTextures uploads those bytes as GL_BGRA, so the
+            // texture's sampled RGBA order is R/G/B/A. Expand each nibble
+            // with *17 so R8G8B8A8 sampling matches normalized GL_RGBA4.
+            r = static_cast<uint8_t>(((packed >> 8) & 0x0fu) * 17u);
+            g = static_cast<uint8_t>(((packed >> 4) & 0x0fu) * 17u);
+            b = static_cast<uint8_t>((packed & 0x0fu) * 17u);
+            a = static_cast<uint8_t>(((packed >> 12) & 0x0fu) * 17u);
         }
         else if (format == eTF_0565)
         {
@@ -199,6 +261,109 @@ bool DecodeSpecialTexture(ETEX_Format format, const byte* pixels, size_t pixelCo
     return true;
 }
 
+size_t VulkanTexturePixelSize(ETEX_Format format, ETexType textureType)
+{
+    if (textureType == eTT_DSDTBump)
+        return (format == eTF_DSDT_MAG || format == eTF_8888 || format == eTF_RGBA) ? 4u : 0u;
+    switch (format)
+    {
+    case eTF_Index:
+    case eTF_8888:
+    case eTF_RGBA:
+        return 4u;
+    case eTF_SIGNED_HILO16:
+    case eTF_V16U16:
+        return 4u;
+    case eTF_0888:
+    case eTF_RGB8:
+    case eTF_SIGNED_RGB8:
+        return 3u;
+    case eTF_8000:
+        return 1u;
+    case eTF_0565:
+    case eTF_0555:
+    case eTF_1555:
+    case eTF_4444:
+    case eTF_SIGNED_HILO8:
+    case eTF_V8U8:
+    case eTF_0088:
+        return 2u;
+    default:
+        return 0u;
+    }
+}
+
+bool DecodeVulkanUncompressedTextureMip(ETEX_Format format, ETexType textureType,
+                                        const byte* pixels, uint32_t width,
+                                        uint32_t height, std::vector<uint8_t>& rgba)
+{
+    if (!pixels || !width || !height)
+        return false;
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    rgba.resize(pixelCount * 4);
+    if (textureType == eTT_DSDTBump)
+    {
+        // CTexMan::LoadFromImage changes DDS_DSDT to DDS_RGBA8 while retaining
+        // FIM_DSDT. GenerateNormalMap preserves those packed signed bytes,
+        // so UploadImage passes eTF_8888 with eTT_DSDTBump. OpenGL chooses
+        // GL_DSDT_MAG_NV from the texture type, not the image format.
+        if (format != eTF_DSDT_MAG && format != eTF_8888 && format != eTF_RGBA)
+            return false;
+        for (size_t i = 0; i < pixelCount; ++i)
+        {
+            for (size_t channel = 0; channel < 3; ++channel)
+            {
+                const int signedValue = static_cast<int>(
+                    reinterpret_cast<const signed char*>(pixels)[i * 4 + channel]);
+                rgba[i * 4 + channel] = static_cast<uint8_t>(signedValue + 128);
+            }
+            rgba[i * 4 + 3] = 255;
+        }
+        return true;
+    }
+    if (format == eTF_0565 || format == eTF_0555 || format == eTF_1555 ||
+        format == eTF_4444 || format == eTF_SIGNED_HILO8 || format == eTF_V8U8 ||
+        format == eTF_SIGNED_HILO16 || format == eTF_V16U16 ||
+        format == eTF_SIGNED_RGB8 || format == eTF_RGB8 || format == eTF_0088)
+        return DecodeSpecialTexture(format, pixels, pixelCount, rgba);
+
+    for (size_t i = 0; i < pixelCount; ++i)
+    {
+        switch (format)
+        {
+        case eTF_Index:
+        case eTF_8888:
+            // Indexed images have already been expanded to BGRA by TexMan.
+            rgba[i * 4 + 0] = pixels[i * 4 + 2];
+            rgba[i * 4 + 1] = pixels[i * 4 + 1];
+            rgba[i * 4 + 2] = pixels[i * 4 + 0];
+            rgba[i * 4 + 3] = pixels[i * 4 + 3];
+            break;
+        case eTF_RGBA:
+            // XRenderOGL uploads this engine format with GL_BGRA_EXT. Match
+            // the sampled Vulkan RGBA order instead of copying the bytes.
+            rgba[i * 4 + 0] = pixels[i * 4 + 2];
+            rgba[i * 4 + 1] = pixels[i * 4 + 1];
+            rgba[i * 4 + 2] = pixels[i * 4 + 0];
+            rgba[i * 4 + 3] = pixels[i * 4 + 3];
+            break;
+        case eTF_0888:
+            rgba[i * 4 + 0] = pixels[i * 3 + 2];
+            rgba[i * 4 + 1] = pixels[i * 3 + 1];
+            rgba[i * 4 + 2] = pixels[i * 3 + 0];
+            rgba[i * 4 + 3] = 255;
+            break;
+        case eTF_8000:
+            rgba[i * 4 + 0] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = 255;
+            rgba[i * 4 + 3] = pixels[i];
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
 bool HasStockVertexNormal(int format)
 {
     // Legacy eVertexFormat values containing a normal; keep aligned with
@@ -220,8 +385,30 @@ public:
         m_callbacks = callbacks;
     }
 
+    void RemoveFromHash(int id, STexPic* texture) override
+    {
+        // Called when STexPic is actually released, after its reference
+        // count has reached zero. A RemoveTexture request alone is not proof
+        // that shared particle/material images can be destroyed.
+        if (m_callbacks.releaseMirroredTexture)
+            m_callbacks.releaseMirroredTexture(m_callbacks.drawUserData, id);
+        CNULLTexMan::RemoveFromHash(id, texture);
+    }
+
     void SetFilterOverride(int filterMode) { m_filterOverride = filterMode; }
     void ClearFilterOverride() { m_filterOverride = -1; }
+    bool UpdateGlobalFilter(CryVR::VulkanFrameRenderer* renderer, int mode, float anisotropy)
+    {
+        m_defaultFilter = mode;
+        bool result = true;
+        for (int index = 0; index < m_Textures.Num(); ++index)
+        {
+            STexPic* texture = m_Textures[index];
+            if (texture && texture->m_bBusy && !(texture->m_Flags & FT_NOMIPS))
+                result = renderer->SetLegacyTextureFilter(texture->m_Bind, mode, anisotropy) && result;
+        }
+        return result;
+    }
 
     struct CubeUpload
     {
@@ -291,84 +478,125 @@ protected:
             case FT2_FILTER_TRILINEAR:
                 filterMode = eVTF_Trilinear; break;
             case FT2_FILTER_ANISOTROPIC: filterMode = eVTF_Anisotropic; break;
-            default: filterMode = anisotropy > 1.0f ? eVTF_Anisotropic : eVTF_Trilinear; break;
+            default:
+                // STexPic::SetFilter uses GL_LINEAR for an unqualified
+                // FT_NOMIPS image regardless of the global mip/aniso setting.
+                filterMode = (flags & FT_NOMIPS) ? eVTF_Linear :
+                    (anisotropy > 1.0f ? eVTF_Anisotropic : m_defaultFilter);
+                break;
             }
         }
 
         const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
         std::vector<unsigned char> rgba(pixelCount * 4);
-        if (textureType == eTT_DSDTBump)
+        std::vector<std::vector<uint8_t>> decodedMipLevels;
+        // CTexMan expands mipmapped 24-bit payloads to BGRA before it calls
+        // the renderer, while a single-level eTF_0888 upload stays packed BGR.
+        const ETEX_Format decodedFormat = format == eTF_0888 &&
+            (flags & FT_HASMIPS) ? eTF_8888 : format;
+        if (format == eTF_DXT1 || format == eTF_DXT3 || format == eTF_DXT5)
         {
-            // CryEngine's eTF_DSDT_MAG payload is four signed bytes per
-            // texel. The legacy GL_DSDT_MAG upload converts its first three
-            // values to signed floating point; encode those signed values in
-            // UNORM8 around 0.5 so a Vulkan shader can recover them with
-            // sample.rgb * 2 - 1. The fourth source byte is not part of the
-            // sampled DSDT vector.
-            if (format != eTF_DSDT_MAG)
-                return texture;
-            for (size_t i = 0; i < pixelCount; ++i)
+            const bool dxt1 = format == eTF_DXT1;
+            const bool dxt3 = format == eTF_DXT3;
+            const bool dxt5 = format == eTF_DXT5;
+            const size_t blockBytes = dxt1 ? 8u : 16u;
+            int sourceMipCount = (flags & FT_NOMIPS) ? 1 : texture->m_nMips;
+            if (sourceMipCount < 1)
+                sourceMipCount = 1;
+            int maxMipCount = 1;
+            for (int mipWidth = width, mipHeight = height;
+                 mipWidth > 1 || mipHeight > 1;
+                 mipWidth = mipWidth > 1 ? mipWidth / 2 : 1,
+                 mipHeight = mipHeight > 1 ? mipHeight / 2 : 1)
+                ++maxMipCount;
+            if (sourceMipCount > maxMipCount)
+                sourceMipCount = maxMipCount;
+            if (sourceMipCount > 1 && dxtSize <= 0)
+                sourceMipCount = 1;
+            size_t sourceOffset = 0;
+            int mipWidth = width;
+            int mipHeight = height;
+            for (int level = 0; level < sourceMipCount; ++level)
             {
-                for (size_t channel = 0; channel < 3; ++channel)
+                const size_t levelBytes =
+                    static_cast<size_t>((mipWidth + 3) / 4) *
+                    static_cast<size_t>((mipHeight + 3) / 4) * blockBytes;
+                if (dxtSize > 0 && sourceOffset + levelBytes > static_cast<size_t>(dxtSize))
                 {
-                    const int signedValue = static_cast<int>(
-                        reinterpret_cast<const signed char*>(pixels)[i * 4 + channel]);
-                    rgba[i * 4 + channel] = static_cast<unsigned char>(signedValue + 128);
+                    if (level == 0)
+                        return texture;
+                    break;
                 }
-                rgba[i * 4 + 3] = 255;
+                std::vector<uint8_t> decoded(static_cast<size_t>(mipWidth) * mipHeight * 4);
+                if (!DecodeVulkanDxtBaseLevel(pixels + sourceOffset, mipWidth, mipHeight,
+                                              dxt1, dxt3, dxt5, decoded))
+                    return texture;
+                if (level == 0)
+                    rgba = decoded;
+                decodedMipLevels.push_back(std::move(decoded));
+                sourceOffset += levelBytes;
+                mipWidth = mipWidth > 1 ? mipWidth / 2 : 1;
+                mipHeight = mipHeight > 1 ? mipHeight / 2 : 1;
             }
         }
-        else if (format == eTF_DXT1 || format == eTF_DXT3 || format == eTF_DXT5)
+        else if (!DecodeVulkanUncompressedTextureMip(decodedFormat, textureType,
+                                                     pixels, static_cast<uint32_t>(width),
+                                                     static_cast<uint32_t>(height), rgba))
+            return texture;
+
+        if (decodedMipLevels.empty() && textureType != eTT_Cubemap &&
+            format != eTF_DXT1 && format != eTF_DXT3 && format != eTF_DXT5)
         {
-            if (!DecodeVulkanDxtBaseLevel(pixels, width, height,
-                                          format == eTF_DXT1,
-                                          format == eTF_DXT3,
-                                          format == eTF_DXT5, rgba))
-                return texture;
-        }
-        else if (format == eTF_0565 || format == eTF_0555 ||
-                 format == eTF_1555 || format == eTF_4444 ||
-                 format == eTF_RGB8 || format == eTF_0088)
-        {
-            if (!DecodeSpecialTexture(format, pixels, pixelCount, rgba))
-                return texture;
-        }
-        else
-        for (size_t i = 0; i < pixelCount; ++i)
-        {
-            switch (format)
+            int sourceMipCount = (flags & FT_NOMIPS) ? 1 : texture->m_nMips;
+            if (sourceMipCount < 1)
+                sourceMipCount = 1;
+            int maxMipCount = 1;
+            for (int mipWidth = width, mipHeight = height;
+                 mipWidth > 1 || mipHeight > 1;
+                 mipWidth = mipWidth > 1 ? mipWidth / 2 : 1,
+                 mipHeight = mipHeight > 1 ? mipHeight / 2 : 1)
+                ++maxMipCount;
+            if (sourceMipCount > maxMipCount)
+                sourceMipCount = maxMipCount;
+            const size_t bytesPerPixel = VulkanTexturePixelSize(decodedFormat, textureType);
+            if (sourceMipCount > 1 && bytesPerPixel)
             {
-            case eTF_Index:
-                // CTexMan::UploadImage expands indexed GIF/PCX/BMP data with
-                // FillBGRA_8to32 before it calls CreateTexture; the payload at
-                // this backend boundary is therefore BGRA8, not palette indices.
-                rgba[i * 4 + 0] = pixels[i * 4 + 2];
-                rgba[i * 4 + 1] = pixels[i * 4 + 1];
-                rgba[i * 4 + 2] = pixels[i * 4 + 0];
-                rgba[i * 4 + 3] = pixels[i * 4 + 3];
-                break;
-            case eTF_8888:
-                rgba[i * 4 + 0] = pixels[i * 4 + 2];
-                rgba[i * 4 + 1] = pixels[i * 4 + 1];
-                rgba[i * 4 + 2] = pixels[i * 4 + 0];
-                rgba[i * 4 + 3] = pixels[i * 4 + 3];
-                break;
-            case eTF_RGBA:
-                memcpy(&rgba[i * 4], &pixels[i * 4], 4);
-                break;
-            case eTF_0888:
-                rgba[i * 4 + 0] = pixels[i * 3 + 2];
-                rgba[i * 4 + 1] = pixels[i * 3 + 1];
-                rgba[i * 4 + 2] = pixels[i * 3 + 0];
-                rgba[i * 4 + 3] = 255;
-                break;
-            case eTF_8000:
-                rgba[i * 4 + 0] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = 255;
-                rgba[i * 4 + 3] = pixels[i];
-                break;
-            default:
-                return texture;
+                decodedMipLevels.reserve(static_cast<size_t>(sourceMipCount));
+                decodedMipLevels.push_back(rgba);
+                size_t sourceOffset = pixelCount * bytesPerPixel;
+                int mipWidth = width > 1 ? width / 2 : 1;
+                int mipHeight = height > 1 ? height / 2 : 1;
+                bool allSourceMipsDecoded = true;
+                for (int level = 1; level < sourceMipCount; ++level)
+                {
+                    std::vector<uint8_t> decoded;
+                    if (!DecodeVulkanUncompressedTextureMip(
+                            decodedFormat, textureType, pixels + sourceOffset,
+                            static_cast<uint32_t>(mipWidth),
+                            static_cast<uint32_t>(mipHeight), decoded))
+                    {
+                        allSourceMipsDecoded = false;
+                        break;
+                    }
+                    decodedMipLevels.push_back(std::move(decoded));
+                    sourceOffset += static_cast<size_t>(mipWidth) * mipHeight * bytesPerPixel;
+                    mipWidth = mipWidth > 1 ? mipWidth / 2 : 1;
+                    mipHeight = mipHeight > 1 ? mipHeight / 2 : 1;
+                }
+                if (!allSourceMipsDecoded)
+                    decodedMipLevels.clear();
             }
+        }
+
+        // GL stores FT_FONT as GL_ALPHA8: sampled RGB is always white.
+        // Preserve the incoming alpha atlas even when the source has four channels.
+        if (flags & FT_FONT)
+        {
+            for (size_t i = 0; i < pixelCount; ++i)
+                rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = 255;
+            for (auto& mip : decodedMipLevels)
+                for (size_t i = 0; i < mip.size(); i += 4)
+                    mip[i] = mip[i + 1] = mip[i + 2] = 255;
         }
 
         if (textureType == eTT_Cubemap)
@@ -415,20 +643,78 @@ protected:
             return texture;
         }
 
-        const bool mirrored = m_callbacks.mirrorRgbaTexture(
-            m_callbacks.drawUserData, static_cast<int>(texture->m_Bind),
-            static_cast<unsigned int>(width), static_cast<unsigned int>(height),
-            rgba.data(), (flags & FT_CLAMP) || (flags2 & FT2_UCLAMP),
-            (flags & FT_CLAMP) || (flags2 & FT2_VCLAMP),
-            ((flags & FT_DYNAMIC) != 0 || (flags & FT_FONT) != 0),
-            (flags & FT_NOMIPS) != 0, filterMode, anisotropy);
+        const bool clampU = (flags & FT_CLAMP) || (flags2 & FT2_UCLAMP);
+        const bool clampV = (flags & FT_CLAMP) || (flags2 & FT2_VCLAMP);
+        bool mirrored = false;
+        if (decodedMipLevels.size() > 1 && m_callbacks.mirrorRgbaTextureMipChain)
+        {
+            std::vector<const unsigned char*> mipPointers;
+            mipPointers.reserve(decodedMipLevels.size());
+            for (const std::vector<uint8_t>& mip : decodedMipLevels)
+                mipPointers.push_back(mip.data());
+            mirrored = m_callbacks.mirrorRgbaTextureMipChain(
+                m_callbacks.drawUserData, static_cast<int>(texture->m_Bind),
+                static_cast<unsigned int>(width), static_cast<unsigned int>(height),
+                mipPointers.data(), static_cast<unsigned int>(mipPointers.size()),
+                clampU, clampV, filterMode, anisotropy);
+        }
+        else
+            mirrored = m_callbacks.mirrorRgbaTexture(
+                m_callbacks.drawUserData, static_cast<int>(texture->m_Bind),
+                static_cast<unsigned int>(width), static_cast<unsigned int>(height),
+                rgba.data(), clampU, clampV,
+                ((flags & FT_DYNAMIC) != 0 || (flags & FT_FONT) != 0),
+                (flags & FT_NOMIPS) != 0, filterMode, anisotropy);
         if (mirrored)
+        {
             texture->m_Size = static_cast<int>(pixelCount * 4);
+#if defined(__ANDROID__)
+            // Bounded upload snapshots for the two reported materials. This
+            // records the actual decoded image, not a guessed shader output.
+            static bool rayImageCaptured = false, boneImageCaptured = false;
+            const bool rayImage = (name && (strstr(name, "sun_rays_textureb") ||
+                strstr(name, "sun_rays_textureB"))) ||
+                strstr(texture->m_SourceName.c_str(), "sun_rays_textureb") ||
+                strstr(texture->m_SourceName.c_str(), "sun_rays_textureB") ||
+                strstr(texture->m_SearchName.c_str(), "sun_rays_textureb") ||
+                strstr(texture->m_SearchName.c_str(), "sun_rays_textureB");
+            const bool boneImage = (name && strstr(name, "skeleton.dds")) ||
+                strstr(texture->m_SourceName.c_str(), "skeleton.dds") ||
+                strstr(texture->m_SearchName.c_str(), "skeleton.dds");
+            bool* captured = rayImage ? &rayImageCaptured : (boneImage ? &boneImageCaptured : nullptr);
+            if (captured && !*captured && rgba.size() <= 1024u * 1024u)
+            {
+                FILE* probe = fopen(rayImage ? "/sdcard/FarCry/vulkan_ray_texture.rgba" :
+                    "/sdcard/FarCry/vulkan_bone_texture.rgba", "wb");
+                if (probe)
+                {
+                    const uint32_t header[] = {static_cast<uint32_t>(width),
+                        static_cast<uint32_t>(height), static_cast<uint32_t>(decodedFormat)};
+                    fwrite(header, sizeof(header), 1, probe);
+                    fwrite(rgba.data(), rgba.size(), 1, probe);
+                    fclose(probe);
+                    *captured = true;
+                }
+            }
+#endif
+            if (g_vulkanAudit)
+            {
+                uint32_t checksum = 2166136261u;
+                for (unsigned char value : rgba)
+                    checksum = (checksum ^ value) * 16777619u;
+                CryLogAlways("Vulkan audit TEXTURE_UPLOAD id=%u name=%s sourceFormat=%d decodedFormat=%d type=%d size=%dx%d mips=%u flags=0x%x rgba0=(%u,%u,%u,%u) checksum=0x%x",
+                    texture->m_Bind, texture->m_SearchName.c_str(), static_cast<int>(format),
+                    static_cast<int>(decodedFormat), static_cast<int>(textureType), width, height,
+                    static_cast<unsigned int>(decodedMipLevels.size()), flags,
+                    rgba[0], rgba[1], rgba[2], rgba[3], checksum);
+            }
+        }
         return texture;
     }
 
 private:
     SVulkanBufferCallbacks m_callbacks;
+    int m_defaultFilter = eVTF_Trilinear;
     std::map<std::string, CubeUpload> m_cubeUploads;
     int m_filterOverride = -1;
 };
@@ -441,12 +727,20 @@ public:
     {
         SetType(R_VULKAN_RENDERER);
         m_nFrameUpdateID = m_nFrameID;
+        // CGLRenderer starts every frame with depth writes enabled. This
+        // renderer derives from CNULLRenderer, whose constructor does not
+        // initialize m_CurState, but Vulkan uses that cache to construct the
+        // first immutable pipeline as well as to resolve inherited pass bits.
+        m_CurState = GS_DEPTHWRITE;
         // GLRendPipeline::EF_PipelineInit starts texture-environment color at
         // opaque white. Keep the NULL-backed renderer's equivalent state in
         // sync before the first Vulkan draw.
         m_RP.m_CurGlobalColor.dcolor = 0xffffffffu;
         if (iConsole)
         {
+            if (!iConsole->GetCVar("GL_TextureFilter"))
+                iConsole->CreateVariable("GL_TextureFilter", "GL_LINEAR_MIPMAP_LINEAR", 0,
+                    "Texture minification/magnification filter, using the stock OpenGL mode names.");
             if (!iConsole->GetCVar("GL_OffsetFactor"))
                 iConsole->Register("GL_OffsetFactor", &g_vulkanPolygonOffsetFactor, -1.0f);
             if (!iConsole->GetCVar("GL_OffsetUnits"))
@@ -456,16 +750,20 @@ public:
             if (!iConsole->GetCVar("GL_ClipPlanes"))
                 iConsole->Register("GL_ClipPlanes", &g_vulkanClipPlanes, 1);
             m_clipPlanesCVar = iConsole->GetCVar("GL_ClipPlanes");
+            if (!iConsole->GetCVar("r_VulkanAudit"))
+                iConsole->Register("r_VulkanAudit", &g_vulkanAudit, 0);
         }
         // Advertise the shader/material capabilities the Vulkan translation
         // actually consumes so CryEngine's shader parser selects its high-end
-        // NV4X/PS3-era material descriptions. Do not advertise depth-map or
-        // self-shadow support here: those OpenGL passes still need a Vulkan
-        // shadow-map implementation. The Vulkan texture manager decodes DXT
-        // itself, so preserve compressed DDS data for upload.
+        // NV4X/PS3-era material descriptions. Depth maps have a Vulkan caster
+        // pass and receiver comparison path, so expose RFT_DEPTHMAPS: CryEngine
+        // uses it to retain DEPTHMAP material branches and build the matching
+        // caster lists. Keep self-shadowing disabled; its separate OpenGL
+        // semantics are not implemented. The Vulkan texture manager decodes
+        // DXT itself, so preserve compressed DDS data for upload.
         m_Features = RFT_HW_NV4X | RFT_HW_VS | RFT_HW_PS20 | RFT_HW_PS30 |
             RFT_MULTITEXTURE | RFT_BUMP | RFT_ALLOWSECONDCOLOR |
-            RFT_COMPRESSTEXTURE;
+            RFT_COMPRESSTEXTURE | RFT_DEPTHMAPS | RFT_RGBA;
         delete m_TexMan;
         m_vulkanTexMan = new CVulkanTexMan;
         m_TexMan = m_vulkanTexMan;
@@ -485,9 +783,13 @@ public:
 
     void ClearColorBuffer(const Vec3d color) override
     {
-        CNULLRenderer::ClearColorBuffer(color);
-        if (m_frameRenderer)
-            m_frameRenderer->SetStockClearColor(color.x, color.y, color.z);
+        const float rgba[4] = { color.x, color.y, color.z, 1.0f };
+        if (m_frameOpen && m_frameRenderer)
+        {
+            if (m_frameRenderer->QueueStockClear(true, false, false, rgba))
+                m_bWasCleared = true;
+            else m_frameRenderer->RequirePanelFallback();
+        }
     }
 
     void ClearDepthBuffer() override
@@ -495,8 +797,11 @@ public:
         CNULLRenderer::ClearDepthBuffer();
         // Match the stock GL side effect as well as the ordered attachment clear.
         EF_SetState(GS_DEPTHWRITE);
-        if (m_frameOpen && m_frameRenderer && !m_frameRenderer->QueueStockClearDepth())
-            m_frameRenderer->RequirePanelFallback();
+        if (m_frameOpen && m_frameRenderer)
+        {
+            if (m_frameRenderer->QueueStockClearDepth()) m_bWasCleared = true;
+            else m_frameRenderer->RequirePanelFallback();
+        }
     }
 
     void SetCamera(const CCamera& camera) override
@@ -519,6 +824,86 @@ public:
     {
         CNULLRenderer::SetPerspective(camera);
         UpdateLegacyProjection(camera);
+    }
+
+    uint LoadTexture(const char* filename, int* textureType = nullptr,
+                     unsigned int defaultId = 0, bool compressToDisk = false,
+                     bool warn = true) override
+    {
+        // Match GL_Renderer.cpp; CNULLRenderer always returns Textures/red.
+        ITexPic* image = EF_LoadTexture(filename, FT_NOREMOVE, 0, eTT_Base,
+            -1, -1, defaultId ? static_cast<int>(defaultId) : -1);
+        return image && image->IsTextureLoaded() ? image->GetTextureID() : 0;
+    }
+
+    int LoadAnimatedTexture(const char* filename, const int count) override
+    {
+        if (!filename || !filename[0] || count < 1) return 0;
+        for (int i = 0; i < m_LoadedAnimatedTextures.Count(); ++i)
+        {
+            AnimTexInfo* info = m_LoadedAnimatedTextures[i];
+            if (!strcmp(info->sName, filename) && info->nFramesCount == count)
+            {
+                ++info->nRefCounter;
+                return i + 1;
+            }
+        }
+        std::string frameFormat(filename);
+        int firstFrame = 0;
+        if (frameFormat.find('%') == std::string::npos)
+        {
+            const size_t extension = frameFormat.find_last_of('.');
+            const size_t slash = frameFormat.find_last_of("/\\");
+            if (extension == std::string::npos ||
+                (slash != std::string::npos && extension < slash)) return 0;
+            size_t digits = extension;
+            while (digits > 0 && frameFormat[digits - 1] >= '0' && frameFormat[digits - 1] <= '9') --digits;
+            if (digits < extension)
+            {
+                firstFrame = atoi(frameFormat.c_str() + digits);
+                char format[32];
+                snprintf(format, sizeof(format), "%%0%ud", static_cast<unsigned int>(extension - digits));
+                frameFormat.replace(digits, extension - digits, format);
+            }
+        }
+        AnimTexInfo* info = new AnimTexInfo();
+        info->pBindIds = new int[count]();
+        info->nFramesCount = 0;
+        snprintf(info->sName, sizeof(info->sName), "%s", filename);
+        for (int frame = 0; frame < count; ++frame)
+        {
+            char name[1024];
+            snprintf(name, sizeof(name), frameFormat.c_str(), firstFrame + frame);
+            const int id = LoadTexture(name);
+            if (!id) break;
+            info->pBindIds[info->nFramesCount++] = id;
+        }
+        if (!info->nFramesCount)
+        {
+            delete[] info->pBindIds;
+            delete info;
+            return 0;
+        }
+        info->nRefCounter = 1;
+        m_LoadedAnimatedTextures.Add(info);
+        return m_LoadedAnimatedTextures.Count();
+    }
+
+    int GenerateAlphaGlowTexture(float k) override
+    {
+        // Same radial alpha as OpenGL's generated particle glow.
+        const int size = 256;
+        std::vector<byte> alpha(size * size);
+        for (int y = 0; y < size; ++y)
+            for (int x = 0; x < size; ++x)
+            {
+                const float dx = static_cast<float>(x - size / 2);
+                const float dy = static_cast<float>(y - size / 2);
+                alpha[y * size + x] = static_cast<byte>(clamp_tpl(
+                    k * 2.0f * (size / 2 - sqrtf(dx * dx + dy * dy)), 0.0f, 255.0f));
+            }
+        return DownLoadToVideoMemory(alpha.data(), size, size, eTF_8000,
+            eTF_8000, false, false, FILTER_LINEAR, 0, nullptr, 0);
     }
 
     IShader* EF_LoadShader(const char* name, EShClass shaderClass, int flags = 0,
@@ -569,6 +954,36 @@ public:
             m_frameRenderer->SetStockViewport(x, y, width, height, logicalWidth, logicalHeight);
         }
         CNULLRenderer::SetViewport(x, y, width, height);
+    }
+
+    void ProjectToScreen(float x, float y, float z,
+                         float* screenX, float* screenY, float* screenZ) override
+    {
+        if (!screenX || !screenY || !screenZ) return;
+        // Match GLHelper::gluProject followed by GL_Renderer::ProjectToScreen.
+        // Visibility traversal runs before eye rendering and uses this logical
+        // camera, not an individual XR eye projection or a zero NULL stub.
+        const float point[4] = { x, y, z, 1.0f };
+        float eye[4]{}, clip[4]{};
+        const float* view = m_ViewMatrix.GetData();
+        const float* projection = m_ProjMatrix.GetData();
+        for (int row = 0; row < 4; ++row)
+            for (int column = 0; column < 4; ++column)
+                eye[row] += view[column * 4 + row] * point[column];
+        for (int row = 0; row < 4; ++row)
+            for (int column = 0; column < 4; ++column)
+                clip[row] += projection[column * 4 + row] * eye[column];
+        if (clip[3] == 0.0f) return;
+        const float width = static_cast<float>(GetWidth());
+        const float height = static_cast<float>(GetHeight());
+        if (width <= 0.0f || height <= 0.0f) return;
+        const float viewportWidth = m_VWidth > 0 ? static_cast<float>(m_VWidth) : width;
+        const float viewportHeight = m_VHeight > 0 ? static_cast<float>(m_VHeight) : height;
+        const float windowX = m_VX + (1.0f + clip[0] / clip[3]) * viewportWidth * 0.5f;
+        const float windowY = m_VY + (1.0f + clip[1] / clip[3]) * viewportHeight * 0.5f;
+        *screenX = windowX * 100.0f / width;
+        *screenY = 100.0f - windowY * 100.0f / height;
+        *screenZ = (1.0f + clip[2] / clip[3]) * 0.5f;
     }
 
     void GetModelViewMatrix(float* matrix) override
@@ -633,13 +1048,18 @@ public:
         m_fogDensity = density;
         m_fogStart = fogStart;
         m_fogEnd = fogEnd;
+        m_FS.m_FogDensity = density;
+        m_FS.m_FogStart = fogStart;
+        m_FS.m_FogEnd = fogEnd;
+        m_FS.m_nFogMode = fogMode;
         // CGLRenderer::SetFog only calls glFogi for these two public modes.
         // Any other value leaves GL's previously selected mode in effect
         // (initially GL_EXP), so retain the effective mode here as well.
         if (fogMode == R_FOGMODE_LINEAR || fogMode == R_FOGMODE_EXP2)
             m_fogMode = fogMode;
         for (int i = 0; i < 3; ++i)
-            m_fogColor[i] = color[i];
+            m_fogColor[i] = m_bHeatVision ? 0.0f : color[i];
+        m_FS.m_FogColor = CFColor(m_fogColor[0], m_fogColor[1], m_fogColor[2], 1.0f);
         UpdateVulkanFog();
     }
 
@@ -649,6 +1069,7 @@ public:
             return;
         for (int i = 0; i < 3; ++i)
             m_fogColor[i] = color[i];
+        m_FS.m_FogColor = CFColor(color);
         UpdateVulkanFog();
     }
 
@@ -656,6 +1077,7 @@ public:
     {
         const bool previous = m_fogEnabled;
         m_fogEnabled = enable;
+        m_FS.m_bEnable = enable;
         UpdateVulkanFog();
         return previous;
     }
@@ -682,31 +1104,168 @@ public:
         m_materialColor[1] = green;
         m_materialColor[2] = blue;
         m_materialColor[3] = alpha;
+        // CGLRenderer::SetMaterialColor delegates to EF_SetGlobalColor:
+        // it selects TMU 0 and installs the texture-env constant/arguments.
+        for (int channel = 0; channel < 4; ++channel)
+            m_RP.m_CurGlobalColor.bcolor[channel] = static_cast<byte>(
+                clamp_tpl(m_materialColor[channel], 0.0f, 1.0f) * 255.0f);
+        SelectTMU(0);
+        SetColorOp(255, 255, eCA_Texture | (eCA_Constant << 3),
+                   eCA_Texture | (eCA_Constant << 3));
+    }
+
+    void ResetToDefault() override
+    {
+        SetScissor(0, 0, 0, 0);
+        if (m_RP.m_ClipPlaneWasOverrided == 1)
+        {
+            m_RP.m_ClipPlaneWasOverrided = 0;
+            m_RP.m_ClipPlaneEnabled = 1;
+        }
+        for (int stage = 0; stage < 8; ++stage)
+        {
+            SelectTMU(stage);
+            SetLodBias(CRenderer::CV_r_maxtexlod_bias);
+            SetColorOp(eCO_MODULATE, eCO_MODULATE, 255, 255);
+            // GL disables texture targets above TMU 0, but retains bindings
+            // and combiner arguments. The NULL backend has no target state.
+            if (stage > 0) m_stageTextureIds[stage] = 0;
+        }
+        SelectTMU(0);
+        if (m_TexMan) m_TexMan->m_nCurStages = 1;
+        if (m_frameRenderer) m_frameRenderer->ResetStockTextureOperations();
+        m_CurState = GS_DEPTHWRITE;
+        m_currentCullMode = R_CULL_NONE;
+        m_RP.m_eCull = static_cast<ECull>(-1);
+        m_activePolygonOffset = false;
+        SetMaterialColor(1.0f, 1.0f, 1.0f, 1.0f);
+        m_RP.m_FlagsPerFlush &= ~(RBSI_ALPHAGEN | RBSI_RGBGEN);
+        m_RP.m_PersFlags &= ~(RBPF_PS1NEEDSET | RBPF_TSNEEDSET | RBPF_VSNEEDSET |
+            RBPF_PS1WASSET | RBPF_PS2WASSET | RBPF_TSWASSET | RBPF_VSWASSET |
+            RBPF_WASWORLDSPACE);
+        m_RP.m_FlagsModificators = 0;
+        m_RP.m_CurrentVLights = 0;
+        m_RP.m_LastVP = nullptr;
+        m_RP.m_CurVP = nullptr;
+        m_RP.m_CurPS = nullptr;
+    }
+
+    void UpdateStockGamma(float gamma, float brightness, float contrast)
+    {
+        gamma = clamp_tpl(gamma, 0.5f, 3.0f);
+        if (m_fLastGamma == gamma && m_fLastBrightness == brightness && m_fLastContrast == contrast)
+            return;
+        for (int index = 0; index < 256; ++index)
+            m_GammaTable[index] = static_cast<ushort>(clamp_tpl(static_cast<int>(
+                (contrast + 0.5f) * cry_powf(static_cast<float>(index) / 255.0f, 1.0f / gamma) * 65535.0f +
+                (brightness - 0.5f) * 32768.0f - contrast * 32768.0f + 16384.0f), 0, 65535));
+        m_fLastGamma = gamma;
+        m_fLastBrightness = brightness;
+        m_fLastContrast = contrast;
+        // GLSystem::SetDeviceGamma has no device-ramp operation on Android.
+        // Keep the same display behavior while preserving the CPU gamma state.
+    }
+
+    bool SetGammaDelta(const float gamma) override
+    {
+        m_fDeltaGamma = gamma;
+        UpdateStockGamma(CV_r_gamma + gamma, CV_r_brightness, CV_r_contrast);
+        return true;
     }
 
     void BeginFrame() override
     {
         CNULLRenderer::BeginFrame();
+        // Quest performance preset: this cheat-protected cvar cannot reliably
+        // be changed through launcher commands outside developer mode.
+        if (iConsole)
+        {
+            ICVar* dynamicLight = iConsole->GetCVar("e_dynamic_light");
+            if (dynamicLight && dynamicLight->GetIVal() != 0)
+                dynamicLight->ForceSet("0");
+        }
+        InitializeStockFogTextures();
+        UpdateStockGamma(CV_r_gamma + m_fDeltaGamma, CV_r_brightness, CV_r_contrast);
+        if (CV_r_reloadshaders)
+        {
+            m_cEF.mfReloadAllShaders(CV_r_reloadshaders);
+            CV_r_reloadshaders = 0;
+        }
+        if (CV_r_PolygonMode != m_polygonMode)
+            SetPolygonMode(CV_r_PolygonMode);
+        if (m_frameRenderer && m_vulkanTexMan)
+        {
+            ICVar* filter = iConsole ? iConsole->GetCVar("GL_TextureFilter") : nullptr;
+            const int anisotropy = clamp_tpl(CRenderer::CV_r_texture_anisotropic_level, 1,
+                crymax(1, static_cast<int>(m_frameRenderer->GetStockMaxAnisotropy())));
+            CRenderer::CV_r_texture_anisotropic_level = anisotropy;
+            if (filter && anisotropy > 1 && stricmp(filter->GetString(), "GL_LINEAR_MIPMAP_LINEAR"))
+                filter->Set("GL_LINEAR_MIPMAP_LINEAR");
+            const char* name = filter ? filter->GetString() : "GL_LINEAR_MIPMAP_LINEAR";
+            if (m_lastTextureFilter != name || m_lastTextureAnisotropy != anisotropy)
+            {
+                const char* names[] = { "GL_NEAREST", "GL_LINEAR", "GL_NEAREST_MIPMAP_NEAREST",
+                    "GL_LINEAR_MIPMAP_NEAREST", "GL_NEAREST_MIPMAP_LINEAR", "GL_LINEAR_MIPMAP_LINEAR" };
+                const int modes[] = { eVTF_NearestNoMips, eVTF_Linear, eVTF_Nearest,
+                    eVTF_Bilinear, eVTF_NearestMipLinear, eVTF_Trilinear };
+                for (int index = 0; index < 6; ++index)
+                    if (!stricmp(name, names[index]))
+                    {
+                        if (m_vulkanTexMan->UpdateGlobalFilter(m_frameRenderer,
+                                anisotropy > 1 ? eVTF_Anisotropic : modes[index], static_cast<float>(anisotropy)))
+                        {
+                            m_lastTextureFilter = name;
+                            m_lastTextureAnisotropy = anisotropy;
+                        }
+                        break;
+                    }
+            }
+        }
         // The NULL backend does not advance CryEngine's frame counters or
         // reset shader pipeline state. World visibility caches key off these
         // counters; keeping one ID across frames empties subsequent scenes.
         m_cEF.mfBeginFrame();
         ++m_nFrameID;
         ++m_nFrameUpdateID;
+        m_nPolygons = 0;
+        m_nShadowVolumePolys = 0;
+        m_bWasCleared = false;
+        m_RP.m_RealTime = iTimer ? iTimer->GetCurrTime() : 0.0f;
+        // GL recycles the alternating temporary-mesh pool at frame entry.
+        TArray<CRETempMesh*>* tempMeshes = &m_RP.m_TempMeshes[m_nFrameID & 1];
+        for (int index = 0; index < tempMeshes->Num(); ++index)
+        {
+            CRETempMesh* mesh = tempMeshes->Get(index);
+            if (!mesh) continue;
+            if (mesh->m_VBuffer)
+            {
+                ReleaseBuffer(mesh->m_VBuffer);
+                mesh->m_VBuffer = nullptr;
+            }
+            ReleaseIndexBuffer(&mesh->m_Inds);
+        }
+        tempMeshes->SetUse(0);
+        m_RP.m_CurTempMeshes = tempMeshes;
+        ResetToDefault();
         // CSystem owns the OpenXR frame lifetime. The renderer only records
         // native scene work into that already-acquired frame.
         m_frameOpen = m_frameRenderer != nullptr;
         if (m_frameRenderer)
+        {
+            m_frameRenderer->SetDiagnosticLogging(g_vulkanAudit != 0);
             m_frameRenderer->SetStockDepthRange(0.0f, 1.0f);
+        }
     }
 
     void Draw2dImage(float x, float y, float width, float height, int textureId,
                      float s0, float t0, float s1, float t1, float angle,
                      float red, float green, float blue, float alpha, float) override
     {
+        SelectTMU(0);
+        if (textureId > 0) SetTexture(textureId);
         if (m_frameOpen && m_frameRenderer)
             m_frameRenderer->QueuePanelImage(textureId,
-                ScaleCoordX(x), ScaleCoordY(y), ScaleCoordX(width), ScaleCoordY(height),
+                ScaleCoordX(x), ScaleCoordY(y)-1.0f, ScaleCoordX(width)+1.0f, ScaleCoordY(height)+2.0f,
                 s0, t0, s1, t1,
                 angle, red, green, blue, alpha,
                 static_cast<float>(GetWidth()), static_cast<float>(GetHeight()),
@@ -717,8 +1276,27 @@ public:
                    float s0, float t0, float s1, float t1,
                    float red, float green, float blue, float alpha) override
     {
-        Draw2dImage(x, y, width, height, textureId, s0, t0, s1, t1, 0.0f,
-                    red, green, blue, alpha, 1.0f);
+        if (!m_frameOpen || !m_frameRenderer) return;
+        SelectTMU(0);
+        if (textureId > 0) SetTexture(textureId);
+        // Unlike Draw2dImage, GL's DrawImage uses the current 2D matrix and
+        // unscaled caller coordinates. Keep both its transform and explicit UVs.
+        struct_VERTEX_FORMAT_P3F_COL4UB_TEX2F vertices[4] = {};
+        const float positions[4][2] = {{x,y},{x+width,y},{x+width,y+height},{x,y+height}};
+        const float uvs[4][2] = {{s0,1.0f-t0},{s1,1.0f-t0},{s1,1.0f-t1},{s0,1.0f-t1}};
+        for (int vertex = 0; vertex < 4; ++vertex)
+        {
+            vertices[vertex].xyz = Vec3(positions[vertex][0], positions[vertex][1], 0);
+            vertices[vertex].st[0] = uvs[vertex][0]; vertices[vertex].st[1] = uvs[vertex][1];
+            const float color[4] = {red,green,blue,alpha};
+            for (int channel = 0; channel < 4; ++channel)
+                vertices[vertex].color.bcolor[channel] = static_cast<byte>(clamp_tpl(color[channel],0.0f,1.0f)*255.0f);
+        }
+        const uint16_t indices[6] = {0,1,2,0,2,3};
+        m_frameRenderer->QueuePanelIndexedGeometry(textureId, vertices, 4, indices, 6,
+            m_screenSpaceMode ? m_screenSpaceWidth : static_cast<float>(GetWidth()),
+            m_screenSpaceMode ? m_screenSpaceHeight : static_cast<float>(GetHeight()),
+            m_screenMatrix.data(), CurrentPanelBlendState());
     }
 
     void Set2DMode(bool enable, int orthoWidth, int orthoHeight) override
@@ -834,13 +1412,34 @@ public:
         CNULLRenderer::LoadMatrix(matrix);
     }
 
+    void SelectTMU(int stage) override
+    {
+        if (stage >= 0 && stage < 8)
+            CTexMan::m_CurStage = stage;
+    }
+
     void SetTexture(int textureId, ETexType textureType = eTT_Base) override
     {
         m_currentTextureId = textureId;
         const int stage = m_TexMan ? m_TexMan->GetCurTMU() : 0;
         if (stage >= 0 && stage < 8)
+        {
             m_stageTextureIds[stage] = textureId;
+            if (m_activePass) m_stageStateOverrides[stage] |= 32u;
+            if (textureId > 0 && m_TexMan)
+                m_TexMan->m_nCurStages = crymax(m_TexMan->m_nCurStages, stage + 1);
+        }
         CNULLRenderer::SetTexture(textureId, textureType);
+    }
+
+    void SetLodBias(float value) override
+    {
+        const int stage = m_TexMan ? m_TexMan->GetCurTMU() : 0;
+        if (stage >= 0 && stage < 8 && std::isfinite(value))
+        {
+            m_stageLodBias[stage] = value;
+            if (m_activePass) m_stageStateOverrides[stage] |= 16u;
+        }
     }
 
     void SetTexClampMode(bool clamp) override
@@ -1219,6 +1818,9 @@ public:
         std::vector<uint8_t> rgba(count * 4);
         if (texture->m_ETF == eTF_0565 || texture->m_ETF == eTF_0555 ||
             texture->m_ETF == eTF_1555 || texture->m_ETF == eTF_4444 ||
+            texture->m_ETF == eTF_SIGNED_HILO8 || texture->m_ETF == eTF_V8U8 ||
+            texture->m_ETF == eTF_SIGNED_HILO16 || texture->m_ETF == eTF_V16U16 ||
+            texture->m_ETF == eTF_SIGNED_RGB8 ||
             texture->m_ETF == eTF_RGB8 || texture->m_ETF == eTF_0088)
         {
             if (!DecodeSpecialTexture(texture->m_ETF, data, count, rgba))
@@ -1236,7 +1838,10 @@ public:
                 rgba[i * 4 + 2] = data[i * 4]; rgba[i * 4 + 3] = data[i * 4 + 3];
                 break;
             case eTF_RGBA:
-                memcpy(&rgba[i * 4], &data[i * 4], 4);
+                // Match GL_BGRA_EXT for updates to lightmaps and dynamic RGBA
+                // textures, just as for their initial Vulkan upload.
+                rgba[i * 4] = data[i * 4 + 2]; rgba[i * 4 + 1] = data[i * 4 + 1];
+                rgba[i * 4 + 2] = data[i * 4]; rgba[i * 4 + 3] = data[i * 4 + 3];
                 break;
             case eTF_8000:
                 rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = 255;
@@ -1245,6 +1850,8 @@ public:
             default:
                 return false;
             }
+            // Match GL_ALPHA8 font storage on atlas updates as well.
+            rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = 255;
         }
         return m_frameRenderer->RegisterLegacyRgbaTextureRegion(textureId,
             static_cast<uint32_t>(x), static_cast<uint32_t>(y),
@@ -1259,6 +1866,9 @@ public:
     void FontSetRenderingState(unsigned long, unsigned long) override
     {
         m_fontRenderingState = true;
+        // GLFont installs its own blend state regardless of the preceding HUD pass.
+        SetState(GS_BLSRC_SRCALPHA | GS_BLDST_ONEMINUSSRCALPHA |
+                 GS_NODEPTHTEST | GS_ALPHATEST_GREATER0);
     }
 
     void FontRestoreRenderingState() override
@@ -1269,8 +1879,6 @@ public:
     void RemoveTexture(unsigned int textureId) override
     {
         m_textureWrapOverrides.erase(static_cast<int>(textureId));
-        if (m_frameRenderer)
-            m_frameRenderer->ReleaseLegacyTexture(static_cast<int>(textureId));
         CNULLRenderer::RemoveTexture(textureId);
     }
 
@@ -1281,7 +1889,12 @@ public:
     {
         if (!data || width <= 0 || height <= 0)
             return 0;
-        if (mipCount == 0)
+        // OpenGL interprets nummipmap == 0 as a base-level upload and
+        // requests generated mipmaps for bilinear/trilinear filtering.
+        // A nonzero value uploads an explicit mip level (1 - nummipmap),
+        // while linear/nearest filters do not need a mip chain.
+        if (mipCount != 0 ||
+            (filter != FILTER_BILINEAR && filter != FILTER_TRILINEAR))
             flags |= FT_NOMIPS;
         if (!repeat)
             flags |= FT_CLAMP;
@@ -1295,7 +1908,9 @@ public:
             sprintf(generatedName, "$AutoVulkan_%d", m_TexGenID++);
             name = generatedName;
         }
-        int filterMode = eVTF_Trilinear;
+        // CGLRenderer::DownLoadToVideoMemory uses GL_NEAREST for FILTER_NONE
+        // and any unrecognized filter value.
+        int filterMode = eVTF_Nearest;
         switch (filter)
         {
         case FILTER_LINEAR: filterMode = eVTF_Linear; break;
@@ -1323,6 +1938,9 @@ public:
         std::vector<uint8_t> rgba(pixelCount * 4);
         if (sourceFormat == eTF_0565 || sourceFormat == eTF_0555 ||
             sourceFormat == eTF_1555 || sourceFormat == eTF_4444 ||
+            sourceFormat == eTF_SIGNED_HILO8 || sourceFormat == eTF_V8U8 ||
+            sourceFormat == eTF_SIGNED_HILO16 || sourceFormat == eTF_V16U16 ||
+            sourceFormat == eTF_SIGNED_RGB8 ||
             sourceFormat == eTF_RGB8 || sourceFormat == eTF_0088)
         {
             if (!DecodeSpecialTexture(sourceFormat, data, pixelCount, rgba))
@@ -1366,11 +1984,275 @@ public:
         m_frameOpen = false;
     }
 
+    void PrepareDepthMap(ShadowMapFrustum* frustum, bool makeNewTexture) override
+    {
+        if (!frustum || !frustum->pLs || !m_frameRenderer || m_RP.m_bDrawToTexture)
+            return;
+        if (frustum->depth_tex_id && !frustum->bUpdateRequested && !makeNewTexture)
+            return;
+
+        // OpenGL keeps the depth map alive on the frustum and updates it only
+        // when requested. Give Vulkan shadow images private IDs so they share
+        // the same legacy texture lookup path without colliding with game
+        // STexPic IDs.
+        static int nextShadowTextureId = 0x40000000;
+        if (frustum->depth_tex_id == 0 || makeNewTexture)
+        {
+            if (nextShadowTextureId <= 0 || nextShadowTextureId == 0x7fffffff)
+                nextShadowTextureId = 0x40000000;
+            frustum->depth_tex_id = static_cast<uint32_t>(nextShadowTextureId++);
+        }
+
+        frustum->nTexSize = crymax(frustum->nTexSize, 32);
+        uint32_t shadowSize = static_cast<uint32_t>(frustum->nTexSize);
+        // GL_Shadows normalizes the capture to the renderer dimensions.
+        while ((m_width > 0 && shadowSize > static_cast<uint32_t>(m_width)) ||
+               (m_height > 0 && shadowSize > static_cast<uint32_t>(m_height)))
+            shadowSize /= 2;
+        if (!m_frameRenderer->RegisterLegacyDepthTexture(
+                static_cast<int>(frustum->depth_tex_id), shadowSize, shadowSize))
+        {
+            static uint32_t shadowAllocationWarnings = 0;
+            if (shadowAllocationWarnings++ < 4)
+                CryLogAlways("OpenXR/Vulkan: failed to create %ux%u shadow map texture id=%u (further failures suppressed)",
+                             shadowSize, shadowSize, frustum->depth_tex_id);
+            frustum->depth_tex_id = 0;
+            return;
+        }
+
+        makeProjectionMatrix(frustum->FOV, frustum->ProjRatio,
+                             frustum->min_dist, frustum->max_dist,
+                             frustum->debugLightFrustumMatrix);
+        const Vec3d eye = frustum->pLs->vSrcPos;
+        const Vec3d target = frustum->target;
+        Vec3d zAxis = eye - target;
+        if (zAxis.Normalize() == 0.0f)
+            return;
+        Vec3d yAxis(0.0f, 0.0f, 1.0f);
+        Vec3d xAxis = yAxis ^ zAxis;
+        if (xAxis.Normalize() == 0.0f)
+            return;
+        yAxis = zAxis ^ xAxis;
+        if (yAxis.Normalize() == 0.0f)
+            return;
+        float* lightView = frustum->debugLightViewMatrix;
+        memset(lightView, 0, sizeof(frustum->debugLightViewMatrix));
+        lightView[0] = xAxis.x; lightView[4] = xAxis.y; lightView[8] = xAxis.z;
+        lightView[1] = yAxis.x; lightView[5] = yAxis.y; lightView[9] = yAxis.z;
+        lightView[2] = zAxis.x; lightView[6] = zAxis.y; lightView[10] = zAxis.z;
+        lightView[15] = 1.0f;
+        lightView[12] = -(lightView[0] * eye.x + lightView[4] * eye.y + lightView[8] * eye.z);
+        lightView[13] = -(lightView[1] * eye.x + lightView[5] * eye.y + lightView[9] * eye.z);
+        lightView[14] = -(lightView[2] * eye.x + lightView[6] * eye.y + lightView[10] * eye.z);
+
+        // OpenGL's PrepareDepthMap switches to the light matrices, renders
+        // both caster lists, then restores the camera. Queue the same model
+        // and entity draws tagged for this Vulkan shadow framebuffer; the
+        // frame recorder uses their captured object transforms and this
+        // light projection instead of either XR eye projection.
+        const Matrix44 savedCameraMatrix = m_CameraMatrix;
+        const Matrix44 savedViewMatrix = m_ViewMatrix;
+        const Matrix44 savedProjectionMatrix = m_ProjMatrix;
+        const Matrix44 savedCameraProjectionMatrix = m_CameraProjMatrix;
+        const Matrix44 savedInverseCameraProjectionMatrix = m_InvCameraProjMatrix;
+        const int savedViewportX = m_VX;
+        const int savedViewportY = m_VY;
+        const int savedViewportWidth = m_VWidth;
+        const int savedViewportHeight = m_VHeight;
+        const bool savedFogEnabled = EnableFog(false);
+        memcpy(m_CameraMatrix.GetData(), lightView, sizeof(float) * 16);
+        m_ViewMatrix = m_CameraMatrix;
+        memcpy(m_ProjMatrix.GetData(), frustum->debugLightFrustumMatrix,
+               sizeof(frustum->debugLightFrustumMatrix));
+        mathMatrixMultiply(m_CameraProjMatrix.GetData(), m_ProjMatrix.GetData(),
+                           m_CameraMatrix.GetData(), g_CpuFlags);
+        mathMatrixInverse(m_InvCameraProjMatrix.GetData(),
+                          m_CameraProjMatrix.GetData(), g_CpuFlags);
+        SetViewport(0, 0, static_cast<int>(shadowSize), static_cast<int>(shadowSize));
+        m_frameRenderer->SetStockShadowMapPass(
+            static_cast<int>(frustum->depth_tex_id), frustum->debugLightFrustumMatrix);
+        m_collectingShadowCasters = true;
+
+        IShader* const noCullState = EF_LoadShader("StateNoCull", eSH_World);
+        if (frustum->pModelsList && frustum->pModelsList->Count())
+        {
+            EF_StartEf();
+            for (int modelIndex = 0; modelIndex < frustum->pModelsList->Count(); ++modelIndex)
+            {
+                SRendParams renderParams;
+                renderParams.pStateShader = noCullState;
+                if (!frustum->m_fBending)
+                    renderParams.nShaderTemplate = EFT_WHITESHADOW;
+                if (frustum->pEntityList && frustum->pEntityList->Count())
+                    renderParams.vPos -= (*frustum->pEntityList)[0]->GetPos();
+                renderParams.dwFObjFlags |= FOB_TRANS_MASK;
+                renderParams.dwFObjFlags |= FOB_RENDER_INTO_SHADOWMAP;
+                renderParams.fBending = frustum->m_fBending;
+                (*frustum->pModelsList)[modelIndex]->Render(renderParams, Vec3(zero), 0);
+            }
+            EF_EndEf3D(true);
+        }
+
+        if (frustum->pEntityList && frustum->pOwner && m_RP.m_pCurObject)
+        {
+            EF_StartEf();
+            for (int entityIndex = 0; entityIndex < frustum->pEntityList->Count(); ++entityIndex)
+            {
+                IEntityRender* const entity = (*frustum->pEntityList)[entityIndex];
+                if (!entity)
+                    continue;
+                Vec3d offset = GetNormalized(
+                    m_RP.m_pCurObject->GetTranslation() - frustum->pLs->vSrcPos) *
+                    (0.1f + 0.035f * (256.0f / static_cast<float>(shadowSize)));
+                SRendParams renderParams;
+                renderParams.nShaderTemplate =
+                    (m_Features & RFT_DEPTHMAPS) ? EFT_WHITE : EFT_WHITESHADOW;
+                renderParams.pStateShader = noCullState;
+                renderParams.vPos = offset + (entity->GetPos() - frustum->pOwner->GetPos());
+                renderParams.dwFObjFlags |= FOB_RENDER_INTO_SHADOWMAP;
+                renderParams.dwFObjFlags |= FOB_TRANS_MASK;
+                entity->DrawEntity(renderParams);
+            }
+            EF_EndEf3D(true);
+        }
+
+        m_collectingShadowCasters = false;
+        m_frameRenderer->SetStockShadowMapPass(0, nullptr);
+        m_CameraMatrix = savedCameraMatrix;
+        m_ViewMatrix = savedViewMatrix;
+        m_ProjMatrix = savedProjectionMatrix;
+        m_CameraProjMatrix = savedCameraProjectionMatrix;
+        m_InvCameraProjMatrix = savedInverseCameraProjectionMatrix;
+        SetViewport(savedViewportX, savedViewportY,
+                    savedViewportWidth, savedViewportHeight);
+        UpdateLegacyCameraInfo();
+        // GL_Shadows finishes the capture by disabling scissor and clearing
+        // the restored main color/depth buffers (stencil is preserved).
+        SetScissor(0, 0, 0, 0);
+        EF_SetState(GS_DEPTHWRITE);
+        const float restoredClearColor[4] = {
+            m_vClearColor.x, m_vClearColor.y, m_vClearColor.z, 0.0f
+        };
+        if (!m_frameRenderer->QueueStockClear(true, true, false, restoredClearColor))
+            m_frameRenderer->RequirePanelFallback();
+        EnableFog(savedFogEnabled);
+        const bool expectedCasters =
+            (frustum->pModelsList && frustum->pModelsList->Count() > 0) ||
+            (frustum->pEntityList && frustum->pEntityList->Count() > 0);
+        frustum->bUpdateRequested = expectedCasters &&
+            !m_frameRenderer->HasQueuedShadowMapDraws(
+                static_cast<int>(frustum->depth_tex_id));
+    }
+
+    void SetupShadowOnlyPass(int textureStage, ShadowMapFrustum* frustum,
+                             Vec3d* shadowTranslation, const float shadowScale,
+                             Vec3d objectTranslation, float objectScale,
+                             const Vec3d objectAngles, Matrix44* objectMatrix) override
+    {
+        (void)objectTranslation;
+        if (!frustum || textureStage < 0 || textureStage >= 8 ||
+            !frustum->pLs || !(shadowScale > 0.0f))
+            return;
+
+        float lightProjection[16]{};
+        float lightView[16]{};
+        if (shadowTranslation)
+        {
+            makeProjectionMatrix(frustum->FOV * shadowScale, frustum->ProjRatio,
+                                 frustum->min_dist, frustum->max_dist,
+                                 lightProjection);
+            const Vec3d eye(frustum->pLs->vSrcPos.x + shadowTranslation->x,
+                            frustum->pLs->vSrcPos.y + shadowTranslation->y,
+                            frustum->pLs->vSrcPos.z + shadowTranslation->z);
+            const Vec3d target(frustum->target.x * shadowScale + shadowTranslation->x,
+                               frustum->target.y * shadowScale + shadowTranslation->y,
+                               frustum->target.z * shadowScale + shadowTranslation->z);
+
+            // Match SGLFuncs::gluLookAt's world-up (0,0,1) basis and matrix
+            // layout. The OpenGL shadow setup uses this view before applying
+            // either the receiver object's transform or scale/rotation.
+            Vec3d zAxis = eye - target;
+            if (zAxis.Normalize() == 0.0f)
+                return;
+            Vec3d yAxis(0.0f, 0.0f, 1.0f);
+            Vec3d xAxis = yAxis ^ zAxis;
+            if (xAxis.Normalize() == 0.0f)
+                return;
+            yAxis = zAxis ^ xAxis;
+            if (yAxis.Normalize() == 0.0f)
+                return;
+            lightView[0] = xAxis.x; lightView[4] = xAxis.y; lightView[8] = xAxis.z;
+            lightView[1] = yAxis.x; lightView[5] = yAxis.y; lightView[9] = yAxis.z;
+            lightView[2] = zAxis.x; lightView[6] = zAxis.y; lightView[10] = zAxis.z;
+            lightView[15] = 1.0f;
+            lightView[12] = -(lightView[0] * eye.x + lightView[4] * eye.y + lightView[8] * eye.z);
+            lightView[13] = -(lightView[1] * eye.x + lightView[5] * eye.y + lightView[9] * eye.z);
+            lightView[14] = -(lightView[2] * eye.x + lightView[6] * eye.y + lightView[10] * eye.z);
+            if (objectMatrix)
+                mathMatrixMultiply(lightView, lightView, objectMatrix->GetData(), g_CpuFlags);
+            else
+            {
+                mathRotateZ(lightView, objectAngles.z, g_CpuFlags);
+                mathRotateY(lightView, objectAngles.y, g_CpuFlags);
+                mathRotateX(lightView, objectAngles.x, g_CpuFlags);
+                mathScale(lightView, Vec3d(objectScale, objectScale, objectScale), g_CpuFlags);
+            }
+        }
+        else
+        {
+            // PrepareDepthMap stores the exact light matrices on the frustum;
+            // non-translated receivers reuse those cached matrices in OpenGL.
+            memcpy(lightProjection, frustum->debugLightFrustumMatrix, sizeof(lightProjection));
+            memcpy(lightView, frustum->debugLightViewMatrix, sizeof(lightView));
+        }
+
+        if (frustum->depth_tex_id > 0)
+        {
+            if (m_RP.m_pRE)
+            {
+                m_RP.m_pRE->m_CustomTexBind[textureStage] =
+                    static_cast<int>(frustum->depth_tex_id);
+                m_RP.m_pRE->m_Color[textureStage] = frustum->fAlpha;
+            }
+            else
+            {
+                m_RP.m_RECustomTexBind[textureStage] =
+                    static_cast<int>(frustum->depth_tex_id);
+                m_RP.m_REColor[textureStage] = frustum->fAlpha;
+            }
+        }
+
+        float textureBias[16] = {
+            0.5f, 0.0f, 0.0f, 0.0f,
+            0.0f, 0.5f, 0.0f, 0.0f,
+            0.0f, 0.0f, 0.5f, 0.0f,
+            0.5f, 0.5f, 0.5f, 1.0f
+        };
+        float lightViewProjection[16]{};
+        float shadowTextureMatrix[16]{};
+        mathMatrixMultiply(lightViewProjection, lightProjection, lightView, g_CpuFlags);
+        mathMatrixMultiply(shadowTextureMatrix, textureBias, lightViewProjection, g_CpuFlags);
+        mathMatrixTranspose(m_cEF.m_TempMatrices[textureStage][0].GetData(),
+                            shadowTextureMatrix, g_CpuFlags);
+    }
+
     void EF_EndEf3D(int flags) override
     {
+        if (SRendItem::m_RecurseLevel < 1)
+        {
+            if (iLog) iLog->Log("Error: CRenderer::EF_EndEf3D without CRenderer::EF_StartEf");
+            return;
+        }
+        if (CV_r_nodrawshaders == 1)
+        {
+            SetClearColor(Vec3d(0, 0, 0));
+            ClearStockSceneBuffers(false, false);
+            --SRendItem::m_RecurseLevel;
+            return;
+        }
         static unsigned int endEfAuditCalls = 0;
         const unsigned int endEfAuditCall = endEfAuditCalls++;
-        if (endEfAuditCall < 12 || (endEfAuditCall % 120) == 0)
+        if (g_vulkanAudit && (endEfAuditCall < 12 || (endEfAuditCall % 120) == 0))
             CryLogAlways("Vulkan EF_EndEf3D path: call=%u frame=%d open=%u recurse=%d renderer=%p flags=0x%x",
                 endEfAuditCall, GetFrameID(), m_frameOpen ? 1u : 0u,
                 SRendItem::m_RecurseLevel - 1, m_frameRenderer, flags);
@@ -1380,7 +2262,17 @@ public:
         const int recurseLevel = SRendItem::m_RecurseLevel - 1;
         if (m_frameOpen && recurseLevel >= 0 && recurseLevel < 8)
         {
+            m_RP.m_PersFlags &= ~(RBPF_DRAWNIGHTMAP | RBPF_DRAWHEATMAP);
             m_RP.m_RealTime = iTimer ? iTimer->GetCurrTime() : 0.0f;
+            m_RP.m_ExcludeShader = CV_r_excludeshader &&
+                CV_r_excludeshader->GetString()[0] != '0' ?
+                CV_r_excludeshader->GetString() : nullptr;
+            m_RP.m_ShowOnlyShader = CV_r_showonlyshader &&
+                CV_r_showonlyshader->GetString()[0] != '0' ?
+                CV_r_showonlyshader->GetString() : nullptr;
+            EF_UpdateSplashes(m_RP.m_RealTime);
+            EF_AddClientPolys3D();
+            EF_AddClientPolys2D();
             static const int stockListOrder[NUMRI_LISTS] = {
                 EFSLIST_PREPROCESS_ID,
                 EFSLIST_STENCIL_ID,
@@ -1392,13 +2284,46 @@ public:
             for (int list = 0; list < NUMRI_LISTS; ++list)
                 SRendItem::m_EndRI[recurseLevel][list] = SRendItem::m_RendItems[list].Num();
 
+#if defined(__ANDROID__) && defined(CRYVR_RENDER_PROBES)
+            static int sceneTraceFrames = 0;
+            static int sceneTraceLastFrame = -1000;
+            if (!m_collectingShadowCasters && recurseLevel == 0 &&
+                m_frameRenderer && m_frameRenderer->IsFrameActive() &&
+                sceneTraceFrames < 64 && GetFrameID() - sceneTraceLastFrame >= 90 &&
+                !IsEquivalent(m_cam.GetPos(), Vec3(0, 0, 0)))
+            {
+                int worldItems = 0;
+                for (int list = 0; list < NUMRI_LISTS; ++list)
+                    for (int index = SRendItem::m_StartRI[recurseLevel][list];
+                         index < SRendItem::m_EndRI[recurseLevel][list]; ++index)
+                        if (SRendItem::m_RendItems[list][index].Item &&
+                            SRendItem::m_RendItems[list][index].Item->mfGetType() == eDATA_OcLeaf)
+                            ++worldItems;
+                if (worldItems > 10)
+                {
+                    m_sceneTrace = fopen("/sdcard/FarCry/vulkan_cutscene_trace.txt",
+                        sceneTraceFrames ? "ab" : "wb");
+                    m_sceneTraceLines = 0;
+                    if (m_sceneTrace)
+                    {
+                        fprintf(m_sceneTrace, "FRAME %d camera=%.3f,%.3f,%.3f angles=%.3f,%.3f,%.3f items=%d\n",
+                            GetFrameID(), m_cam.GetPos().x, m_cam.GetPos().y, m_cam.GetPos().z,
+                            m_cam.GetAngles().x, m_cam.GetAngles().y, m_cam.GetAngles().z, worldItems);
+                        ++sceneTraceFrames;
+                        sceneTraceLastFrame = GetFrameID();
+                    }
+                }
+            }
+#endif
+
             // Capture several scene frames after the renderer is active. Keep
             // this diagnostic bounded: the full item and draw trace is useful
             // for a device log, but must not grow for the lifetime of a game.
-            static int auditFramesRemaining = 2;
+            static int auditFramesRemaining = 10;
+            static int lastAuditedFrame = -1;
             int auditItemTotal = 0;
             bool auditHasWorldLeaf = false;
-            for (int list = 0; list < NUMRI_LISTS; ++list)
+            for (int list = 0; g_vulkanAudit && list < NUMRI_LISTS; ++list)
             {
                 const int begin = SRendItem::m_StartRI[recurseLevel][list];
                 const int end = SRendItem::m_EndRI[recurseLevel][list];
@@ -1416,11 +2341,13 @@ public:
                     }
                 }
             }
-            m_auditFrameActive = auditFramesRemaining > 0 && auditHasWorldLeaf &&
+            m_auditFrameActive = g_vulkanAudit && auditFramesRemaining > 0 && auditHasWorldLeaf &&
+                (lastAuditedFrame < 0 || GetFrameID() - lastAuditedFrame >= 120) &&
                 m_frameRenderer && m_frameRenderer->IsFrameActive();
             if (m_auditFrameActive)
             {
                 --auditFramesRemaining;
+                lastAuditedFrame = GetFrameID();
                 CryLogAlways("Vulkan audit BEGIN frame=%d recurse=%d items=%d visObjects=%d lights=%d flags=0x%x pers=0x%x cameraPos=(%.3f,%.3f,%.3f)",
                     GetFrameID(), recurseLevel, auditItemTotal, m_RP.m_NumVisObjects,
                     m_RP.m_DLights[recurseLevel].Num(), m_RP.m_Flags, m_RP.m_PersFlags,
@@ -1443,14 +2370,29 @@ public:
             for (int order = 0; order < NUMRI_LISTS; ++order)
             {
                 const int list = stockListOrder[order];
+                // EF_RenderPipeLine tests suppression once, immediately after
+                // PREPROCESS. Later lists may alter the flag, but that does
+                // not retroactively change entry into the outer list block.
+                if (order == 1 && (m_RP.m_PersFlags & RBPF_IGNORERENDERING))
+                {
+                    m_RP.m_PersFlags &= ~RBPF_IGNORERENDERING;
+                    break;
+                }
+                if (list == EFSLIST_LAST_ID && recurseLevel > 0)
+                    continue;
                 int drawFirst = SRendItem::m_StartRI[recurseLevel][list];
                 int last = SRendItem::m_EndRI[recurseLevel][list];
                 if (drawFirst < 0 || drawFirst >= last)
                     continue;
                 CCObject* savedObject = m_RP.m_pCurObject;
+                // EF_PipeLine establishes the identity object before both
+                // PreRender(1) and preprocess, not only before item drawing.
+                m_RP.m_nCurLightParam = -1;
+                m_RP.m_pCurObject = m_RP.m_NumVisObjects > 0 ? m_RP.m_VisObjects[0] : nullptr;
+                m_RP.m_pPrevObject = m_RP.m_pCurObject;
                 // OpenGL runs EF_PreRender(1) once for every non-empty list,
                 // before sorting and preprocess handling.
-                PrepareStockFrameState(recurseLevel);
+                PrepareStockFrameState();
 
                 // Match the stock XRenderOGL list preparation: shader-sort the
                 // preprocess/general/last lists, distance-sort blended items,
@@ -1460,16 +2402,7 @@ public:
                 {
                     SRendItem::mfSort(&SRendItem::m_RendItems[list][drawFirst], last - drawFirst);
                     if ((SRendItem::m_RendItems[list][drawFirst].SortVal.i.High >> 26) == eS_PreProcess)
-                    {
-                        // The NULL renderer has no stock preprocess executor. Do
-                        // not accidentally submit its reflection/refraction/etc.
-                        // source items as ordinary world geometry; consume the
-                        // same leading preprocess run the GL pipeline removes
-                        // after executing its off-screen passes.
-                        while (drawFirst < last &&
-                               (SRendItem::m_RendItems[list][drawFirst].SortVal.i.High >> 26) == eS_PreProcess)
-                            ++drawFirst;
-                    }
+                        drawFirst += ProcessStockPreprocess(list, drawFirst, last);
                 }
                 else if (list == EFSLIST_DISTSORT_ID)
                     SRendItem::mfSortByDist(&SRendItem::m_RendItems[list][drawFirst], last - drawFirst);
@@ -1501,8 +2434,24 @@ public:
                                                 last - runStart);
                 }
 
+                // GL checks this flag after preprocess, which can change it.
+                if ((list == EFSLIST_PREPROCESS_ID || list == EFSLIST_GENERAL_ID ||
+                     list == EFSLIST_LAST_ID) && (m_RP.m_PersFlags & RBPF_IGNORERENDERING))
+                {
+                    m_RP.m_pCurObject = savedObject;
+                    continue;
+                }
+                // EF_PreRender(3) repeats the Stage & 1 preparation, then
+                // applies Stage & 2 depth-range/clear state.
+                PrepareStockFrameState();
                 // This is the state established by EF_PreRender(3) and the
                 // list walker immediately before entering its item loop.
+                if (!m_RP.m_bStartPipeline && !m_bWasCleared &&
+                    !(m_RP.m_PersFlags & RBPF_NOCLEARBUF))
+                {
+                    m_RP.m_bStartPipeline = true;
+                    ClearStockSceneBuffers(false, false);
+                }
                 float minDepthRange = 0.0f;
                 float maxDepthRange = 1.0f;
                 if (m_RP.m_WasPortals > 0)
@@ -1518,11 +2467,16 @@ public:
                         maxDepthRange = minDepthRange + portalDepthSpan;
                     }
                 }
+                m_RP.m_fMinDepthRange = minDepthRange;
+                m_RP.m_fMaxDepthRange = maxDepthRange;
                 m_frameRenderer->SetStockDepthRange(minDepthRange, maxDepthRange);
                 m_RP.m_pCurObject = m_RP.m_NumVisObjects > 0 ? m_RP.m_VisObjects[0] : nullptr;
-                m_RP.m_pPrevObject = m_RP.m_pCurObject;
                 m_RP.m_Flags |= RBF_3D;
                 SShader* previousStateShader = nullptr;
+                SShader* previousStencilShader = nullptr;
+                SRenderShaderResources* previousStencilResources = nullptr;
+                int previousStencilObject = -1;
+                int previousStencilFog = -1;
                 int previousObjectIndex = -1;
                 for (int itemIndex = drawFirst; itemIndex < last; ++itemIndex)
                 {
@@ -1554,6 +2508,13 @@ public:
                     }
 
                     CCObject* renderObject = m_RP.m_VisObjects[objectIndex];
+#if defined(__ANDROID__)
+                    if (m_sceneTrace && !m_collectingShadowCasters && renderObject && m_sceneTraceLines++ < 256)
+                        fprintf(m_sceneTrace, "ITEM list=%d shader=%s re=%d object=%d flags=%x lm=%d,%d opacity=%.4f fog=%d\n",
+                            list, shader ? shader->GetName() : "<none>", item->Item->mfGetType(),
+                            objectIndex, renderObject->m_ObjFlags, renderObject->m_nLMId,
+                            renderObject->m_nLMDirId, renderObject->m_Color.a, fogIndex);
+#endif
                     if (!renderObject)
                     {
                         if (m_auditFrameActive)
@@ -1578,6 +2539,11 @@ public:
                                 GetFrameID(), list, itemIndex, shader->m_Name.c_str(), renderObject->m_ObjFlags);
                         continue;
                     }
+                    // EF_ObjectChange excludes the capture source by position,
+                    // not pointer identity; sky remains visible in reflections.
+                    if (shader && m_RP.m_pIgnoreObject && !(shader->m_Flags & EF_SKY) &&
+                        IsEquivalent(m_RP.m_pIgnoreObject->GetTranslation(), renderObject->GetTranslation()))
+                        continue;
                     if (shader && (m_RP.m_PersFlags & RBPF_IGNOREREFRACTED) &&
                         (renderObject->m_ObjFlags & FOB_REFRACTED))
                     {
@@ -1592,14 +2558,16 @@ public:
                         m_auditCurrentList = list;
                         m_auditCurrentItem = itemIndex;
                         CMatInfo* chunk = item->Item->mfGetMatInfo();
-                        CryLogAlways("Vulkan audit ITEM frame=%d list=%d index=%d type=%d shader=%s shaderId=%d sort=%d obj=%d objFlags=0x%x pos=(%.3f,%.3f,%.3f) fog=%d resources=%d opacity=%.3f dynLights=0x%x fixedPasses=%d hwTechniques=%d stateShader=%s chunk=%d+%d verts=%d firstVert=%d",
+                        CryLogAlways("Vulkan audit ITEM frame=%d list=%d index=%d type=%d shader=%s shaderId=%d sort=%d obj=%d objFlags=0x%x pos=(%.3f,%.3f,%.3f) fog=%d resources=%d opacity=%.3f dynLights=0x%x lightmaps=(%d,%d,%d) fixedPasses=%d hwTechniques=%d stateShader=%s chunk=%d+%d verts=%d firstVert=%d",
                             GetFrameID(), list, itemIndex, item->Item->mfGetType(),
                             shader ? shader->m_Name.c_str() : "<null>", shader ? shader->m_Id : -1,
                             item->Item->m_SortId, objectIndex, renderObject->m_ObjFlags,
                             renderObject->GetTranslation().x, renderObject->GetTranslation().y,
                             renderObject->GetTranslation().z, fogIndex,
                             resources ? resources->m_Id : -1, resources ? resources->m_Opacity : 1.0f,
-                            item->DynLMask, shader ? shader->m_Passes.Num() : 0,
+                            item->DynLMask, renderObject->m_nLMId,
+                            renderObject->m_nLMDirId, renderObject->m_nHDRLMId,
+                            shader ? shader->m_Passes.Num() : 0,
                             shader ? shader->m_HWTechniques.Num() : 0,
                             shaderState ? shaderState->m_Name.c_str() : "<null>",
                             chunk ? chunk->nFirstIndexId : -1, chunk ? chunk->nNumIndices : -1,
@@ -1665,19 +2633,56 @@ public:
                         }
                     }
 
-                    if (renderObject != m_RP.m_pCurObject)
+                    if (renderObject != m_RP.m_pPrevObject)
                     {
+                        UpdateStockNearestCamera(objectIndex != 0 &&
+                            (renderObject->m_ObjFlags & FOB_NEAREST));
                         ++m_RP.m_FrameObject;
-                        m_RP.m_pPrevObject = m_RP.m_pCurObject;
                         m_RP.m_pCurObject = renderObject;
                         UpdateLegacyObjectTransform(renderObject);
+                        // EF_ObjectChange's cache denotes the object whose
+                        // state is loaded, rather than the object it replaced.
+                        m_RP.m_pPrevObject = renderObject;
                     }
                     m_RP.m_pRE = item->Item;
                     m_RP.m_pShader = shader;
+                    m_RP.m_pStateShader = shaderState;
                     m_RP.m_pShaderResources = resources;
-                    m_RP.m_DynLMask = item->DynLMask;
+                    // EF_Start resets these for each new material batch.
+                    // Vulkan flushes each item directly, so its item is the
+                    // corresponding batch boundary.
+                    m_RP.m_FlagsPerFlush = 0;
+                    m_RP.m_FlagsModificators = 0;
+                    m_RP.m_ResourceState = 0;
+                    m_RP.m_pCurLightMaterial = nullptr;
+                    m_RP.m_pCurTechnique = nullptr;
+                    ++m_RP.m_Frame;
+                    m_RP.m_RendNumIndices = 0;
+                    m_RP.m_RendNumVerts = 0;
+                    m_RP.m_RendIndices = m_RP.m_SysRendIndices;
+                    // EF_Start owns the lifetime of this list as well as
+                    // MergedREs/MergedObjs. Shared leaf preparation traverses
+                    // it when uploading object-specific lightmap coordinates.
+                    m_RP.m_MergedObjects.SetUse(0);
+                    m_RP.m_MergedREs.SetUse(0);
+                    m_RP.m_MergedObjs.SetUse(0);
+                    if (shader && shader->m_VertexFormatId >= 0 &&
+                        shader->m_VertexFormatId < VERTEX_FORMAT_NUMS)
+                    {
+                        const int format = shader->m_VertexFormatId;
+                        const SBufInfoTable& offsets = gBufInfoTable[format];
+                        m_RP.m_CurVFormat = format;
+                        m_RP.m_Stride = m_VertexSize[format];
+                        m_RP.m_OffsD = offsets.OffsColor;
+                        m_RP.m_OffsT = offsets.OffsTC;
+                        m_RP.m_OffsN = offsets.OffsNormal;
+                        m_RP.m_NextPtr = m_RP.m_Ptr;
+                    }
+                    // EF_Start builds the initial light list from the live
+                    // object's mask before selecting the hardware technique.
+                    m_RP.m_DynLMask = renderObject->m_DynLMMask;
                     m_RP.m_ObjFlags = renderObject->m_ObjFlags;
-                    m_RP.m_fCurOpacity = resources ? resources->m_Opacity : 1.0f;
+                    m_RP.m_fCurOpacity = 1.0f;
                     if (item->Item->mfGetType() == eDATA_Beam)
                     {
                         // OpenGL's item prepare loads the beam model and
@@ -1690,7 +2695,7 @@ public:
                             continue;
                         shader = m_RP.m_pShader;
                         resources = m_RP.m_pShaderResources;
-                        m_RP.m_fCurOpacity = resources ? resources->m_Opacity : 1.0f;
+                        m_RP.m_fCurOpacity = 1.0f;
                     }
                     if (shader && m_RP.m_pIgnoreObject && !(shader->m_Flags & EF_SKY) &&
                         IsEquivalent(m_RP.m_pIgnoreObject->GetTranslation(),
@@ -1702,36 +2707,77 @@ public:
                         previousObjectIndex = objectIndex;
                     }
                     // OpenGL's EF_Start builds this list before selecting the
-                    // hardware technique. EF_SelectHWTechnique consults both
-                    // m_NumActiveDLights and m_fCurOpacity; leaving those
-                    // fields stale makes light-count/opacity conditions pick
-                    // the wrong technique (or reject every valid one).
+                    // hardware technique. EF_Start initializes opacity to one;
+                    // resource opacity is applied later by EF_FlushShader.
                     EF_BuildLightsList();
                     // CGLRenderer::EF_Start resets this for each shader/item
                     // batch. Vulkan emits the passes directly, so preserve the
                     // same per-item lifetime explicitly.
                     m_RP.m_RendPass = 0;
-                    m_RP.m_pFogVolume = fogIndex > 0 && fogIndex < m_RP.m_FogVolumes.Num() ?
+                    m_RP.m_pFogVolume = CV_r_VolumetricFog && fogIndex > 0 &&
+                        fogIndex < m_RP.m_FogVolumes.Num() ?
                         &m_RP.m_FogVolumes[fogIndex] : nullptr;
                     if (shader && (shader->m_Flags & EF_FOGSHADER) && !m_RP.m_pFogVolume)
                         continue;
                     m_activeStateShaderState = shaderState ? shaderState->m_State : nullptr;
-                    if (shaderState != previousStateShader && m_activeStateShaderState)
+                    if (m_activeStateShaderState)
                     {
-                        if (m_activeStateShaderState->m_bClearStencil &&
-                            !m_frameRenderer->QueueStockClearStencil())
-                            m_frameRenderer->RequirePanelFallback();
-                        if (m_activeStateShaderState->m_Stencil)
+                        const SEfState& stateShader = *m_activeStateShaderState;
+                        UCol color; color.dcolor = 0;
+                        if (stateShader.m_Flags & ESF_RGBGEN)
                         {
-                            // The scene pipeline decoder consumes OpenGL's
-                            // packed FSS compare/op bits directly and carries
-                            // the reference and mask as dynamic stencil state.
-                            m_CurStencilState = m_activeStateShaderState->m_Stencil->m_State;
-                            m_CurStencRef = m_activeStateShaderState->m_Stencil->m_FuncRef;
-                            m_CurStencMask = m_activeStateShaderState->m_Stencil->m_FuncMask;
+                            m_RP.m_FlagsPerFlush |= RBSI_RGBGEN;
+                            if (stateShader.m_eEvalRGB == eERGB_Fixed)
+                                for (int channel = 0; channel < 4; ++channel)
+                                    color.bcolor[channel] = stateShader.m_FixedColor[channel];
+                        }
+                        if (stateShader.m_Flags & ESF_ALPHAGEN)
+                        {
+                            m_RP.m_FlagsPerFlush |= RBSI_ALPHAGEN;
+                            if (stateShader.m_eEvalAlpha == eEALPHA_Fixed)
+                                color.bcolor[3] = stateShader.m_FixedColor[3];
+                        }
+                        if (stateShader.m_Flags & (ESF_RGBGEN | ESF_ALPHAGEN))
+                        {
+                            Exchange(color.bcolor[0], color.bcolor[3]);
+                            m_RP.m_NeedGlobalColor = color;
                         }
                     }
+                    const bool newStencilBatch = shaderState != previousStateShader ||
+                        shader != previousStencilShader || resources != previousStencilResources ||
+                        objectIndex != previousStencilObject || fogIndex != previousStencilFog;
+                    if (newStencilBatch && m_activeStateShaderState)
+                    {
+                        if (m_activeStateShaderState->m_bClearStencil)
+                        {
+                            // EF_SetStateShaderState disables overdraw when
+                            // stencil shadows claim the same attachment.
+                            if (CV_r_measureoverdraw)
+                            {
+                                if (iLog) iLog->Log("Stencil shadows and overdraw measurement are mutually exclusive");
+                                CV_r_measureoverdraw = 0;
+                            }
+                            if (!m_frameRenderer->QueueStockClearStencil())
+                                m_frameRenderer->RequirePanelFallback();
+                        }
+                    }
+                    // EF_SetStateShaderState reapplies stencil for every
+                    // flush. Pointer equality does not imply that a previous
+                    // render element left the packed state/ref/mask intact.
+                    if (m_activeStateShaderState && m_activeStateShaderState->m_Stencil)
+                    {
+                        // The scene pipeline decoder consumes OpenGL's
+                        // packed FSS compare/op bits directly and carries
+                        // the reference and mask as dynamic stencil state.
+                        m_CurStencilState = m_activeStateShaderState->m_Stencil->m_State;
+                        m_CurStencRef = m_activeStateShaderState->m_Stencil->m_FuncRef;
+                        m_CurStencMask = m_activeStateShaderState->m_Stencil->m_FuncMask;
+                    }
                     previousStateShader = shaderState;
+                    previousStencilShader = shader;
+                    previousStencilResources = resources;
+                    previousStencilObject = objectIndex;
+                    previousStencilFog = fogIndex;
 
                     if (m_auditFrameActive && !shader)
                         CryLogAlways("Vulkan audit NO_SHADER frame=%d list=%d index=%d type=%d re=%p; shader dispatch will submit no geometry",
@@ -1744,6 +2790,7 @@ public:
                     if (item->Item->mfGetType() == eDATA_OcLeaf &&
                         !PrepareStockLeafItem(static_cast<CREOcLeaf*>(item->Item), renderObject))
                     {
+                        CaptureStockLeafStatus(item->Item, shader, "prepare-rejected");
                         m_activeStateShaderState = nullptr;
                         continue;
                     }
@@ -1756,6 +2803,9 @@ public:
                     if (shader && shader->m_HWTechniques.Num() > 0)
                     {
                         const int techniqueIndex = EF_SelectHWTechnique(shader);
+                        PrepareStockFlushState(renderObject, shader);
+                        CaptureStockLeafStatus(item->Item, shader,
+                            techniqueIndex < 0 ? "no-technique" : "selected");
                         if (m_auditFrameActive)
                             CryLogAlways("Vulkan audit SELECT_TECHNIQUE frame=%d list=%d index=%d shader=%s selected=%d candidates=%d opacity=%.3f activeLights=%d fog=%p",
                                 GetFrameID(), list, itemIndex, shader->m_Name.c_str(), techniqueIndex,
@@ -1765,16 +2815,62 @@ public:
                         {
                             SShaderTechnique* technique = shader->m_HWTechniques[techniqueIndex];
                             m_RP.m_pCurTechnique = technique;
+                            m_RP.m_fCurOpacity = resources && !resources->m_AlphaRef &&
+                                !(shader->m_Flags2 & EF2_IGNORERESOURCESTATES) ?
+                                resources->m_Opacity : 1.0f;
+                            // EF_SelectHWTechnique runs during EF_Start, before
+                            // EF_FlushShader applies resource opacity. That
+                            // resource step clears only the cached LIGHTPASS
+                            // flag before hardware pass dispatch, not the
+                            // object's flag used by technique selection.
+                            if (m_RP.m_fCurOpacity != 1.0f)
+                                m_RP.m_ObjFlags &= ~FOB_LIGHTPASS;
                             bool submittedTranslatedTechniquePass = false;
+                            bool inPerLightPassGroup = false;
+                            int perLightPassGroupStart = -1;
+                            bool perLightNoBumpBreak[32]{};
+                            bool perLightPassTerminated[32]{};
                             const int cull = technique->m_eCull == static_cast<ECull>(-1) ?
                                 MapStockCullMode(shader->m_eCull) :
                                 MapStockCullMode(technique->m_eCull);
                             for (int passIndex = 0; passIndex < technique->m_Passes.Num(); ++passIndex)
                             {
                                 SShaderPassHW* pass = &technique->m_Passes[passIndex];
+                                // EF_DrawGeneralPasses skips ordinary material
+                                // draws for FOB_FOGPASS. Submit one General
+                                // pass's geometry below for the volume overlay,
+                                // without dispatching its light/shadow passes.
+                                if ((m_RP.m_ObjFlags & FOB_FOGPASS) &&
+                                    pass->m_ePassType != eSHP_General)
+                                    continue;
+                                const bool perLightPass =
+                                    pass->m_ePassType == eSHP_Light ||
+                                    pass->m_ePassType == eSHP_DiffuseLight ||
+                                    pass->m_ePassType == eSHP_SpecularLight;
+                                if (!perLightPass)
+                                    inPerLightPassGroup = false;
+                                else if (!inPerLightPassGroup)
+                                {
+                                    memset(perLightNoBumpBreak, 0, sizeof(perLightNoBumpBreak));
+                                    memset(perLightPassTerminated, 0, sizeof(perLightPassTerminated));
+                                    inPerLightPassGroup = true;
+                                    perLightPassGroupStart = passIndex;
+                                }
                                 if (pass->m_ePassType == eSHP_General)
                                 {
-                                    const bool firstOpaquePass = passIndex == 0 &&
+                                    // GL::EF_DrawGeneralPasses omits the base
+                                    // material on separately queued light objects.
+                                    // Those objects can lack the original LM stream;
+                                    // replaying General overwrites the lit base.
+                                    if ((m_RP.m_ObjFlags & FOB_LIGHTPASS) &&
+                                        (shader->m_Flags & EF_USELIGHTS))
+                                    {
+                                        // This is an intentional skip, so do not
+                                        // invoke the fixed-function fallback below.
+                                        submittedTranslatedTechniquePass = true;
+                                        continue;
+                                    }
+                                    const bool firstOpaquePass = m_RP.m_RendPass == 0 &&
                                         !(m_RP.m_ObjFlags & FOB_LIGHTPASS);
                                     const uint32_t state = firstOpaquePass ? pass->m_RenderState :
                                         pass->m_SecondRenderState;
@@ -1808,20 +2904,36 @@ public:
                                             if (!(itemLightMask & (1u << lightIndex)))
                                                 continue;
                                             CDLight* light = m_RP.m_DLights[lightLevel][lightIndex];
-                                            if (!light || !(light->m_Flags & (DLF_DIRECTIONAL | DLF_POINT)))
+                                            if (!light || !(light->m_Flags &
+                                                (DLF_DIRECTIONAL | DLF_POINT | DLF_PROJECT)))
+                                                continue;
+                                            const int passLightTypes =
+                                                pass->m_LightFlags & DLF_LIGHTTYPE_MASK;
+                                            if (passLightTypes &&
+                                                !(passLightTypes &
+                                                  (light->m_Flags & DLF_LIGHTTYPE_MASK)))
+                                                continue;
+                                            if ((pass->m_LMFlags & LMF_IGNOREPROJLIGHTS) &&
+                                                (light->m_Flags & DLF_PROJECT))
                                                 continue;
                                             if (hasObjectLightmap && (light->m_Flags & DLF_LM) &&
                                                 (pass->m_LMFlags & LMF_NOSPECULAR))
                                                 continue;
                                             matchingLightMask |= 1u << lightIndex;
-                                            const uint8_t encodedLightId =
-                                                static_cast<uint8_t>(light->m_Id + 1);
-                                            for (int occlusionIndex = 0; occlusionIndex < 4; ++occlusionIndex)
+                                            if (hasObjectLightmap &&
+                                                (light->m_Flags & DLF_LM))
                                             {
-                                                if (renderObject->m_OcclLights[occlusionIndex] == encodedLightId)
+                                                const uint8_t encodedLightId =
+                                                    static_cast<uint8_t>(light->m_Id + 1);
+                                                for (int occlusionIndex = 0; occlusionIndex < 4;
+                                                     ++occlusionIndex)
                                                 {
-                                                    hasOccludedMatchingLight = true;
-                                                    break;
+                                                    if (renderObject->m_OcclLights[occlusionIndex] ==
+                                                        encodedLightId)
+                                                    {
+                                                        hasOccludedMatchingLight = true;
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1832,14 +2944,13 @@ public:
                                     const bool hasAmbientLightPass =
                                         (pass->m_LMFlags & LMF_HASAMBIENT) &&
                                         !(pass->m_LMFlags & LMF_DISABLE) &&
-                                        !(pass->m_LMFlags & LMF_NOAMBIENT) &&
                                         !(m_RP.m_ObjFlags & FOB_LIGHTPASS) &&
                                         (!(pass->m_LMFlags & LMF_HASDOT3LM) ||
                                          (resources && renderObject->m_nLMDirId));
                                     if ((matchingLightMask || hasAmbientLightPass) && occlusionPassEligible)
                                     {
                                         m_RP.m_DynLMask = matchingLightMask;
-                                        const bool firstOpaquePass = passIndex == 0 &&
+                                        const bool firstOpaquePass = m_RP.m_RendPass == 0 &&
                                             !(m_RP.m_ObjFlags & FOB_LIGHTPASS);
                                         const uint32_t state = firstOpaquePass ? pass->m_RenderState :
                                             pass->m_SecondRenderState;
@@ -1869,17 +2980,28 @@ public:
                                     const uint32_t itemLightMask = m_RP.m_DynLMask;
                                     CDLight* const previousLight = m_RP.m_pCurLight;
                                     const int previousLightId = m_RP.m_nCurLight;
-                                    const bool hasDirectionalLightmap =
+                                    // EF_DrawLightPasses performs this legacy
+                                    // DLF_LM diffuse rejection once, using only
+                                    // the first pass in the light-pass range.
+                                    // It does not reject every later DiffuseLight
+                                    // pass based on any generic lightmap.
+                                    const bool hasOpenGLDiffuseLightSuppressionMap =
                                         (resources && resources->m_Textures[EFTT_LIGHTMAP_DIR]) ||
                                         renderObject->m_nLMId;
                                     for (int lightIndex = 0;
-                                         lightIndex < m_RP.m_DLights[lightLevel].Num() && lightIndex < 32;
+                                         lightIndex < m_RP.m_DLights[lightLevel].Num() && lightIndex < 8;
                                          ++lightIndex)
                                     {
                                         if (!(itemLightMask & (1u << lightIndex)))
                                             continue;
                                         CDLight* light = m_RP.m_DLights[lightLevel][lightIndex];
-                                        if (!light || (pass->m_LMFlags & LMF_DISABLE))
+                                        if (!light || perLightPassTerminated[lightIndex])
+                                            continue;
+                                        if ((light->m_Flags & DLF_LM) &&
+                                            perLightPassGroupStart >= 0 &&
+                                            technique->m_Passes[perLightPassGroupStart].m_ePassType ==
+                                                eSHP_DiffuseLight &&
+                                            hasOpenGLDiffuseLightSuppressionMap)
                                             continue;
                                         if ((pass->m_LMFlags & LMF_IGNOREPROJLIGHTS) &&
                                             (light->m_Flags & DLF_PROJECT))
@@ -1894,30 +3016,39 @@ public:
                                         if (passLightTypes &&
                                             !(passLightTypes & (light->m_Flags & DLF_LIGHTTYPE_MASK)))
                                             continue;
-                                        if (pass->m_LightFlags & DLF_LM)
+                                        if (passLightTypes && (pass->m_LightFlags & DLF_LM))
                                         {
-                                            if (!(light->m_Flags & DLF_LM) || !hasDirectionalLightmap)
+                                            if (!(light->m_Flags & DLF_LM) ||
+                                                !hasOpenGLDiffuseLightSuppressionMap)
                                                 continue;
                                             if (light->m_SpecColor.r <= 0.01f &&
                                                 light->m_SpecColor.g <= 0.01f &&
                                                 light->m_SpecColor.b <= 0.01f)
                                                 continue;
                                         }
-                                        if ((pass->m_LMFlags & LMF_USEOCCLUSIONMAP) &&
+                                        if (passLightTypes &&
+                                            (pass->m_LMFlags & LMF_USEOCCLUSIONMAP) &&
                                             *reinterpret_cast<const int*>(renderObject->m_OcclLights) == 0)
                                             continue;
-                                        if ((pass->m_LMFlags & LMF_NOBUMP) && resources &&
-                                            (!resources->m_Textures[EFTT_BUMP] ||
-                                             !(resources->m_Textures[EFTT_BUMP]->m_TU.m_nFlags & FTU_NOBUMP)))
+                                        if (pass->m_LMFlags & LMF_NOBUMP)
+                                        {
+                                            if (resources &&
+                                                (!resources->m_Textures[EFTT_BUMP] ||
+                                                 !(resources->m_Textures[EFTT_BUMP]->m_TU.m_nFlags & FTU_NOBUMP)))
+                                                continue;
+                                            perLightNoBumpBreak[lightIndex] = true;
+                                        }
+                                        else if (perLightNoBumpBreak[lightIndex])
+                                        {
+                                            perLightPassTerminated[lightIndex] = true;
                                             continue;
-                                        if ((pass->m_ePassType == eSHP_DiffuseLight) &&
-                                            (light->m_Flags & DLF_LM) &&
-                                            hasDirectionalLightmap)
+                                        }
+                                        if (pass->m_LMFlags & LMF_DISABLE)
                                             continue;
                                         if (pass->m_ePassType == eSHP_SpecularLight &&
-                                            light->m_SpecColor.r <= 0.01f &&
-                                            light->m_SpecColor.g <= 0.01f &&
-                                            light->m_SpecColor.b <= 0.01f)
+                                            light->m_SpecColor.r == 0.0f &&
+                                            light->m_SpecColor.g == 0.0f &&
+                                            light->m_SpecColor.b == 0.0f)
                                             continue;
 
                                         m_RP.m_DynLMask = 1u << lightIndex;
@@ -1938,7 +3069,7 @@ public:
                                                 continue;
                                             }
                                         }
-                                        const bool firstOpaquePass = passIndex == 0 &&
+                                        const bool firstOpaquePass = m_RP.m_RendPass == 0 &&
                                             !(m_RP.m_ObjFlags & FOB_LIGHTPASS);
                                         const uint32_t state = firstOpaquePass ? pass->m_RenderState :
                                             pass->m_SecondRenderState;
@@ -1949,6 +3080,513 @@ public:
                                     m_RP.m_DynLMask = itemLightMask;
                                     m_RP.m_pCurLight = previousLight;
                                     m_RP.m_nCurLight = previousLightId;
+                                }
+                                else if (pass->m_ePassType == eSHP_Shadow)
+                                {
+                                    // Port the stock per-caster shadow-pass
+                                    // loop. ETC_ShadowMap addresses the caster
+                                    // at m_nCurStartCaster plus the texture
+                                    // stage, while SetupShadowOnlyPass builds
+                                    // that receiver's light projection.
+                                    list2<ShadowMapLightSourceInstance>* const shadowCasters =
+                                        renderObject ? static_cast<list2<ShadowMapLightSourceInstance>*>(
+                                            renderObject->m_pShadowCasters) : nullptr;
+                                    if (!shadowCasters || !shadowCasters->Count())
+                                        continue;
+
+                                    int firstCaster = 0;
+                                    if (shader->m_eSort != eS_TerrainShadowPass &&
+                                        !CV_r_selfshadow &&
+                                        !(m_Features & RFT_SHADOWMAP_SELFSHADOW))
+                                    {
+                                        ShadowMapLightSourceInstance& caster =
+                                            shadowCasters->GetAt(0);
+                                        ShadowMapFrustum* frustum = caster.m_pLS ?
+                                            caster.m_pLS->GetShadowMapFrustum() : nullptr;
+                                        if (frustum && frustum->pOwner == caster.m_pReceiver &&
+                                            !(frustum->dwFlags & SMFF_ACTIVE_SHADOW_MAP))
+                                            firstCaster = 1;
+                                    }
+
+                                    uint32_t samplesPerPass = 1;
+                                    if (pass->m_LMFlags & LMF_SAMPLES)
+                                    {
+                                        if (pass->m_LMFlags & LMF_4SAMPLES) samplesPerPass = 4;
+                                        else if (pass->m_LMFlags & LMF_3SAMPLES) samplesPerPass = 3;
+                                        else if (pass->m_LMFlags & LMF_2SAMPLES) samplesPerPass = 2;
+                                    }
+                                    const int savedCasterStart = m_RP.m_nCurStartCaster;
+                                    const uint32_t savedFlushFlags = m_RP.m_FlagsPerFlush;
+                                    const uint32_t savedLightMask = m_RP.m_DynLMask;
+                                    CDLight* const savedLight = m_RP.m_pCurLight;
+                                    const int savedLightId = m_RP.m_nCurLight;
+                                    for (int casterIndex = firstCaster;
+                                         casterIndex + static_cast<int>(samplesPerPass) <=
+                                             shadowCasters->Count();
+                                         casterIndex += static_cast<int>(samplesPerPass))
+                                    {
+                                        ShadowMapLightSourceInstance& caster =
+                                            shadowCasters->GetAt(casterIndex);
+                                        if (!caster.m_pLS ||
+                                            !caster.m_pLS->GetShadowMapFrustum())
+                                            continue;
+
+                                        CDLight* matchingLight = nullptr;
+                                        int matchingLightIndex = -1;
+                                        const int lightLevel = SRendItem::m_RecurseLevel;
+                                        if (lightLevel >= 0 && lightLevel < 8)
+                                        {
+                                            for (int lightIndex = 0;
+                                                 lightIndex < m_RP.m_DLights[lightLevel].Num() &&
+                                                 lightIndex < 32;
+                                                 ++lightIndex)
+                                            {
+                                                if (!(m_RP.m_DynLMask & (1u << lightIndex)))
+                                                    continue;
+                                                CDLight* light = m_RP.m_DLights[lightLevel][lightIndex];
+                                                if (!light || light->m_Id != caster.m_pLS->nDLightId)
+                                                    continue;
+                                                const int requiredTypes =
+                                                    pass->m_LightFlags & DLF_LIGHTTYPE_MASK;
+                                                if (requiredTypes &&
+                                                    !(requiredTypes &
+                                                      (light->m_Flags & DLF_LIGHTTYPE_MASK)))
+                                                    continue;
+                                                matchingLight = light;
+                                                matchingLightIndex = lightIndex;
+                                                break;
+                                            }
+                                        }
+                                        if ((pass->m_LightFlags & DLF_LIGHTTYPE_MASK) &&
+                                            !matchingLight)
+                                            continue;
+                                        // OpenGL narrows the caster list to the
+                                        // current light before EF_DrawShadowPasses.
+                                        // Vulkan keeps the object's full list,
+                                        // so apply that light ownership filter
+                                        // explicitly for every light pass.
+                                        if (savedLightMask && !matchingLight)
+                                            continue;
+
+                                        m_RP.m_nCurStartCaster = casterIndex;
+                                        m_RP.m_FlagsPerFlush |= RBSI_SHADOWPASS;
+                                        if (matchingLight)
+                                        {
+                                            m_RP.m_pCurLight = matchingLight;
+                                            m_RP.m_nCurLight = matchingLight->m_Id;
+                                            m_RP.m_DynLMask = 1u << matchingLightIndex;
+                                        }
+                                        const uint32_t shadowState =
+                                            (m_RP.m_RendPass || (m_RP.m_ObjFlags & FOB_LIGHTPASS)) ?
+                                                pass->m_SecondRenderState : pass->m_RenderState;
+                                        DrawRenderItem(item->Item, shader, pass, resources,
+                                                       shadowState, cull, true);
+                                        submittedTranslatedTechniquePass = true;
+                                    }
+                                    m_RP.m_nCurStartCaster = savedCasterStart;
+                                    m_RP.m_FlagsPerFlush = savedFlushFlags;
+                                    m_RP.m_DynLMask = savedLightMask;
+                                    m_RP.m_pCurLight = savedLight;
+                                    m_RP.m_nCurLight = savedLightId;
+                                }
+                                else if (pass->m_ePassType == eSHP_MultiShadows)
+                                {
+                                    // OpenGL treats MultiShadows as a delimiter
+                                    // for a run of per-light Shadow/Light passes.
+                                    // Execute that run against caster subsets
+                                    // keyed by ShadowMapLightSourceInstance's
+                                    // dynamic-light id, as EF_DrawMultiShadowPasses
+                                    // does, instead of falling through to the
+                                    // untranslated-shader fallback.
+                                    int shadowStart = -1;
+                                    int shadowEnd = -1;
+                                    int lightmapShadowStart = -1;
+                                    int lightmapShadowEnd = -1;
+                                    int lightStart = -1;
+                                    int lightEnd = -1;
+                                    int groupEnd = passIndex;
+                                    for (int groupPass = passIndex + 1;
+                                         groupPass < technique->m_Passes.Num(); ++groupPass)
+                                    {
+                                        const EShaderPassType groupType =
+                                            technique->m_Passes[groupPass].m_ePassType;
+                                        if (groupType == eSHP_Shadow)
+                                        {
+                                            SShaderPassHW* shadowPass =
+                                                &technique->m_Passes[groupPass];
+                                            const bool lightmapShadow =
+                                                (shadowPass->m_SecondRenderState & GS_BLEND_MASK) ==
+                                                (GS_BLSRC_SRCALPHA | GS_BLDST_ONEMINUSSRCALPHA);
+                                            if (lightmapShadow)
+                                            {
+                                                if (lightmapShadowStart < 0)
+                                                    lightmapShadowStart = groupPass;
+                                                lightmapShadowEnd = groupPass;
+                                            }
+                                            else
+                                            {
+                                                if (shadowStart < 0) shadowStart = groupPass;
+                                                shadowEnd = groupPass;
+                                            }
+                                            groupEnd = groupPass;
+                                        }
+                                        else if (groupType == eSHP_Light ||
+                                                 groupType == eSHP_DiffuseLight ||
+                                                 groupType == eSHP_SpecularLight)
+                                        {
+                                            if (lightStart < 0) lightStart = groupPass;
+                                            lightEnd = groupPass;
+                                            groupEnd = groupPass;
+                                        }
+                                        else
+                                            break;
+                                    }
+
+                                    list2<ShadowMapLightSourceInstance>* const allCasters =
+                                        renderObject ? static_cast<list2<ShadowMapLightSourceInstance>*>(
+                                            renderObject->m_pShadowCasters) : nullptr;
+                                    const int lightLevel = SRendItem::m_RecurseLevel;
+                                    const int lightCount = lightLevel >= 0 && lightLevel < 8 ?
+                                        m_RP.m_NumActiveDLights : 0;
+                                    const uint32_t savedLightMask = m_RP.m_DynLMask;
+                                    const int savedCasterStart = m_RP.m_nCurStartCaster;
+                                    const uint32_t savedFlushFlags = m_RP.m_FlagsPerFlush;
+                                    CDLight* const savedLight = m_RP.m_pCurLight;
+                                    const int savedLightId = m_RP.m_nCurLight;
+                                    list2<ShadowMapLightSourceInstance> lightCasters[16];
+                                    list2<ShadowMapLightSourceInstance> lightmapCasters;
+                                    CDLight* lights[16]{};
+                                    int lightIndices[16]{};
+                                    int lightOrder[16]{};
+                                    int groupedLights = 0;
+                                    const bool hasDirectionalLightmap = resources &&
+                                        renderObject && renderObject->m_nLMDirId > 0;
+
+                                    if (allCasters && lightCount > 0)
+                                    {
+                                        const int maxLights = crymin(lightCount, 16);
+                                        for (int activeLightIndex = 0;
+                                             activeLightIndex < maxLights; ++activeLightIndex)
+                                        {
+                                            CDLight* light =
+                                                m_RP.m_pActiveDLights[activeLightIndex];
+                                            if (!light)
+                                                continue;
+                                            int dynamicLightIndex = -1;
+                                            for (int lightIndex = 0;
+                                                 lightIndex < m_RP.m_DLights[lightLevel].Num() &&
+                                                 lightIndex < 32;
+                                                 ++lightIndex)
+                                            {
+                                                if (m_RP.m_DLights[lightLevel][lightIndex] == light)
+                                                {
+                                                    dynamicLightIndex = lightIndex;
+                                                    break;
+                                                }
+                                            }
+                                            if (dynamicLightIndex < 0 ||
+                                                !(savedLightMask & (1u << dynamicLightIndex)))
+                                                continue;
+                                            lights[groupedLights] = light;
+                                            lightIndices[groupedLights] = dynamicLightIndex;
+                                            lightOrder[groupedLights] = groupedLights;
+                                            for (int casterIndex = 0;
+                                                 casterIndex < allCasters->Count(); ++casterIndex)
+                                            {
+                                                ShadowMapLightSourceInstance& caster =
+                                                    allCasters->GetAt(casterIndex);
+                                                if (!caster.m_pLS ||
+                                                    caster.m_pLS->nDLightId != light->m_Id)
+                                                    continue;
+                                                const bool lightmapCaster =
+                                                    hasDirectionalLightmap &&
+                                                    (light->m_Flags & DLF_LM);
+                                                if (lightmapCaster)
+                                                {
+                                                    ShadowMapFrustum* frustum =
+                                                        caster.m_pLS->GetShadowMapFrustum();
+                                                    if (!frustum || !frustum->pOwner ||
+                                                        !(frustum->pOwner->GetRndFlags() &
+                                                          ERF_CASTSHADOWINTOLIGHTMAP))
+                                                        lightmapCasters.Add(caster);
+                                                }
+                                                else
+                                                    lightCasters[groupedLights].Add(caster);
+                                            }
+                                            ++groupedLights;
+                                        }
+
+                                        // Match OpenGL's SShadowLight sort: process
+                                        // lights with the most caster frustums first.
+                                        for (int i = 0; i < groupedLights; ++i)
+                                            for (int j = i + 1; j < groupedLights; ++j)
+                                                if (lightCasters[lightOrder[j]].Count() >
+                                                    lightCasters[lightOrder[i]].Count())
+                                                    std::swap(lightOrder[i], lightOrder[j]);
+                                    }
+
+                                    const auto drawShadowPassesForLight =
+                                        [&](list2<ShadowMapLightSourceInstance>& casterList,
+                                            int groupedLight, int firstPass, int lastPass)
+                                    {
+                                        if (firstPass < 0 || lastPass < firstPass ||
+                                            casterList.IsEmpty() ||
+                                            (groupedLight >= groupedLights))
+                                            return;
+                                        list2<ShadowMapLightSourceInstance>* const savedCasters =
+                                            static_cast<list2<ShadowMapLightSourceInstance>*>(
+                                                renderObject->m_pShadowCasters);
+                                        renderObject->m_pShadowCasters = &casterList;
+                                        m_RP.m_FlagsPerFlush |= RBSI_SHADOWPASS;
+                                        const auto selectCasterLight =
+                                            [&](ShadowMapLightSourceInstance& caster)
+                                        {
+                                            int selected = groupedLight;
+                                            if (selected < 0)
+                                            {
+                                                for (int i = 0; i < groupedLights; ++i)
+                                                    if (lights[i] && caster.m_pLS &&
+                                                        lights[i]->m_Id == caster.m_pLS->nDLightId)
+                                                    {
+                                                        selected = i;
+                                                        break;
+                                                    }
+                                            }
+                                            if (selected >= 0 && selected < groupedLights)
+                                            {
+                                                m_RP.m_pCurLight = lights[selected];
+                                                m_RP.m_nCurLight = lights[selected]->m_Id;
+                                                m_RP.m_DynLMask = 1u << lightIndices[selected];
+                                            }
+                                            return selected;
+                                        };
+                                        int firstCaster = 0;
+                                        if (shader->m_eSort != eS_TerrainShadowPass &&
+                                            !CV_r_selfshadow &&
+                                            !(m_Features & RFT_SHADOWMAP_SELFSHADOW))
+                                        {
+                                            ShadowMapLightSourceInstance& caster =
+                                                casterList.GetAt(0);
+                                            ShadowMapFrustum* frustum = caster.m_pLS ?
+                                                caster.m_pLS->GetShadowMapFrustum() : nullptr;
+                                            if (frustum && frustum->pOwner == caster.m_pReceiver &&
+                                                !(frustum->dwFlags & SMFF_ACTIVE_SHADOW_MAP))
+                                                firstCaster = 1;
+                                        }
+                                        int casterStep = 1;
+                                        for (int casterIndex = firstCaster;
+                                             casterIndex < casterList.Count();
+                                             casterIndex += casterStep)
+                                        {
+                                            ShadowMapLightSourceInstance& caster =
+                                                casterList.GetAt(casterIndex);
+                                            if (!caster.m_pLS ||
+                                                !caster.m_pLS->GetShadowMapFrustum())
+                                                continue;
+                                            const int casterLight = selectCasterLight(caster);
+                                            if (casterLight < 0)
+                                                continue;
+                                            for (int shadowPassIndex = firstPass;
+                                                 shadowPassIndex <= lastPass;
+                                                 ++shadowPassIndex)
+                                            {
+                                                SShaderPassHW* shadowPass =
+                                                    &technique->m_Passes[shadowPassIndex];
+                                                if (shadowPass->m_ePassType != eSHP_Shadow)
+                                                    continue;
+                                                const int requiredTypes = shadowPass->m_LightFlags &
+                                                    DLF_LIGHTTYPE_MASK;
+                                                if (requiredTypes &&
+                                                    !(requiredTypes &
+                                                      (lights[casterLight]->m_Flags &
+                                                       DLF_LIGHTTYPE_MASK)))
+                                                    continue;
+                                                uint32_t sampleCount = 1;
+                                                if (shadowPass->m_LMFlags & LMF_SAMPLES)
+                                                {
+                                                    if (shadowPass->m_LMFlags & LMF_4SAMPLES)
+                                                        sampleCount = 4;
+                                                    else if (shadowPass->m_LMFlags & LMF_3SAMPLES)
+                                                        sampleCount = 3;
+                                                    else if (shadowPass->m_LMFlags & LMF_2SAMPLES)
+                                                        sampleCount = 2;
+                                                }
+                                                if (casterIndex + static_cast<int>(sampleCount) >
+                                                    casterList.Count())
+                                                    continue;
+                                                // EF_DrawShadowPasses updates the
+                                                // outer caster stride while it
+                                                // walks the pass list. The last
+                                                // eligible sampled pass decides
+                                                // the next caster index; taking
+                                                // the maximum across passes skips
+                                                // casters OpenGL actually draws.
+                                                if (shadowPass->m_LMFlags & LMF_SAMPLES)
+                                                    casterStep = static_cast<int>(sampleCount);
+                                                bool sampleTypesMatch = true;
+                                                if (requiredTypes)
+                                                    for (uint32_t sample = 1;
+                                                         sample < sampleCount; ++sample)
+                                                    {
+                                                        ShadowMapLightSourceInstance& sampleCaster =
+                                                            casterList.GetAt(casterIndex + sample);
+                                                        int sampleLight = selectCasterLight(sampleCaster);
+                                                        if (sampleLight < 0 ||
+                                                            !(requiredTypes &
+                                                              (lights[sampleLight]->m_Flags &
+                                                               DLF_LIGHTTYPE_MASK)))
+                                                        {
+                                                            sampleTypesMatch = false;
+                                                            break;
+                                                        }
+                                                    }
+                                                if (!sampleTypesMatch)
+                                                {
+                                                    selectCasterLight(caster);
+                                                    continue;
+                                                }
+                                                selectCasterLight(caster);
+                                                m_RP.m_nCurStartCaster = casterIndex;
+                                                const uint32_t shadowState =
+                                                    (m_RP.m_RendPass ||
+                                                     (m_RP.m_ObjFlags & FOB_LIGHTPASS)) ?
+                                                        shadowPass->m_SecondRenderState :
+                                                        shadowPass->m_RenderState;
+                                                DrawRenderItem(item->Item, shader, shadowPass,
+                                                    resources, shadowState, cull, true);
+                                                submittedTranslatedTechniquePass = true;
+                                            }
+                                        }
+                                        renderObject->m_pShadowCasters = savedCasters;
+                                    };
+
+                                    const auto drawLightPassesForLight =
+                                        [&](int groupedLight)
+                                    {
+                                        if (lightStart < 0 || lightEnd < lightStart ||
+                                            groupedLight < 0 ||
+                                            (m_RP.m_RendPass != 0 &&
+                                             m_RP.m_fCurOpacity != 1.0f))
+                                            return;
+                                        // Match EF_DrawLightPasses' one early
+                                        // test against its first pass and its
+                                        // specific LM_DIR/object-lightmap test.
+                                        const bool hasOpenGLDiffuseLightSuppressionMap =
+                                            (resources &&
+                                             resources->m_Textures[EFTT_LIGHTMAP_DIR]) ||
+                                            renderObject->m_nLMId;
+                                        if (technique->m_Passes[lightStart].m_ePassType ==
+                                                eSHP_DiffuseLight &&
+                                            (lights[groupedLight]->m_Flags & DLF_LM) &&
+                                            hasOpenGLDiffuseLightSuppressionMap)
+                                            return;
+                                        m_RP.m_pCurLight = lights[groupedLight];
+                                        m_RP.m_nCurLight = lights[groupedLight]->m_Id;
+                                        m_RP.m_DynLMask = 1u << lightIndices[groupedLight];
+                                        bool breakAfterNoBump = false;
+                                        for (int lightPassIndex = lightStart;
+                                             lightPassIndex <= lightEnd; ++lightPassIndex)
+                                        {
+                                            SShaderPassHW* lightPass =
+                                                &technique->m_Passes[lightPassIndex];
+                                            if (lightPass->m_ePassType != eSHP_Light &&
+                                                lightPass->m_ePassType != eSHP_DiffuseLight &&
+                                                lightPass->m_ePassType != eSHP_SpecularLight)
+                                                continue;
+                                            const int requiredTypes = lightPass->m_LightFlags &
+                                                DLF_LIGHTTYPE_MASK;
+                                            if (requiredTypes &&
+                                                !(requiredTypes &
+                                                  (lights[groupedLight]->m_Flags &
+                                                   DLF_LIGHTTYPE_MASK)))
+                                                continue;
+                                            if ((lightPass->m_LMFlags & LMF_IGNOREPROJLIGHTS) &&
+                                                (lights[groupedLight]->m_Flags & DLF_PROJECT))
+                                                continue;
+                                            if (requiredTypes &&
+                                                (lightPass->m_LMFlags & LMF_USEOCCLUSIONMAP) &&
+                                                *reinterpret_cast<const int*>(
+                                                    renderObject->m_OcclLights) == 0)
+                                                continue;
+                                            if (requiredTypes &&
+                                                (lightPass->m_LightFlags & DLF_LM))
+                                            {
+                                                if (!(lights[groupedLight]->m_Flags & DLF_LM) ||
+                                                    !hasOpenGLDiffuseLightSuppressionMap ||
+                                                    (lights[groupedLight]->m_SpecColor.r <= 0.01f &&
+                                                     lights[groupedLight]->m_SpecColor.g <= 0.01f &&
+                                                     lights[groupedLight]->m_SpecColor.b <= 0.01f))
+                                                    continue;
+                                            }
+                                            if (lightPass->m_LMFlags & LMF_NOBUMP)
+                                            {
+                                                if (resources &&
+                                                    (!resources->m_Textures[EFTT_BUMP] ||
+                                                     !(resources->m_Textures[EFTT_BUMP]->m_TU.m_nFlags &
+                                                       FTU_NOBUMP)))
+                                                    continue;
+                                                breakAfterNoBump = true;
+                                            }
+                                            else if (breakAfterNoBump)
+                                                break;
+                                            if (lightPass->m_LMFlags & LMF_DISABLE)
+                                                continue;
+                                            if (lightPass->m_ePassType == eSHP_SpecularLight &&
+                                                lights[groupedLight]->m_SpecColor.r == 0.0f &&
+                                                lights[groupedLight]->m_SpecColor.g == 0.0f &&
+                                                lights[groupedLight]->m_SpecColor.b == 0.0f)
+                                                continue;
+                                            SLightIndicies* const previousLightIndices =
+                                                m_RP.m_pCurLightIndices;
+                                            m_RP.m_pCurLightIndices = &m_RP.m_FakeLightIndices;
+                                            if (CullGeometryForLightsEnabled() &&
+                                                EF_IsOnlyLightPass(lightPass) &&
+                                                item->Item->mfGetType() == eDATA_OcLeaf)
+                                            {
+                                                m_RP.m_pCurLightIndices =
+                                                    static_cast<CREOcLeaf*>(item->Item)->
+                                                        mfGetIndiciesForLight(lights[groupedLight]);
+                                                if (!m_RP.m_pCurLightIndices)
+                                                {
+                                                    m_RP.m_pCurLightIndices = previousLightIndices;
+                                                    continue;
+                                                }
+                                            }
+                                            const uint32_t lightState =
+                                                (m_RP.m_RendPass ||
+                                                 (m_RP.m_ObjFlags & FOB_LIGHTPASS)) ?
+                                                    lightPass->m_SecondRenderState :
+                                                    lightPass->m_RenderState;
+                                            DrawRenderItem(item->Item, shader, lightPass,
+                                                resources, lightState, cull, true);
+                                            m_RP.m_pCurLightIndices = previousLightIndices;
+                                            submittedTranslatedTechniquePass = true;
+                                        }
+                                    };
+
+                                    if (allCasters)
+                                    {
+                                        if (!lightmapCasters.IsEmpty() &&
+                                            lightmapShadowStart >= 0)
+                                            drawShadowPassesForLight(lightmapCasters, -1,
+                                                lightmapShadowStart, lightmapShadowEnd);
+                                        for (int groupedLight = 0;
+                                             groupedLight < groupedLights; ++groupedLight)
+                                        {
+                                            const int sortedLight = lightOrder[groupedLight];
+                                            drawShadowPassesForLight(lightCasters[sortedLight],
+                                                sortedLight,
+                                                shadowStart, shadowEnd);
+                                            drawLightPassesForLight(sortedLight);
+                                        }
+                                    }
+                                    m_RP.m_pCurObject->m_pShadowCasters = allCasters;
+                                    m_RP.m_DynLMask = savedLightMask;
+                                    m_RP.m_nCurStartCaster = savedCasterStart;
+                                    m_RP.m_FlagsPerFlush = savedFlushFlags;
+                                    m_RP.m_pCurLight = savedLight;
+                                    m_RP.m_nCurLight = savedLightId;
+                                    passIndex = groupEnd;
                                 }
                                 else if (pass->m_ePassType == eSHP_Fur ||
                                          pass->m_ePassType == eSHP_SimulatedFur)
@@ -1985,8 +3623,8 @@ public:
                                 for (int passIndex = 0; passIndex < shader->m_Passes.Num(); ++passIndex)
                                 {
                                     SShaderPass* pass = &shader->m_Passes[passIndex];
-                                    const bool firstOpaquePass = passIndex == 0 &&
-                                        !(m_RP.m_ObjFlags & FOB_LIGHTPASS);
+                                    const bool firstOpaquePass = m_RP.m_RendPass == 0 &&
+                                        !(m_RP.m_pCurObject->m_ObjFlags & FOB_LIGHTPASS);
                                     const uint32_t state = firstOpaquePass ? pass->m_RenderState :
                                         pass->m_SecondRenderState;
                                     DrawRenderItem(item->Item, shader, pass, resources, state,
@@ -2001,10 +3639,14 @@ public:
                     }
                     else if (shader && shader->m_Passes.Num() > 0)
                     {
+                        PrepareStockFlushState(renderObject, shader);
+                        m_RP.m_fCurOpacity = resources && !resources->m_AlphaRef &&
+                            !(shader->m_Flags2 & EF2_IGNORERESOURCESTATES) ?
+                            resources->m_Opacity : 1.0f;
                         for (int passIndex = 0; passIndex < shader->m_Passes.Num(); ++passIndex)
                         {
                             SShaderPass* pass = &shader->m_Passes[passIndex];
-                            const bool firstOpaquePass = passIndex == 0 &&
+                            const bool firstOpaquePass = m_RP.m_RendPass == 0 &&
                                 !(m_RP.m_ObjFlags & FOB_LIGHTPASS);
                             const uint32_t state = firstOpaquePass ? pass->m_RenderState :
                                 pass->m_SecondRenderState;
@@ -2020,6 +3662,23 @@ public:
                 }
                 // Mirror EF_PipeLine's per-list cleanup/state restoration.
                 m_RP.m_pRE = nullptr;
+                UpdateStockNearestCamera(false);
+                if (m_RP.m_PersFlags & RBPF_SETCLIPPLANE)
+                {
+                    EF_SetClipPlane(false, nullptr, false);
+                    m_RP.m_PersFlags &= ~RBPF_SETCLIPPLANE;
+                }
+                m_frameRenderer->SetStockDepthRange(m_RP.m_fMinDepthRange,
+                                                    m_RP.m_fMaxDepthRange);
+                m_RP.m_PersFlags &= ~(RBPF_MATRIXNOTLOADED | RBPF_PS1NEEDSET |
+                    RBPF_PS2NEEDSET | RBPF_TSNEEDSET | RBPF_VSNEEDSET);
+                // CGLTexMan::BindNULL(1) disables every higher texture target
+                // and clears its bind cache, while retaining combiner state.
+                for (int stage = 1; stage < 8; ++stage)
+                    m_stageTextureIds[stage] = 0;
+                if (m_TexMan) m_TexMan->m_nCurStages = 1;
+                SelectTMU(0);
+                SetScissor(0, 0, 0, 0);
                 m_RP.m_pFogVolume = nullptr;
                 m_RP.m_pCurTechnique = nullptr;
                 m_RP.m_pShader = nullptr;
@@ -2034,6 +3693,13 @@ public:
         }
 
         m_auditFrameActive = false;
+#if defined(__ANDROID__)
+        if (!m_collectingShadowCasters && recurseLevel == 0 && m_sceneTrace)
+        {
+            fclose(m_sceneTrace);
+            m_sceneTrace = nullptr;
+        }
+#endif
         CNULLRenderer::EF_EndEf3D(flags);
     }
 
@@ -2152,10 +3818,36 @@ public:
             return;
         }
 
-        // DrawBuffer is called once per render chunk. For
-        // R_PRIMV_MULTI_STRIPS, firstIndex/indexCount already identify that
-        // chunk's strip (as in GL_VertBuffer's DrawBuffer path); do not walk
-        // the render element's entire CMatInfo list here.
+        // LeafBuffer::AddRenderElements submits only the first material when
+        // a client texture is bound. Terrain sectors and OutdoorWaterCircle
+        // use that path: their one item represents every strip in the buffer,
+        // as in GL_VertBuffer's multi-strip submission callback. Preserve
+        // separate strip draws so adjoining ranges are never joined together.
+        if (primitiveType == R_PRIMV_MULTI_STRIPS && m_RP.m_pRE &&
+            m_RP.m_pRE->mfGetType() == eDATA_OcLeaf)
+        {
+            CREOcLeaf* element = static_cast<CREOcLeaf*>(m_RP.m_pRE);
+            CLeafBuffer* leaf = element->m_pBuffer;
+            list2<CMatInfo>* materials = m_RP.m_pRE->mfGetMatInfoList();
+            if (leaf && leaf->m_nClientTextureBindID && materials)
+            {
+                const int indexBase = firstIndex -
+                    (materialInfo ? materialInfo->nFirstIndexId : 0);
+                for (int strip = 0; strip < materials->Count(); ++strip)
+                {
+                    CMatInfo* material = materials->Get(strip);
+                    if (material->nNumIndices < 3)
+                        continue;
+                    DrawBuffer(vertices, indices, material->nNumIndices,
+                               indexBase + material->nFirstIndexId,
+                               R_PRIMV_TRIANGLE_STRIP, flags,
+                               material->nNumVerts, material);
+                }
+                return;
+            }
+        }
+
+        // Buffers without a shared client texture enqueue each chunk itself.
         int topology = -1;
         if (primitiveType == R_PRIMV_TRIANGLES) topology = 0;
         else if (primitiveType == R_PRIMV_TRIANGLE_STRIP ||
@@ -2171,6 +3863,8 @@ public:
         float modelView[16] = {};
         float textureMatrix[16] = {};
         int textureIds[2] = {};
+        float shadowMapTransforms[8][16]{};
+        uint32_t shadowMapStageMask = 0;
         bool textureStage1UsesTexCoord1 = true;
         CryVR::VulkanStockTextureStage textureStage2{};
         const CryVR::VulkanStockTextureStage* textureStage2Ptr = nullptr;
@@ -2178,76 +3872,328 @@ public:
         const CryVR::VulkanStockTextureStage* textureStage3Ptr = nullptr;
         CryVR::VulkanStockTextureStage textureStages4To7[4]{};
         const CryVR::VulkanStockTextureStage* textureStages4To7Ptr = nullptr;
-        float textureLodBias[2] = {};
+        float textureLodBias[2] = { m_stageLodBias[0], m_stageLodBias[1] };
         float normalMapLodBias = 0.0f;
         int colorOps[2] = { eCO_MODULATE, eCO_MODULATE };
         int alphaOps[2] = { eCO_MODULATE, eCO_MODULATE };
         uint32_t colorArgs[2] = { DEF_TEXARG0, DEF_TEXARG1 };
         uint32_t alphaArgs[2] = { DEF_TEXARG0, DEF_TEXARG1 };
         float textureMatrices[2][16] = {};
-        std::vector<uint8_t> generatedVertexData;
-        std::vector<float> lightmapTexCoords;
+        CryVR::VulkanStockLinearTexgen linearTexgen[8]{};
+        // Keep scratch capacities across draws; nesting gets a separate slot.
+        struct ScratchDepthRelease
+        {
+            size_t& depth;
+            ~ScratchDepthRelease() { --depth; }
+        } scratchRelease{m_drawScratchDepth};
+        const size_t scratchIndex = m_drawScratchDepth++;
+        if (m_drawScratch.size() <= scratchIndex) m_drawScratch.emplace_back();
+        DrawScratch& scratchStorage = m_drawScratch[scratchIndex];
+        auto& generatedVertexData = scratchStorage.generatedVertices;
+        auto& lightmapTexCoords = scratchStorage.lightmapCoordinates;
+        generatedVertexData.clear();
+        lightmapTexCoords.clear();
+        float terrainProjectionRows[2][8][4]{};
+        bool hasTerrainProjection = false;
         bool beamDeformActive = false;
         bool flareDeformActive = false;
         std::vector<struct_VERTEX_FORMAT_P3F_COL4UB_TEX2F> flareVertexData;
         std::vector<uint16_t> flareIndexData;
         int lightmapStage = -1;
+        bool explicitLightmapPointer = false;
+        const SArrayPointer* textureCoordinatePointers[8]{};
+        const SArrayPointer* normalPointer = nullptr;
+        int textureCoordinatePointerOrder[8]{};
+        int nextTextureCoordinatePointerOrder = 0;
+        bool techniqueHasLightmap = false;
+        bool techniqueHasDirectionalLightmap = false;
         if (m_RP.m_pCurTechnique)
         {
+            if (m_RP.m_pShader)
+            {
+                for (int techniqueIndex = 0;
+                     techniqueIndex < m_RP.m_pShader->m_HWTechniques.Num() &&
+                     techniqueIndex < m_RP.m_pShader->m_HWConditions.Num(); ++techniqueIndex)
+                {
+                    if (m_RP.m_pShader->m_HWTechniques[techniqueIndex] == m_RP.m_pCurTechnique)
+                    {
+                        techniqueHasLightmap =
+                            (m_RP.m_pShader->m_HWConditions[techniqueIndex].m_Flags &
+                             SHCF_HASLM) != 0;
+                        techniqueHasDirectionalLightmap =
+                            (m_RP.m_pShader->m_HWConditions[techniqueIndex].m_Flags &
+                             SHCF_HASDOT3LM) != 0;
+                        break;
+                    }
+                }
+            }
             for (int pointerIndex = 0;
                  pointerIndex < m_RP.m_pCurTechnique->m_Pointers.Num(); ++pointerIndex)
             {
                 SArrayPointer* pointer = m_RP.m_pCurTechnique->m_Pointers[pointerIndex];
-                if (pointer && pointer->ePT == eSrcPointer_TexLM)
+                if (pointer && pointer->eDst == eDstPointer_Normal)
+                    normalPointer = pointer;
+                if (pointer && pointer->eDst == eDstPointer_Tex0 &&
+                    pointer->Stage >= 0 && pointer->Stage < 8)
                 {
-                    lightmapStage = pointer->Stage;
-                    break;
+                    textureCoordinatePointers[pointer->Stage] = pointer;
+                    textureCoordinatePointerOrder[pointer->Stage] = ++nextTextureCoordinatePointerOrder;
                 }
             }
         }
-        if (lightmapStage < 0 && m_activePass &&
+        const bool hasMaterialLightmap = m_activeResources &&
+            m_activeResources->m_Textures[EFTT_LIGHTMAP];
+        const bool hasObjectDirectionalLightmap = m_RP.m_pCurObject &&
+            m_RP.m_pCurObject->m_nLMDirId != 0;
+        const bool hasMaterialDirectionalLightmap = m_activeResources &&
+            m_activeResources->m_Textures[EFTT_LIGHTMAP_DIR];
+        const bool hasMultiLightsDirectionalLightmap =
+            hasObjectDirectionalLightmap || hasMaterialDirectionalLightmap;
+        const bool hasObjectLightmap = m_RP.m_pCurObject &&
+            m_RP.m_pCurObject->m_nLMId != 0;
+        bool isFirstHardwareGeneralPass = false;
+        if (m_activeHardwarePassType == eSHP_General && m_RP.m_pCurTechnique && m_activePass)
+        {
+            for (int passIndex = 0; passIndex < m_RP.m_pCurTechnique->m_Passes.Num(); ++passIndex)
+            {
+                SShaderPassHW* pass = &m_RP.m_pCurTechnique->m_Passes[passIndex];
+                if (pass->m_ePassType != eSHP_General)
+                    continue;
+                isFirstHardwareGeneralPass = pass == m_activePass;
+                break;
+            }
+        }
+        // Stock CG techniques sample object lightmaps from their program and
+        // therefore have no declared SShaderPassHW texture units or array
+        // pointers. If the NULL-backed technique selection falls back to an
+        // otherwise valid General pass, still attach the object's baked map
+        // to that one base pass. OpenGL's EF_FlushHW/CGRCAmbientTempl does
+        // this implicitly through the HasLM program variant.
+        const bool shaderLightingDisabled = m_RP.m_pShader &&
+            (m_RP.m_pShader->m_LMFlags & LMF_DISABLE);
+        const SShaderPassHW* stockHardwarePass = m_activePass &&
+            m_activeHardwarePassType != eSHP_MAX ?
+            static_cast<SShaderPassHW*>(m_activePass) : nullptr;
+        int stockWaterMode = 0;
+        if (stockHardwarePass)
+        {
+            const char* program = stockHardwarePass->m_StockFragmentProgram;
+            if (!stricmp(program, "CGRCLowMedWater")) stockWaterMode = 1;
+            else if (!stricmp(program, "CGRCIndoorWater_final")) stockWaterMode = 2;
+            else if (!stricmp(program, "CGRCIndoorWaterSpec")) stockWaterMode = 3;
+            else if (!stricmp(program, "CGRCOutdoorWaterRefraction")) stockWaterMode = 4;
+            else if (!stricmp(program, "CGRCIndoorWater")) stockWaterMode = 5;
+            else if (!stricmp(program, "CGRCWater")) stockWaterMode = 7;
+            else if (!stricmp(program, "CGRCWater_Beach_Refr")) stockWaterMode = 8;
+            else if (!stricmp(program, "CGRCWater_Beach")) stockWaterMode = 9;
+            else if (!stricmp(program, "CGRCOcean_NoRefl") || !stricmp(program, "CGRCOcean")) stockWaterMode = 6;
+            if (!stockWaterMode &&
+                !strnicmp(stockHardwarePass->m_StockVertexProgram, "CGVProgWater_Beach_Shift", 25))
+                stockWaterMode = 10;
+        }
+        const bool stockAmbientTemplate = stockHardwarePass &&
+            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCAmbientTempl");
+        const bool stockLightTemplate = stockHardwarePass &&
+            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCLightTempl");
+        const bool stockParticleAmbient = stockHardwarePass &&
+            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCAmbient_Particle");
+        const bool stockTerrainLayerBase = stockHardwarePass &&
+            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCTerrainLayerTempl") &&
+            !(stockHardwarePass->m_StockProgramMask & 0x10000000u);
+        // OpenGL's TerrainShadowPass is a two-stage material program, not a
+        // generic shadowed texture combine. Its fragment program writes the
+        // terrain albedo/lighting to RGB and the inverse shadow comparison to
+        // alpha; the declared SRC_ALPHA blend then overlays only shadowed
+        // pixels. Keep this identity through the stock Vulkan draw path.
+        const bool stockTerrainShadowProgram = stockHardwarePass &&
+            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCTerrainShadow");
+        if (stockAmbientTemplate)
+        {
+            techniqueHasLightmap = (stockHardwarePass->m_StockProgramMask & 0x02000000ull) != 0;
+            techniqueHasDirectionalLightmap =
+                (stockHardwarePass->m_StockProgramMask & 0x01000000ull) != 0;
+        }
+        const bool implicitHardwareLightmapBasePass = !shaderLightingDisabled && isFirstHardwareGeneralPass &&
+            !stockAmbientTemplate &&
+            !(stockHardwarePass && stockHardwarePass->m_StockFragmentProgram[0]) &&
+            (hasObjectLightmap || hasMaterialLightmap);
+        const uint32_t activeHardwareLightFlags =
+            m_activeHardwarePassType != eSHP_MAX && m_activePass ?
+                static_cast<SShaderPassHW*>(m_activePass)->m_LMFlags :
+                (m_RP.m_pShader ? m_RP.m_pShader->m_LMFlags : 0);
+        // DrawRenderItem increments m_RendPass before calling DrawBuffer,
+        // unlike GL's EF_FlushHW which tests the initial pass at zero.
+        const bool activeHardwareLightmapBasePass =
+            !shaderLightingDisabled && ((m_activeHardwarePassType == eSHP_General &&
+              (techniqueHasLightmap || techniqueHasDirectionalLightmap ||
+               implicitHardwareLightmapBasePass)) ||
+             (m_activeHardwarePassType == eSHP_MultiLights &&
+              (activeHardwareLightFlags & LMF_HASAMBIENT))) &&
+            !(activeHardwareLightFlags & LMF_DISABLE) &&
+            !(m_RP.m_ObjFlags & FOB_LIGHTPASS) && m_RP.m_RendPass <= 1 &&
+            (!(activeHardwareLightFlags & LMF_HASDOT3LM) ||
+             hasMultiLightsDirectionalLightmap);
+        // LMF_NOAMBIENT removes the ambient term, not the baked lightmap.
+        const bool activeHardwareAmbientPass = activeHardwareLightmapBasePass &&
+            !(activeHardwareLightFlags & LMF_NOAMBIENT);
+        const bool directionalLightmapPass =
+            activeHardwareLightmapBasePass &&
+            (techniqueHasDirectionalLightmap || implicitHardwareLightmapBasePass) &&
+            m_RP.m_pCurObject &&
+            (m_RP.m_pCurObject->m_nLMId > 0 || hasMaterialLightmap) &&
+            (hasObjectDirectionalLightmap || hasMaterialDirectionalLightmap) &&
+            m_activeResources && (stockAmbientTemplate || m_activeResources->m_Textures[EFTT_BUMP]);
+        if (directionalLightmapPass)
+            // AmbPassTempl orders the DOT3 samplers as diffuse, bump,
+            // lightmap, and lightmap direction. UV set 1 belongs to stages 2/3.
+            lightmapStage = 2;
+        if (m_activePass &&
             m_activeHardwarePassType != eSHP_MAX)
         {
             SShaderPassHW* hardwarePass = static_cast<SShaderPassHW*>(m_activePass);
             for (int pointerIndex = 0; pointerIndex < hardwarePass->m_Pointers.Num(); ++pointerIndex)
             {
                 SArrayPointer* pointer = hardwarePass->m_Pointers[pointerIndex];
-                if (pointer && pointer->ePT == eSrcPointer_TexLM)
+                if (pointer && pointer->eDst == eDstPointer_Normal)
+                    normalPointer = pointer;
+                if (pointer && pointer->eDst == eDstPointer_Tex0 &&
+                    pointer->Stage >= 0 && pointer->Stage < 8)
                 {
-                    lightmapStage = pointer->Stage;
-                    break;
+                    textureCoordinatePointers[pointer->Stage] = pointer;
+                    textureCoordinatePointerOrder[pointer->Stage] = ++nextTextureCoordinatePointerOrder;
                 }
+            }
+        }
+        // A pass may replace a technique's TexLM binding with ordinary UVs
+        // on the same destination stage. Resolve destinations before deciding
+        // which stages consume the separate object lightmap stream.
+        int lastLightmapPointerOrder = 0;
+        for (int stage = 0; stage < 8; ++stage)
+        {
+            const SArrayPointer* pointer = textureCoordinatePointers[stage];
+            if (pointer && pointer->ePT == eSrcPointer_TexLM &&
+                textureCoordinatePointerOrder[stage] > lastLightmapPointerOrder)
+            {
+                lightmapStage = stage;
+                explicitLightmapPointer = true;
+                lastLightmapPointerOrder = textureCoordinatePointerOrder[stage];
             }
         }
         if (m_activePass && lightmapStage < 0)
             for (int stage = 0; stage < m_activePass->m_TUnits.Num() && stage < 8; ++stage)
-                if (m_activePass->m_TUnits[stage].m_eGenTC == eGTC_LightMap)
+                if (m_activePass->m_TUnits[stage].m_eGenTC == eGTC_LightMap ||
+                    (m_activePass->m_TUnits[stage].m_TexPic &&
+                     (m_activePass->m_TUnits[stage].m_TexPic->m_Bind == EFTT_LIGHTMAP ||
+                      m_activePass->m_TUnits[stage].m_TexPic->m_Bind == EFTT_LIGHTMAP_DIR ||
+                      m_activePass->m_TUnits[stage].m_TexPic->m_Bind == EFTT_OCCLUSION)))
                 {
                     lightmapStage = stage;
                     break;
                 }
+        // OpenGL's programmable hardware techniques keep their samplers in
+        // the shader program, so SShaderPassHW::m_TUnits and its pointer list
+        // are empty even when the object's baked lightmap is part of the
+        // material. Translate that missing base-pass sampler explicitly;
+        // never attach it to dynamic light/specular passes.
+        const bool synthesizeHardwareBaseLightmap = lightmapStage < 0 &&
+            activeHardwareLightmapBasePass && m_activePass &&
+            m_activePass->m_TUnits.Num() == 0 && m_RP.m_pCurObject &&
+            (m_RP.m_pCurObject->m_nLMId > 0 || hasMaterialLightmap);
+        if (m_auditFrameActive && m_activeHardwarePassType == eSHP_General &&
+            m_RP.m_pCurObject && m_RP.m_pCurObject->m_nLMId > 0)
+            CryLogAlways("Vulkan audit LIGHTMAP_DECISION frame=%d list=%d item=%d pass=%p type=%d technique=%p firstGeneral=%d objectLm=%d objectDirLm=%d materialLm=%d techniqueLm=%d techniqueDot3=%d base=%d stage=%d units=%d rendPass=%d objFlags=0x%x lmFlags=0x%x synth=%d",
+                GetFrameID(), m_auditCurrentList, m_auditCurrentItem, m_activePass,
+                static_cast<int>(m_activeHardwarePassType), m_RP.m_pCurTechnique,
+                isFirstHardwareGeneralPass ? 1 : 0, m_RP.m_pCurObject->m_nLMId,
+                m_RP.m_pCurObject->m_nLMDirId, hasMaterialLightmap ? 1 : 0,
+                techniqueHasLightmap ? 1 : 0, techniqueHasDirectionalLightmap ? 1 : 0,
+                activeHardwareLightmapBasePass ? 1 : 0, lightmapStage,
+                m_activePass ? m_activePass->m_TUnits.Num() : -1, m_RP.m_RendPass,
+                m_RP.m_ObjFlags, activeHardwareLightFlags,
+                synthesizeHardwareBaseLightmap ? 1 : 0);
+        if (synthesizeHardwareBaseLightmap)
+            lightmapStage = 1;
+        // Match OpenGL: m_nLMId chooses the image only for a texture stage
+        // that the selected pass already declares as a lightmap stage. An
+        // object having a lightmap does not add a new stage to every pass.
         const bool hasLightmapTexCoordSource = lightmapStage >= 0;
         if (hasLightmapTexCoordSource)
         {
             CCObject* object = m_RP.m_pCurObject;
             CLeafBuffer* lmBuffer = object ? object->m_pLMTCBufferO : nullptr;
-            if (lightmapStage > 7 || !lmBuffer || !lmBuffer->m_pSecVertBuffer ||
-                !lmBuffer->m_pSecVertBuffer->m_VS[VSF_GENERAL].m_VData ||
-                lmBuffer->m_pSecVertBuffer->m_vertexformat != VERTEX_FORMAT_TEX2F ||
-                lmBuffer->m_SecVertCount < vertices->m_NumVerts)
+            // CREOcLeaf::mfGetPointer(TexLM) binds the primary LM stream.
+            // Its CPU shadow is a fallback when the video stream has no
+            // retained data; it is not the only valid source.
+            CVertexBuffer* lmVertices = lmBuffer ? lmBuffer->m_pVertexBuffer : nullptr;
+            if (!lmVertices || !lmVertices->m_VS[VSF_GENERAL].m_VData ||
+                lmVertices->m_vertexformat != VERTEX_FORMAT_TEX2F)
+                lmVertices = lmBuffer ? lmBuffer->m_pSecVertBuffer : nullptr;
+            const int lmVertexCount = lmVertices == (lmBuffer ? lmBuffer->m_pVertexBuffer : nullptr) && lmVertices ?
+                lmVertices->m_NumVerts : (lmBuffer ? lmBuffer->m_SecVertCount : 0);
+            if (lightmapStage > 7)
             {
                 m_frameRenderer->RequirePanelFallback();
                 return;
             }
-            const struct_VERTEX_FORMAT_TEX2F* source =
-                static_cast<const struct_VERTEX_FORMAT_TEX2F*>(
-                    lmBuffer->m_pSecVertBuffer->m_VS[VSF_GENERAL].m_VData);
-            lightmapTexCoords.resize(static_cast<size_t>(vertices->m_NumVerts) * 2);
-            for (int vertex = 0; vertex < vertices->m_NumVerts; ++vertex)
+            if (lmVertices && lmVertices->m_VS[VSF_GENERAL].m_VData &&
+                lmVertices->m_vertexformat == VERTEX_FORMAT_TEX2F && lmVertexCount > 0)
             {
-                lightmapTexCoords[static_cast<size_t>(vertex) * 2] = source[vertex].st[0];
-                lightmapTexCoords[static_cast<size_t>(vertex) * 2 + 1] = source[vertex].st[1];
+                const struct_VERTEX_FORMAT_TEX2F* source =
+                    static_cast<const struct_VERTEX_FORMAT_TEX2F*>(
+                        lmVertices->m_VS[VSF_GENERAL].m_VData);
+                // GL binds the LM stream independently of the main VBO. A
+                // material chunk need not reference every vertex in that VBO.
+                const uint16_t* chunkIndices =
+                    static_cast<const uint16_t*>(indices->m_VData) + firstIndex;
+                for (int index = 0; lmVertexCount < vertices->m_NumVerts &&
+                     index < indexCount; ++index)
+                    if (chunkIndices[index] >= lmVertexCount)
+                    {
+                        m_frameRenderer->RequirePanelFallback();
+                        return;
+                    }
+                lightmapTexCoords.resize(static_cast<size_t>(vertices->m_NumVerts) * 2);
+                const int copiedVertices = crymin(vertices->m_NumVerts, lmVertexCount);
+                for (int vertex = 0; vertex < copiedVertices; ++vertex)
+                {
+                    lightmapTexCoords[static_cast<size_t>(vertex) * 2] = source[vertex].st[0];
+                    lightmapTexCoords[static_cast<size_t>(vertex) * 2 + 1] = source[vertex].st[1];
+                }
+                textureStage1UsesTexCoord1 = true;
             }
+            else if (explicitLightmapPointer)
+            {
+                // CREOcLeaf::mfGetPointer(eSrcPointer_TexLM) returns the start
+                // of the ordinary vertex stream when no separate LM buffer
+                // exists. GL therefore reads position X/Y as its vec2 UV.
+                textureStage1UsesTexCoord1 = false;
+                CryVR::VulkanVertexFormat lmSourceFormat{};
+                if (CryVR::GetVulkanVertexFormat(
+                        static_cast<uint32_t>(vertices->m_vertexformat), lmSourceFormat))
+                {
+                    for (uint32_t attribute = 0; attribute < lmSourceFormat.attributeCount;
+                         ++attribute)
+                    {
+                        const VkVertexInputAttributeDescription& position =
+                            lmSourceFormat.attributes[attribute];
+                        if (position.location != 0 ||
+                            position.format != VK_FORMAT_R32G32B32_SFLOAT ||
+                            position.offset + sizeof(float) * 2 > lmSourceFormat.stride)
+                            continue;
+                        const uint8_t* source = static_cast<const uint8_t*>(
+                            vertices->m_VS[VSF_GENERAL].m_VData);
+                        lightmapTexCoords.resize(static_cast<size_t>(vertices->m_NumVerts) * 2);
+                        for (int vertex = 0; vertex < vertices->m_NumVerts; ++vertex)
+                            memcpy(&lightmapTexCoords[static_cast<size_t>(vertex) * 2],
+                                   source + static_cast<size_t>(vertex) * lmSourceFormat.stride +
+                                       position.offset, sizeof(float) * 2);
+                        textureStage1UsesTexCoord1 = true;
+                        break;
+                    }
+                }
+            }
+            else if (vertices->m_vertexformat != 16)
+                textureStage1UsesTexCoord1 = false;
         }
         const void* drawVertexData = vertices->m_VS[VSF_GENERAL].m_VData;
         CryVR::VulkanVertexFormat stockVertexFormat{};
@@ -2256,6 +4202,7 @@ public:
         uint32_t positionOffset = 0xffffffffu;
         uint32_t normalOffset = 0xffffffffu;
         uint32_t colorOffset = 0xffffffffu;
+        uint32_t secondaryColorOffset = 0xffffffffu;
         uint32_t uv0Offset = 0xffffffffu;
         uint32_t uv1Offset = 0xffffffffu;
         if (stockVertexFormatValid)
@@ -2267,15 +4214,43 @@ public:
                 else if (desc.location == 1) normalOffset = desc.offset;
                 else if (desc.location == 2) colorOffset = desc.offset;
                 else if (desc.location == 3) uv0Offset = desc.offset;
+                else if (desc.location == 4) secondaryColorOffset = desc.offset;
                 else if (desc.location == 5) uv1Offset = desc.offset;
             }
         }
         const SPipTangents* sourceTangentBasis = nullptr;
+        const uint8_t* sourcePositionData = static_cast<const uint8_t*>(
+            vertices->m_VS[VSF_GENERAL].m_VData);
+        uint32_t sourcePositionStride = stockVertexFormat.stride;
+        uint32_t sourcePositionOffset = positionOffset;
+        CryVR::VulkanVertexFormat cpuSourceFormat = stockVertexFormat;
         if (m_RP.m_pRE && m_RP.m_pRE->mfGetType() == eDATA_OcLeaf)
         {
             CREOcLeaf* leafElement = static_cast<CREOcLeaf*>(m_RP.m_pRE);
             CLeafBuffer* leafBuffer = leafElement->m_pBuffer ?
                 leafElement->m_pBuffer->GetVertexContainer() : nullptr;
+            if (leafBuffer && leafBuffer->m_pSecVertBuffer &&
+                leafBuffer->m_SecVertCount >= vertices->m_NumVerts &&
+                leafBuffer->m_pSecVertBuffer->m_VS[VSF_GENERAL].m_VData)
+            {
+                CryVR::VulkanVertexFormat sourceFormat{};
+                if (CryVR::GetVulkanVertexFormat(
+                        leafBuffer->m_pSecVertBuffer->m_vertexformat, sourceFormat))
+                    for (uint32_t attribute = 0; attribute < sourceFormat.attributeCount; ++attribute)
+                    {
+                        const VkVertexInputAttributeDescription& position = sourceFormat.attributes[attribute];
+                        if (position.location == 0 && position.format == VK_FORMAT_R32G32B32_SFLOAT &&
+                            position.offset + sizeof(float) * 3 <= sourceFormat.stride)
+                        {
+                            sourcePositionData = static_cast<const uint8_t*>(
+                                leafBuffer->m_pSecVertBuffer->m_VS[VSF_GENERAL].m_VData);
+                            sourcePositionStride = sourceFormat.stride;
+                            sourcePositionOffset = position.offset;
+                            cpuSourceFormat = sourceFormat;
+                            break;
+                        }
+                    }
+            }
             if (leafBuffer && leafBuffer->m_pSecVertBuffer &&
                 leafBuffer->m_SecVertCount >= vertices->m_NumVerts &&
                 leafBuffer->m_pSecVertBuffer->m_VS[VSF_TANGENTS].m_VData)
@@ -2294,6 +4269,18 @@ public:
                     static_cast<size_t>(vertices->m_NumVerts);
                 generatedVertexData.resize(byteCount);
                 memcpy(generatedVertexData.data(), vertices->m_VS[VSF_GENERAL].m_VData, byteCount);
+                if (m_stockColorCacheFrame != m_RP.m_Frame)
+                {
+                    m_stockGeneratedColors.clear();
+                    m_stockColorCacheFrame = m_RP.m_Frame;
+                }
+                const auto previous = m_stockGeneratedColors.find(vertices);
+                if (colorOffset != 0xffffffffu && previous != m_stockGeneratedColors.end() &&
+                    previous->second.vertexFormat == vertices->m_vertexformat &&
+                    previous->second.colors.size() == static_cast<size_t>(vertices->m_NumVerts) * 4u)
+                    for (int vertex = 0; vertex < vertices->m_NumVerts; ++vertex)
+                        memcpy(generatedVertexData.data() + static_cast<size_t>(vertex) * stockVertexFormat.stride +
+                            colorOffset, previous->second.colors.data() + static_cast<size_t>(vertex) * 4u, 4u);
                 drawVertexData = generatedVertexData.data();
             }
             return generatedVertexData.data();
@@ -2321,20 +4308,45 @@ public:
             }
         }
 
+        std::vector<const SDeform*> stockDeforms;
+        if (m_activePass && m_RP.m_pShader && m_RP.m_pShader->m_Deforms)
+            for (int index = 0; index < m_RP.m_pShader->m_Deforms->Num(); ++index)
+                stockDeforms.push_back(&m_RP.m_pShader->m_Deforms->Get(index));
+        if (m_activePass && (m_activeHardwarePassType == eSHP_General ||
+             m_activeHardwarePassType == eSHP_Shadow ||
+             m_activeHardwarePassType == eSHP_MultiShadows))
+        {
+            SShaderPassHW* deformPass = static_cast<SShaderPassHW*>(m_activePass);
+            if (deformPass->m_Deforms)
+                for (int index = 0; index < deformPass->m_Deforms->Num(); ++index)
+                    stockDeforms.push_back(&deformPass->m_Deforms->Get(index));
+        }
         // OpenGL applies SShader::m_Deforms to CPU mesh streams before UV
         // generation. Reproduce its common vertex/normal-based forms on a
         // private upload copy so shared leaf buffers remain untouched.
-        if (m_activePass && m_RP.m_pShader && m_RP.m_pShader->m_Deforms &&
-            m_RP.m_pShader->m_Deforms->Num() > 0)
+        if (!stockDeforms.empty())
         {
+            const int deformFirstVertex = m_RP.m_pRE ? m_RP.m_FirstVertex : 0;
+            const int deformVertexCount = m_RP.m_pRE ? m_RP.m_RendNumVerts : vertices->m_NumVerts;
+            if (deformFirstVertex < 0 || deformFirstVertex > vertices->m_NumVerts ||
+                deformVertexCount < 0 || deformVertexCount > vertices->m_NumVerts - deformFirstVertex)
+            {
+                m_frameRenderer->RequirePanelFallback();
+                return;
+            }
+            const int deformEndVertex = deformFirstVertex + deformVertexCount;
             uint8_t* data = ensureVertexCopy();
             if (!data || positionOffset == 0xffffffffu)
                 m_frameRenderer->RequirePanelFallback();
             else
             {
-                for (int deformIndex = 0; deformIndex < m_RP.m_pShader->m_Deforms->Num(); ++deformIndex)
+                for (int deformIndex = 0; deformIndex < static_cast<int>(stockDeforms.size()); ++deformIndex)
                 {
-                    const SDeform& deform = m_RP.m_pShader->m_Deforms->Get(deformIndex);
+                    const SDeform& deform = *stockDeforms[deformIndex];
+                    // SEvalFuncs_C::VerticalWaveDeform is empty; only the
+                    // render-element evaluator implements this operation.
+                    if (deform.m_eType == eDT_VerticalWave && !m_RP.m_pRE)
+                        continue;
                     const bool needsNormal = deform.m_eType == eDT_Wave ||
                         deform.m_eType == eDT_Squeeze || deform.m_eType == eDT_Bulge;
                     if (deform.m_eType == eDT_Flare)
@@ -2352,10 +4364,10 @@ public:
                         // applied to the original vertex copy here.
                         bool hasFollowingGeometryDeform = false;
                         for (int followingIndex = deformIndex + 1;
-                             followingIndex < m_RP.m_pShader->m_Deforms->Num(); ++followingIndex)
+                             followingIndex < static_cast<int>(stockDeforms.size()); ++followingIndex)
                         {
                             const EDeformType followingType =
-                                m_RP.m_pShader->m_Deforms->Get(followingIndex).m_eType;
+                                stockDeforms[followingIndex]->m_eType;
                             if (followingType != eDT_Unknown && followingType != eDT_Flare)
                             {
                                 hasFollowingGeometryDeform = true;
@@ -2632,7 +4644,7 @@ public:
                         Matrix44& inverseObject = m_RP.m_pCurObject->GetInvMatrix();
                         Vec3d cameraPosition;
                         TransformPosition(cameraPosition, m_RP.m_ViewOrg, inverseObject);
-                        for (int vertex = 0; vertex < vertices->m_NumVerts; ++vertex)
+                        for (int vertex = deformFirstVertex; vertex < deformEndVertex; ++vertex)
                         {
                             uint8_t* source = data + static_cast<size_t>(vertex) * stockVertexFormat.stride;
                             float position[3], normal[3], sourcePosition[3];
@@ -2680,7 +4692,8 @@ public:
                         }
                         continue;
                     }
-                    if (needsNormal && normalOffset == 0xffffffffu && !sourceTangentBasis)
+                    if (needsNormal && normalOffset == 0xffffffffu &&
+                        !(m_RP.m_pRE && sourceTangentBasis))
                     {
                         m_frameRenderer->RequirePanelFallback();
                         continue;
@@ -2689,7 +4702,7 @@ public:
                         // EF_Eval_DeformVerts logs an unknown type and leaves
                         // the current vertex stream unchanged.
                         continue;
-                    for (int vertex = 0; vertex < vertices->m_NumVerts; ++vertex)
+                    for (int vertex = deformFirstVertex; vertex < deformEndVertex; ++vertex)
                     {
                         uint8_t* source = data + static_cast<size_t>(vertex) * stockVertexFormat.stride;
                         float position[3] = {};
@@ -2697,7 +4710,7 @@ public:
                         memcpy(position, source + positionOffset, sizeof(position));
                         if (needsNormal)
                         {
-                            if (sourceTangentBasis)
+                            if (m_RP.m_pRE && sourceTangentBasis)
                             {
                                 const Vec3& sourceTNormal = sourceTangentBasis[vertex].m_TNormal;
                                 normal[0] = sourceTNormal.x;
@@ -2798,6 +4811,9 @@ public:
         for (int stage = 0; stage < 2; ++stage)
             textureMatrices[stage][0] = textureMatrices[stage][5] =
                 textureMatrices[stage][10] = textureMatrices[stage][15] = 1.0f;
+        for (int stage = 0; stage < 8; ++stage)
+            shadowMapTransforms[stage][0] = shadowMapTransforms[stage][5] =
+                shadowMapTransforms[stage][10] = shadowMapTransforms[stage][15] = 1.0f;
 
         // OpenGL starts from the texture matrix stack's identity and only
         // loads the material matrix when Update() reports a real transform.
@@ -2860,19 +4876,45 @@ public:
             stage.uvTransform[7] = matrix[7];
             stage.uvTransform[8] = matrix[15];
         };
+        const auto captureShadowStage = [&](int stage, const SShaderTexUnit* unit,
+                                             int resolvedTextureId)
+        {
+            if (stage < 0 || stage >= 8)
+                return;
+            if (unit && unit->m_eGenTC == eGTC_ShadowMap &&
+                resolvedTextureId >= 0x40000000)
+            {
+                memcpy(shadowMapTransforms[stage],
+                       m_cEF.m_TempMatrices[stage][0].GetData(),
+                       sizeof(shadowMapTransforms[stage]));
+                shadowMapStageMask |= 1u << stage;
+            }
+            else
+                shadowMapStageMask &= ~(1u << stage);
+        };
 
-        const auto generateLegacyTexCoords = [&](int stage, const SShaderTexUnit* unit)
+        const auto generateLegacyTexCoords = [&](int stage, const SShaderTexUnit* unit,
+                                                 const float* stageMatrix)
         {
             if (flareDeformActive)
                 return;
-            if (!unit || !unit->m_TexPic ||
-                unit->m_eGenTC == eGTC_NoFill || unit->m_eGenTC == eGTC_None ||
-                unit->m_eGenTC == eGTC_Base || unit->m_eGenTC == eGTC_LightMap)
+            // GL mfSetTexture resolves the image through pSTU but enables
+            // hardware texgen from the pass unit (this), independently of
+            // its software eGenTC mode.
+            SGenTC* stageGenerator = unit ? unit->m_GTC : nullptr;
+            if (m_activePass && stage < m_activePass->m_TUnits.Num())
+                stageGenerator = m_activePass->m_TUnits[stage].m_GTC;
+            if (!unit || (!unit->m_TexPic && !stageGenerator) ||
+                (!stageGenerator && (unit->m_eGenTC == eGTC_NoFill || unit->m_eGenTC == eGTC_None ||
+                unit->m_eGenTC == eGTC_Base || unit->m_eGenTC == eGTC_LightMap)))
                 return;
             // OpenGL's eGTC_Quad CPU generator only fills coordinates when
             // there is no current render element. Leave stock leaf and other
             // render-element UVs untouched, as EF_Eval_TexGen does.
-            if (unit->m_eGenTC == eGTC_Quad && m_RP.m_pRE)
+            if (!stageGenerator && unit->m_eGenTC == eGTC_Quad && m_RP.m_pRE)
+                return;
+            // SEvalFuncs_C::ETC_Projection is empty in the OpenGL reference.
+            if (!stageGenerator && unit->m_eGenTC == eGTC_Projection && !m_RP.m_pRE)
                 return;
             SGenTC_ObjectLinear* objectLinear = nullptr;
             SGenTC_EyeLinear* eyeLinear = nullptr;
@@ -2882,24 +4924,24 @@ public:
             TArray<SParam>* linearParameters = nullptr;
             int linearMask = 0;
             float linearPlanes[4][4] = {};
-            if (unit->m_GTC)
+            if (stageGenerator)
             {
-                if (unit->m_GTC->GetType() == eGTCType_ObjectLinear)
+                if (stageGenerator->GetType() == eGTCType_ObjectLinear)
                 {
-                    objectLinear = static_cast<SGenTC_ObjectLinear*>(unit->m_GTC);
+                    objectLinear = static_cast<SGenTC_ObjectLinear*>(stageGenerator);
                     linearParameters = &objectLinear->m_Params;
                 }
-                else if (unit->m_GTC->GetType() == eGTCType_EyeLinear)
+                else if (stageGenerator->GetType() == eGTCType_EyeLinear)
                 {
-                    eyeLinear = static_cast<SGenTC_EyeLinear*>(unit->m_GTC);
+                    eyeLinear = static_cast<SGenTC_EyeLinear*>(stageGenerator);
                     linearParameters = &eyeLinear->m_Params;
                 }
-                else if (unit->m_GTC->GetType() == eGTCType_NormalMap)
-                    normalMap = static_cast<SGenTC_NormalMap*>(unit->m_GTC);
-                else if (unit->m_GTC->GetType() == eGTCType_ReflectionMap)
-                    reflectionMap = static_cast<SGenTC_ReflectionMap*>(unit->m_GTC);
-                else if (unit->m_GTC->GetType() == eGTCType_SphereMap)
-                    sphereMap = static_cast<SGenTC_SphereMap*>(unit->m_GTC);
+                else if (stageGenerator->GetType() == eGTCType_NormalMap)
+                    normalMap = static_cast<SGenTC_NormalMap*>(stageGenerator);
+                else if (stageGenerator->GetType() == eGTCType_ReflectionMap)
+                    reflectionMap = static_cast<SGenTC_ReflectionMap*>(stageGenerator);
+                else if (stageGenerator->GetType() == eGTCType_SphereMap)
+                    sphereMap = static_cast<SGenTC_SphereMap*>(stageGenerator);
                 else
                 {
                     m_frameRenderer->RequirePanelFallback();
@@ -2908,7 +4950,11 @@ public:
 
                 if (objectLinear || eyeLinear)
                 {
-                    const int requestedMask = unit->m_GTC->m_Mask;
+                    // GLShaders.cpp resets the element parameter cursor
+                    // before either linear generator reads its plane params.
+                    if (m_RP.m_pRE)
+                        m_RP.m_pRE->m_nCountCustomData = 0;
+                    const int requestedMask = stageGenerator->m_Mask;
                     if (requestedMask & ~0xf)
                     {
                         m_frameRenderer->RequirePanelFallback();
@@ -2924,25 +4970,36 @@ public:
                             !(*linearParameters)[coordinate].mfIsValid())
                             continue;
                         linearMask |= 1 << coordinate;
-                        // R is not consumed by a 2D sampler. S, T and Q are
-                        // evaluated below; Q is folded into S/T by the
-                        // homogeneous divide before the texture matrix.
-                        if (coordinate == 2)
-                            continue;
                         float* plane = (*linearParameters)[coordinate].mfGet();
                         memcpy(linearPlanes[coordinate], plane, sizeof(linearPlanes[coordinate]));
                     }
+                    auto& captured = linearTexgen[stage];
+                    captured.enabled = true;
+                    captured.componentMask = static_cast<uint32_t>(linearMask);
+                    memcpy(captured.planes, linearPlanes, sizeof(linearPlanes));
+                    memcpy(captured.textureMatrix, stageMatrix, sizeof(captured.textureMatrix));
+                    // Preserve original UVs; the fragment shader evaluates
+                    // homogeneous planes independently for this TMU.
+                    return;
                 }
             }
 
+            // Higher stages carry independent linear planes through the UBO.
+            // Other generated modes must not overwrite the shared UV1 stream
+            // or index the two legacy textureMatrices slots with stage >= 2.
+            if (stage >= 2)
+            {
+                if (stageGenerator) m_frameRenderer->RequirePanelFallback();
+                return;
+            }
             const bool needsNormal = unit->m_eGenTC == eGTC_Environment ||
                 unit->m_eGenTC == eGTC_SphereMap ||
                 unit->m_eGenTC == eGTC_SphereMapEnvironment || normalMap ||
                 reflectionMap || sphereMap;
             const bool usesTangentNormal =
-                unit->m_eGenTC == eGTC_Environment ||
+                m_RP.m_pRE && (unit->m_eGenTC == eGTC_Environment ||
                 unit->m_eGenTC == eGTC_SphereMap ||
-                unit->m_eGenTC == eGTC_SphereMapEnvironment;
+                unit->m_eGenTC == eGTC_SphereMapEnvironment);
             const bool hasRequiredNormal = usesTangentNormal ?
                 (sourceTangentBasis || HasStockVertexNormal(vertices->m_vertexformat)) :
                 HasStockVertexNormal(vertices->m_vertexformat);
@@ -2978,61 +5035,34 @@ public:
             }
             uint8_t* data = generatedVertexData.data();
             const Vec3d objectTranslation = m_RP.m_pCurObject->GetTranslation();
-            const float* projection = unit->m_TexPic->m_Matrix;
+            const float* projection = unit->m_TexPic ? unit->m_TexPic->m_Matrix : nullptr;
+            bool generatedShadowCoords = false;
             Matrix44 normalTransform;
             if (normalMap || reflectionMap || sphereMap)
             {
                 mathMatrixInverse(normalTransform.GetData(), m_ViewMatrix.GetData(), g_CpuFlags);
                 normalTransform.Transpose();
             }
-            for (int vertex = 0; vertex < vertices->m_NumVerts; ++vertex)
+            const int texgenFirstVertex = m_RP.m_pRE ? m_RP.m_FirstVertex : 0;
+            const int texgenVertexCount = m_RP.m_pRE ? m_RP.m_RendNumVerts : vertices->m_NumVerts;
+            if (texgenFirstVertex < 0 || texgenFirstVertex > vertices->m_NumVerts ||
+                texgenVertexCount < 0 || texgenVertexCount > vertices->m_NumVerts - texgenFirstVertex)
+            {
+                m_frameRenderer->RequirePanelFallback();
+                return;
+            }
+            const int texgenEndVertex = texgenFirstVertex + texgenVertexCount;
+            for (int vertex = texgenFirstVertex; vertex < texgenEndVertex; ++vertex)
             {
                 const uint8_t* source = data + static_cast<size_t>(vertex) * stockVertexFormat.stride;
                 const uint8_t* originalVertex =
-                    static_cast<const uint8_t*>(vertices->m_VS[VSF_GENERAL].m_VData) +
-                    static_cast<size_t>(vertex) * stockVertexFormat.stride;
+                    sourcePositionData + static_cast<size_t>(vertex) * sourcePositionStride;
                 float originalPosition[3] = {};
-                memcpy(originalPosition, originalVertex + positionOffset, sizeof(originalPosition));
+                memcpy(originalPosition, originalVertex + sourcePositionOffset, sizeof(originalPosition));
                 float position[3] = {};
                 memcpy(position, source + positionOffset, sizeof(position));
                 float uv[2] = {};
-                if (objectLinear || eyeLinear)
-                {
-                    memcpy(uv, source + uvOffset, sizeof(uv));
-                    Vec3d generatedPosition(position[0], position[1], position[2]);
-                    if (eyeLinear)
-                        generatedPosition = m_ViewMatrix.TransformPointOLD(generatedPosition);
-                    const float position4[4] = {
-                        generatedPosition.x, generatedPosition.y, generatedPosition.z, 1.0f
-                    };
-                    for (int coordinate = 0; coordinate < 2; ++coordinate)
-                    {
-                        if (!(linearMask & (1 << coordinate)))
-                            continue;
-                        uv[coordinate] = linearPlanes[coordinate][0] * position4[0] +
-                            linearPlanes[coordinate][1] * position4[1] +
-                            linearPlanes[coordinate][2] * position4[2] +
-                            linearPlanes[coordinate][3] * position4[3];
-                    }
-                    if (linearMask & (1 << 3))
-                    {
-                        const float q = linearPlanes[3][0] * position4[0] +
-                            linearPlanes[3][1] * position4[1] +
-                            linearPlanes[3][2] * position4[2] +
-                            linearPlanes[3][3] * position4[3];
-                        if (fabsf(q) > 1.0e-6f)
-                        {
-                            uv[0] /= q;
-                            uv[1] /= q;
-                        }
-                        else
-                        {
-                            m_frameRenderer->RequirePanelFallback();
-                            return;
-                        }
-                    }
-                }
-                else if (normalMap || reflectionMap || sphereMap)
+                if (normalMap || reflectionMap || sphereMap)
                 {
                     float normal[3] = {};
                     memcpy(normal, source + normalOffset, sizeof(normal));
@@ -3079,7 +5109,7 @@ public:
                 else if (needsNormal)
                 {
                     float normal[3] = {};
-                    if (usesTangentNormal && sourceTangentBasis)
+                    if (m_RP.m_pRE && usesTangentNormal && sourceTangentBasis)
                     {
                         const Vec3& sourceTNormal = sourceTangentBasis[vertex].m_TNormal;
                         normal[0] = sourceTNormal.x;
@@ -3094,9 +5124,11 @@ public:
                         // FGP_SRC reads the original vertex stream even when
                         // EF_Eval_DeformVerts has already modified the draw
                         // stream. Use that same undeformed position here.
-                        float view[3] = { objectTranslation.x - originalPosition[0],
-                                           objectTranslation.y - originalPosition[1],
-                                           objectTranslation.z - originalPosition[2] };
+                        const Vec3d viewOrigin = m_RP.m_pRE ? objectTranslation : m_RP.m_ViewOrg;
+                        const float* environmentPosition = m_RP.m_pRE ? originalPosition : position;
+                        float view[3] = { viewOrigin.x - environmentPosition[0],
+                                         viewOrigin.y - environmentPosition[1],
+                                         viewOrigin.z - environmentPosition[2] };
                         const float length = sqrtf(view[0] * view[0] + view[1] * view[1] + view[2] * view[2]);
                         if (length > 1.0e-6f)
                         {
@@ -3104,7 +5136,9 @@ public:
                         }
                         const float dot = view[0] * normal[0] + view[1] * normal[1] + view[2] * normal[2];
                         uv[0] = ((2.0f * dot * normal[1] - view[1]) + 1.0f) * 0.5f;
-                        uv[1] = 0.5f - ((2.0f * dot * normal[2] - view[2]) * 0.5f);
+                        const float reflectedZ = 2.0f * dot * normal[2] - view[2];
+                        uv[1] = m_RP.m_pRE ? 0.5f - reflectedZ * 0.5f :
+                            (reflectedZ + 1.0f) * 0.5f;
                     }
                     else
                     {
@@ -3147,16 +5181,85 @@ public:
                     uv[0] = tx / tw;
                     uv[1] = ty / tw;
                 }
+                else if (unit->m_eGenTC == eGTC_ShadowMap)
+                {
+                    // SEvalFuncs_RE::ETC_ShadowMap selects one frustum per
+                    // shadow-map texture stage, offset by the current sample
+                    // group. Install the same light * object matrix and bind
+                    // the depth texture before generating receiver coords.
+                    CCObject* const receiverObject = m_RP.m_pCurObject;
+                    list2<ShadowMapLightSourceInstance>* const shadowCasters =
+                        receiverObject ? static_cast<list2<ShadowMapLightSourceInstance>*>(
+                            receiverObject->m_pShadowCasters) : nullptr;
+                    const bool terrainShadowPass = m_RP.m_pShader &&
+                        m_RP.m_pShader->m_eSort == eS_TerrainShadowPass;
+                    const int shadowCasterIndex = terrainShadowPass ? 0 :
+                        stage + m_RP.m_nCurStartCaster;
+                    if (!shadowCasters || shadowCasterIndex < 0 ||
+                        shadowCasterIndex >= shadowCasters->Count())
+                        return;
+                    ShadowMapLightSourceInstance& shadowCaster =
+                        shadowCasters->GetAt(shadowCasterIndex);
+                    ShadowMapFrustum* shadowFrustum = shadowCaster.m_pLS ?
+                        shadowCaster.m_pLS->GetShadowMapFrustum() : nullptr;
+                    if (shadowFrustum && shadowCasterIndex > 0 &&
+                        shadowCasters->GetAt(shadowCasterIndex - 1).m_pLS ==
+                            shadowCaster.m_pLS && shadowFrustum->pPenumbra)
+                        shadowFrustum = shadowFrustum->pPenumbra;
+                    if (!shadowFrustum || !shadowFrustum->depth_tex_id)
+                        return;
+                    Matrix44* const receiverMatrix =
+                        (m_RP.m_ObjFlags & FOB_TRANS_MASK) ?
+                            &receiverObject->m_Matrix : nullptr;
+                    SetupShadowOnlyPass(stage, shadowFrustum,
+                        &shadowCaster.m_vProjTranslation,
+                        shadowCaster.m_fProjScale,
+                        receiverObject ? receiverObject->GetTranslation() : Vec3d(0.0f, 0.0f, 0.0f),
+                        1.0f, Vec3d(0.0f, 0.0f, 0.0f), receiverMatrix);
+                    // ETC_ShadowMap installs the light bias * projection *
+                    // view * object matrix in m_TempMatrices[stage][0]. GL
+                    // applies that matrix after object-linear texgen; bake
+                    // the same homogeneous transform into this generated UV
+                    // stream and leave the Vulkan stage matrix at identity
+                    // below so it is not applied twice.
+                    const float* shadowMatrix = m_cEF.m_TempMatrices[stage][0].GetData();
+                    memcpy(shadowMapTransforms[stage], shadowMatrix,
+                           sizeof(shadowMapTransforms[stage]));
+                    shadowMapStageMask |= 1u << stage;
+                    const float tx = originalPosition[0] * shadowMatrix[0] +
+                                     originalPosition[1] * shadowMatrix[4] +
+                                     originalPosition[2] * shadowMatrix[8] + shadowMatrix[12];
+                    const float ty = originalPosition[0] * shadowMatrix[1] +
+                                     originalPosition[1] * shadowMatrix[5] +
+                                     originalPosition[2] * shadowMatrix[9] + shadowMatrix[13];
+                    const float tw = originalPosition[0] * shadowMatrix[3] +
+                                     originalPosition[1] * shadowMatrix[7] +
+                                     originalPosition[2] * shadowMatrix[11] + shadowMatrix[15];
+                    if (fabsf(tw) > 1.0e-6f)
+                    {
+                        uv[0] = tx / tw;
+                        uv[1] = ty / tw;
+                        generatedShadowCoords = true;
+                    }
+                    else
+                    {
+                        m_frameRenderer->RequirePanelFallback();
+                        return;
+                    }
+                }
                 else
                 {
-                    // Shadow-map generation requires OpenGL's shadow-frustum
-                    // setup and render-to-texture pass, neither of which is
-                    // available in this Vulkan frame path yet.
                     m_frameRenderer->RequirePanelFallback();
                     return;
                 }
                 memcpy(data + static_cast<size_t>(vertex) * stockVertexFormat.stride + uvOffset,
                        uv, sizeof(uv));
+            }
+            if (generatedShadowCoords)
+            {
+                memset(textureMatrices[stage], 0, sizeof(textureMatrices[stage]));
+                textureMatrices[stage][0] = textureMatrices[stage][5] =
+                    textureMatrices[stage][10] = textureMatrices[stage][15] = 1.0f;
             }
             drawVertexData = data;
         };
@@ -3172,45 +5275,140 @@ public:
             }
         }
         int normalMapTextureId = 0;
-        float materialLighting[11] = { -0.35f, 0.72f, 0.60f, 0.0f,
-                                       0.78f, 0.78f, 0.78f, 0.22f,
-                                       1.0f, 1.0f, 1.0f };
+        int normalMapTextureStage = -1;
+        float materialLighting[19] = { -0.35f, 0.72f, 0.60f, 0.0f,
+                                       1.0f, 1.0f, 1.0f, 1.0f,
+                                       1.0f, 1.0f, 1.0f, 1.0f, 0.0f };
+        float materialDiffuse[3] = { 1.0f, 1.0f, 1.0f };
+        // The stock lit vertex shaders evaluate the fallback directional
+        // light in object space. Use the sun direction prepared from the
+        // active scene light list and transform it through the object's
+        // inverse matrix; a fixed world-space vector made lighting rotate
+        // with the mesh (and could leave most normals permanently unlit).
+        Vec3d objectSunDirection = m_RP.m_SunDir;
+        if (m_RP.m_pCurObject)
+            objectSunDirection = m_RP.m_pCurObject->GetInvMatrix().TransformVectorOLD(objectSunDirection);
+        if (objectSunDirection.Normalize() == 0.0f)
+            objectSunDirection = Vec3d(0.0f, 0.0f, 1.0f);
+        materialLighting[0] = objectSunDirection.x;
+        materialLighting[1] = objectSunDirection.y;
+        materialLighting[2] = objectSunDirection.z;
+        // GL_LIGHT_MODEL_LOCAL_VIEWER defaults to false, so the fixed-function
+        // specular eye vector is constant in eye space (+Z). CryEngine camera
+        // space looks along +Y; convert that direction and then into object
+        // space for the fixed-function stock-light shader.
+        Matrix34 cameraView = GetCamera().GetVMatrix();
+        Matrix34 inverseCameraView = cameraView.GetInverted();
+        Vec3d objectViewDirection = inverseCameraView.TransformVector(Vec3d(0.0f, -1.0f, 0.0f));
+        if (m_RP.m_pCurObject)
+            objectViewDirection = m_RP.m_pCurObject->GetInvMatrix().TransformVectorOLD(
+                objectViewDirection);
+        if (objectViewDirection.Normalize() == 0.0f)
+            objectViewDirection = Vec3d(0.0f, 0.0f, 1.0f);
+        materialLighting[16] = objectViewDirection.x;
+        materialLighting[17] = objectViewDirection.y;
+        materialLighting[18] = objectViewDirection.z;
+        if (m_activeHardwarePassType == eSHP_MAX)
+            materialLighting[7] = 0.0f;
         if (m_activeResources && m_activeResources->m_LMaterial)
         {
             const SSideMaterial& material = m_activeResources->m_LMaterial->Front;
             materialLighting[8] = material.m_Ambient.r;
             materialLighting[9] = material.m_Ambient.g;
             materialLighting[10] = material.m_Ambient.b;
-            materialLighting[4] = 0.78f * material.m_Diffuse.r;
-            materialLighting[5] = 0.78f * material.m_Diffuse.g;
-            materialLighting[6] = 0.78f * material.m_Diffuse.b;
+            materialDiffuse[0] = material.m_Diffuse.r;
+            materialDiffuse[1] = material.m_Diffuse.g;
+            materialDiffuse[2] = material.m_Diffuse.b;
+            materialLighting[4] = materialDiffuse[0];
+            materialLighting[5] = materialDiffuse[1];
+            materialLighting[6] = materialDiffuse[2];
+            if (m_activeHardwarePassType == eSHP_MAX)
+                materialLighting[7] = material.m_SpecShininess;
         }
-        bool techniqueHasDedicatedLightPass = false;
-        if (m_RP.m_pCurTechnique)
-        {
-            for (int passIndex = 0; passIndex < m_RP.m_pCurTechnique->m_Passes.Num(); ++passIndex)
-            {
-                const EShaderPassType type = m_RP.m_pCurTechnique->m_Passes[passIndex].m_ePassType;
-                if (type == eSHP_Light || type == eSHP_DiffuseLight ||
-                    type == eSHP_MultiLights)
-                {
-                    techniqueHasDedicatedLightPass = true;
-                    break;
-                }
-            }
-        }
-        const bool hardwareAmbientPass =
-            m_activeHardwarePassType == eSHP_General && techniqueHasDedicatedLightPass;
         const bool hardwareLightPass =
             m_activeHardwarePassType == eSHP_Light ||
             m_activeHardwarePassType == eSHP_DiffuseLight ||
             m_activeHardwarePassType == eSHP_SpecularLight ||
             m_activeHardwarePassType == eSHP_MultiLights;
+        const bool hardwareMaterialLightPass =
+            m_activeHardwarePassType == eSHP_Light ||
+            m_activeHardwarePassType == eSHP_DiffuseLight ||
+            m_activeHardwarePassType == eSHP_SpecularLight;
+        // These are additive direct-light passes. The base/ambient material
+        // pass below still draws albedo and baked lightmaps.
+        if (!kVulkanDynamicLightingEnabled && hardwareMaterialLightPass)
+            return;
+        // OpenGL routes these passes through SLightMaterial::mfApply and
+        // EF_LightMaterial; LMF_IGNORELIGHTS deliberately skips EF_SetLights.
+        // MultiLights is its own PS30 path and does not use that executor.
         const bool hardwareSpecularPass = m_activeHardwarePassType == eSHP_SpecularLight;
-        const uint32_t hardwareLightFlags =
-            m_activeHardwarePassType != eSHP_MAX && m_activePass ?
-                static_cast<SShaderPassHW*>(m_activePass)->m_LMFlags : 0;
-        if (m_RP.m_pCurObject)
+        const uint32_t hardwareLightFlags = activeHardwareLightFlags;
+        float hardwareAmbientParameter[4]{};
+        float hardwareTerrainFogColor[4]{};
+        bool hardwareGeneralAmbientProgram = false;
+        bool hardwareMaterialAmbientProgram = false;
+        if ((m_activeHardwarePassType == eSHP_General ||
+             (stockTerrainShadowProgram && m_activeHardwarePassType == eSHP_Shadow) ||
+             (hardwareMaterialLightPass && !hardwareSpecularPass)) && m_activePass &&
+            m_RP.m_pShader && (stockTerrainShadowProgram || !shaderLightingDisabled))
+        {
+            SShaderPassHW* hardwarePass = static_cast<SShaderPassHW*>(m_activePass);
+            TArray<SCGParam4f>* parameterLists[] = {
+                hardwarePass->m_CGFSParamsNoObj, hardwarePass->m_CGFSParamsObj,
+                &hardwarePass->m_VPParamsNoObj, &hardwarePass->m_VPParamsObj };
+            for (TArray<SCGParam4f>* parameters : parameterLists)
+            {
+                if (!parameters) continue;
+                for (int parameter = 0; parameter < parameters->Num(); ++parameter)
+                {
+                    SCGParam4f& value = parameters->Get(parameter);
+                    if (!stricmp(value.m_Name.c_str(), "Ambient"))
+                    {
+                        memcpy(hardwareAmbientParameter, value.mfGet(), sizeof(hardwareAmbientParameter));
+                        hardwareGeneralAmbientProgram = m_activeHardwarePassType == eSHP_General;
+                        hardwareMaterialAmbientProgram = hardwareMaterialLightPass &&
+                            m_RP.m_RendPass == 1 && !(m_RP.m_ObjFlags & FOB_LIGHTPASS);
+                    }
+                    else if (!stricmp(value.m_Name.c_str(), "FogColor"))
+                        memcpy(hardwareTerrainFogColor, value.mfGet(),
+                               sizeof(hardwareTerrainFogColor));
+                }
+            }
+        }
+        // EF_LightMaterial returns before selecting lights for fog objects or
+        // shaders without normals; EF_FlushShader clears lighting without a
+        // light material. Apply those gates before building any Vulkan draws.
+        const bool fixedFunctionMaterialLighting = m_activeHardwarePassType == eSHP_MAX &&
+            !(hardwareLightFlags & (LMF_DISABLE | LMF_BUMPMATERIAL)) &&
+            m_RP.m_pShader && (m_RP.m_pShader->m_Flags & EF_NEEDNORMALS) &&
+            !(m_RP.m_ObjFlags & FOB_FOGPASS) && m_RP.m_pCurObject &&
+            m_activeResources && m_activeResources->m_LMaterial;
+        const bool canTranslateDynamicLights = kVulkanDynamicLightingEnabled && (
+            m_activeHardwarePassType == eSHP_MultiLights ||
+            ((fixedFunctionMaterialLighting || hardwareMaterialLightPass) &&
+             !(activeHardwareLightFlags & LMF_IGNORELIGHTS)));
+        const bool hardwareMultiLightsAmbient =
+            m_activeHardwarePassType == eSHP_MultiLights &&
+            (hardwareLightFlags & LMF_HASAMBIENT) &&
+            !(hardwareLightFlags & (LMF_DISABLE | LMF_NOAMBIENT)) &&
+            !(m_RP.m_ObjFlags & FOB_LIGHTPASS) &&
+            (!(hardwareLightFlags & LMF_HASDOT3LM) || hasMultiLightsDirectionalLightmap);
+        // A GL MultiLights pass evaluates ambient together with its selected
+        // direct lights. Keep the diffuse material term available when those
+        // lights are translated to additive Vulkan draws. With no selected
+        // lights the same pass reduces to ambient only.
+        const bool hardwareAmbientPass = (activeHardwareAmbientPass || hardwareMultiLightsAmbient ||
+            hardwareGeneralAmbientProgram) &&
+            (!hardwareMultiLightsAmbient || m_RP.m_DynLMask == 0);
+        const bool nightMapLighting = (m_RP.m_PersFlags & RBPF_DRAWNIGHTMAP) != 0;
+        if (nightMapLighting)
+        {
+            // SParamComp_AmbLightColor returns opaque white immediately while
+            // rendering night maps, before applying LMF_NOAMBIENT, object
+            // ambient, the light material, or its divide scale.
+            materialLighting[8] = materialLighting[9] = materialLighting[10] = 1.0f;
+        }
+        else if (m_RP.m_pCurObject)
         {
             const CFColor objectAmbient = m_RP.m_pCurObject->m_AmbColor;
             const bool ignoreMaterialAmbient =
@@ -3236,34 +5434,68 @@ public:
                 materialLighting[10] = objectAmbient.b;
             }
         }
-        const bool hardwareMultiLightsAmbient =
-            m_activeHardwarePassType == eSHP_MultiLights &&
-            (hardwareLightFlags & LMF_HASAMBIENT) &&
-            !(hardwareLightFlags & LMF_DISABLE) &&
-            !(hardwareLightFlags & LMF_NOAMBIENT) &&
-            !(m_RP.m_ObjFlags & FOB_LIGHTPASS) &&
-            (!(hardwareLightFlags & LMF_HASDOT3LM) ||
-             (m_activeResources && m_RP.m_pCurObject && m_RP.m_pCurObject->m_nLMDirId));
-        float ambientScale = 1.0f;
-        if (hardwareLightFlags & LMF_DIVIDEAMB4)
-            ambientScale = 0.25f;
-        if (hardwareLightFlags & LMF_DIVIDEAMB2)
-            ambientScale = 0.5f;
-        for (int channel = 8; channel < 11; ++channel)
-            materialLighting[channel] = crymin(materialLighting[channel] * ambientScale, 1.0f);
+        if (!nightMapLighting)
+        {
+            // SParamComp_AmbLightColor filters object/material ambient through
+            // the material diffuse color before clamping each channel.
+            for (int channel = 0; channel < 3; ++channel)
+                materialLighting[8 + channel] *= materialDiffuse[channel];
+            float ambientScale = 1.0f;
+            if (hardwareLightFlags & LMF_DIVIDEAMB4)
+                ambientScale = 0.25f;
+            if (hardwareLightFlags & LMF_DIVIDEAMB2)
+                ambientScale = 0.5f;
+            for (int channel = 8; channel < 11; ++channel)
+                materialLighting[channel] = crymin(materialLighting[channel] * ambientScale, 1.0f);
+        }
         float diffuseScale = 1.0f;
+        if ((hardwareGeneralAmbientProgram || hardwareMaterialAmbientProgram) &&
+            !(hardwareLightFlags & LMF_NOAMBIENT))
+        {
+            // Use the same CGPSParam Ambient components as OpenGL, including
+            // shader-specific multipliers, instead of leaving transparent
+            // general passes at unlit albedo when they have no baked lightmap.
+            materialLighting[8] = hardwareAmbientParameter[0];
+            materialLighting[9] = hardwareAmbientParameter[1];
+            materialLighting[10] = hardwareAmbientParameter[2];
+        }
         if (hardwareLightFlags & LMF_DIVIDEDIFF4)
             diffuseScale = 0.25f;
         if (hardwareLightFlags & LMF_DIVIDEDIFF2)
             diffuseScale = 0.5f;
         for (int channel = 4; channel < 7; ++channel)
             materialLighting[channel] *= diffuseScale;
+        if (m_activeHardwarePassType == eSHP_MAX && m_RP.m_pCurObject &&
+            m_activeResources && m_activeResources->m_LMaterial)
+        {
+            // EF_LightMaterial uses the fixed-function material helpers,
+            // rather than programmable AmbLightColor (which also multiplies
+            // by diffuse). Share the exact GL formulas and channel clamps.
+            const CFColor ambient = EF_GetCurrentAmbient(
+                m_activeResources->m_LMaterial, hardwareLightFlags);
+            const CFColor diffuse = EF_GetCurrentDiffuse(
+                m_activeResources->m_LMaterial, hardwareLightFlags);
+            materialLighting[8] = ambient.r;
+            materialLighting[9] = ambient.g;
+            materialLighting[10] = ambient.b;
+            materialLighting[4] = diffuse.r;
+            materialLighting[5] = diffuse.g;
+            materialLighting[6] = diffuse.b;
+        }
+        if (stockTerrainShadowProgram && m_activeHardwarePassType == eSHP_Shadow)
+        {
+            // CGRCTerrainShadow uses its own CGPSParam Ambient directly; it
+            // must not inherit the generic object/material ambient product.
+            materialLighting[8] = hardwareAmbientParameter[0];
+            materialLighting[9] = hardwareAmbientParameter[1];
+            materialLighting[10] = hardwareAmbientParameter[2];
+        }
         if (hardwareAmbientPass)
         {
             // OpenGL's programmable technique adds dynamic lights in its
             // dedicated light passes, not again in its general/base pass.
             materialLighting[4] = materialLighting[5] = materialLighting[6] = 0.0f;
-            if (hardwareLightFlags & LMF_NOAMBIENT)
+            if (!nightMapLighting && (hardwareLightFlags & LMF_NOAMBIENT))
                 materialLighting[8] = materialLighting[9] = materialLighting[10] = 0.0f;
         }
         else if (hardwareLightPass)
@@ -3271,28 +5503,102 @@ public:
             // Translated per-light passes must not repeat ambient; specular
             // replaces the diffuse tint and uses a negative exponent marker
             // in the existing eight-float lighting payload.
-            if (!hardwareMultiLightsAmbient)
+            if (!hardwareMultiLightsAmbient && !hardwareMaterialAmbientProgram && !nightMapLighting)
                 materialLighting[8] = materialLighting[9] = materialLighting[10] = 0.0f;
             if (hardwareSpecularPass &&
                 (hardwareLightFlags & (LMF_NOSPECULAR | LMF_NOADDSPECULAR)))
                 materialLighting[4] = materialLighting[5] = materialLighting[6] = 0.0f;
         }
 
-        std::vector<std::array<float, 11>> lightPasses;
-        if (!hardwareAmbientPass && HasStockVertexNormal(vertices->m_vertexformat) && m_RP.m_DynLMask &&
+        std::vector<std::array<float, 19>> lightPasses;
+        std::vector<std::array<int, 2>> lightPassSpecularOcclusion;
+        std::vector<bool> ambientOnlyLightPasses;
+        const auto appendLightPass = [&](const std::array<float, 19>& parameters,
+                                         int occlusionTextureId = 0,
+                                         int occlusionChannel = -1,
+                                         bool ambientOnly = false)
+        {
+            lightPasses.push_back(parameters);
+            lightPassSpecularOcclusion.push_back(
+                { occlusionTextureId, occlusionChannel });
+            ambientOnlyLightPasses.push_back(ambientOnly);
+        };
+        bool hasTranslatedDynamicLightPass = false;
+        // OpenGL's MultiLights ambient pass is independent of its packed
+        // direct-light passes. Keep it as the first Vulkan draw as well:
+        // projected lights use materialAmbient.xyz for projector direction,
+        // so they cannot carry the ambient RGB in that same draw.
+        if (hardwareMultiLightsAmbient && !hardwareAmbientPass && m_RP.m_DynLMask)
+        {
+            std::array<float, 19> ambientParameters;
+            memcpy(ambientParameters.data(), materialLighting, sizeof(materialLighting));
+            ambientParameters[4] = ambientParameters[5] = ambientParameters[6] = 0.0f;
+            appendLightPass(ambientParameters, 0, -1, true);
+        }
+        // Position/UV-only scene formats still receive lighting: the fragment
+        // shader reconstructs their face normal from derivatives. Do not gate
+        // the light list on a normal vertex attribute here.
+        const bool fixedFunctionLightList = m_activeHardwarePassType == eSHP_MAX;
+        if (canTranslateDynamicLights && !hardwareAmbientPass &&
+            (fixedFunctionLightList ? m_RP.m_NumActiveDLights != 0 : m_RP.m_DynLMask != 0) &&
             m_RP.m_pCurObject)
         {
             const int lightLevel = SRendItem::m_RecurseLevel;
             if (lightLevel >= 0 && lightLevel < 8)
             {
-                const int lightCount = m_RP.m_DLights[lightLevel].Num();
-                for (int lightIndex = 0; lightIndex < lightCount && lightIndex < 32; ++lightIndex)
+                const int lightCount = fixedFunctionLightList ?
+                    m_RP.m_NumActiveDLights : m_RP.m_DLights[lightLevel].Num();
+                Vec3d lightBoundsCenter(0.0f, 0.0f, 0.0f);
+                float lightBoundsRadius = 1000.0f;
+                if (m_RP.m_pRE)
                 {
-                    if (!(m_RP.m_DynLMask & (1u << lightIndex)))
+                    Vec3d boundsMin, boundsMax;
+                    m_RP.m_pRE->mfGetBBox(boundsMin, boundsMax);
+                    lightBoundsCenter = (boundsMin + boundsMax) * 0.5f;
+                    lightBoundsCenter += m_RP.m_pCurObject->GetTranslation();
+                    lightBoundsRadius = (boundsMax - boundsMin).Length() * 0.5f;
+                }
+                const auto stockRangeAttenuation = [](float distance, float radius)
+                {
+                    if (distance > radius || !(radius > 0.0f))
+                        return 0.0f;
+                    const float a = distance / radius;
+                    const float b = 2.0f * a * a * a - 3.0f * a * a + 1.0f;
+                    // Preserve GLRendPipeline.cpp::sAttenuation's operation
+                    // order as well as its equation; EF_SetLights inverts this
+                    // value to derive the render-element constant/linear terms.
+                    return b / a * a * 2.0f;
+                };
+                const int lightLimit = m_activeHardwarePassType == eSHP_MultiLights ? 32 : 8;
+                bool fixedPointBoundsUsed = false;
+                for (int lightIndex = 0; lightIndex < lightCount && lightIndex < lightLimit; ++lightIndex)
+                {
+                    if (!fixedFunctionLightList && !(m_RP.m_DynLMask & (1u << lightIndex)))
                         continue;
-                    CDLight* light = m_RP.m_DLights[lightLevel][lightIndex];
+                    // GL's eight slots and LMF_LIGHT_MASK index the compact
+                    // EF_BuildLightsList result, not the scene-wide light array.
+                    if (fixedFunctionLightList && (hardwareLightFlags & LMF_LIGHT_MASK) &&
+                        ((hardwareLightFlags & LMF_LIGHT_MASK) >> LMF_LIGHT_SHIFT) != lightIndex)
+                        continue;
+                    CDLight* light = fixedFunctionLightList ?
+                        m_RP.m_pActiveDLights[lightIndex] : m_RP.m_DLights[lightLevel][lightIndex];
                     if (!light || !(light->m_Flags &
                                     (DLF_DIRECTIONAL | DLF_POINT | DLF_PROJECT)))
+                        continue;
+                    // EF_SetLights filters projector lights before preparing
+                    // either diffuse or specular fixed-function contributions.
+                    if (m_activeHardwarePassType == eSHP_MAX &&
+                        (hardwareLightFlags & LMF_IGNOREPROJLIGHTS) &&
+                        (light->m_Flags & DLF_PROJECT))
+                        continue;
+                    // OpenGL treats DLF_LM as specular-only on a surface with
+                    // a baked lightmap. Diffuse from that light is already in
+                    // the map and must not be multiplied into the base pass.
+                    const bool specularOnlyLight =
+                        (m_RP.m_pCurObject->m_nLMId > 0 || hasMaterialLightmap) &&
+                        (light->m_Flags & DLF_LM);
+                    if (m_activeHardwarePassType == eSHP_MAX && specularOnlyLight &&
+                        (hardwareLightFlags & LMF_NOSPECULAR))
                         continue;
                     Vec3d objectLightPosition;
                     TransformPosition(objectLightPosition, light->m_Origin,
@@ -3308,18 +5614,118 @@ public:
                     if (!pointLight && !(lightVectorLength > 1.0e-6f))
                         continue;
 
-                    std::array<float, 11> parameters;
+                    std::array<float, 19> parameters;
                     memcpy(parameters.data(), materialLighting, sizeof(materialLighting));
                     parameters[0] = objectLightPosition.x;
                     parameters[1] = objectLightPosition.y;
                     parameters[2] = objectLightPosition.z;
                     parameters[3] = pointLight ? light->m_fRadius : 0.0f;
-                    const float lightScale = directionalLight ? 1.5f : 1.0f;
-                    parameters[4] *= light->m_Color.r * lightScale;
-                    parameters[5] *= light->m_Color.g * lightScale;
-                    parameters[6] *= light->m_Color.b * lightScale;
-                    if (light->m_Flags & DLF_PROJECT)
+                    // EF_SetLights applies 1.5x only to fixed-function
+                    // directional lights. Programmable LightColor/LightsColor
+                    // components use the raw CDLight color.
+                    const float directionalScale = directionalLight &&
+                        m_activeHardwarePassType == eSHP_MAX ? 1.5f : 1.0f;
+                    parameters[4] *= light->m_Color.r * directionalScale;
+                    parameters[5] *= light->m_Color.g * directionalScale;
+                    parameters[6] *= light->m_Color.b * directionalScale;
+                    if (stockLightTemplate && !hardwareSpecularPass)
                     {
+                        // Evaluate the stock CG parameter itself. Its scalar
+                        // LightColor components clamp independently and may
+                        // have material/user scales absent from a reconstructed
+                        // raw CDLight color.
+                        CDLight* previousLight = m_RP.m_pCurLight;
+                        m_RP.m_pCurLight = light;
+                        TArray<SCGParam4f>* lists[2] = {
+                            stockHardwarePass->m_CGFSParamsNoObj,
+                            stockHardwarePass->m_CGFSParamsObj };
+                        for (TArray<SCGParam4f>* list : lists)
+                            if (list)
+                                for (int parameter = 0; parameter < list->Num(); ++parameter)
+                                    if (!stricmp(list->Get(parameter).m_Name.c_str(), "Diffuse"))
+                                    {
+                                        const float* diffuse = list->Get(parameter).mfGet();
+                                        for (int channel = 0; channel < 3; ++channel)
+                                            parameters[4 + channel] = diffuse[channel];
+                                    }
+                        m_RP.m_pCurLight = previousLight;
+                        if (!(stockHardwarePass->m_StockProgramMask & 0x1ull))
+                            parameters[4] = parameters[5] = parameters[6] = 0.0f;
+                    }
+                    if (m_activeHardwarePassType == eSHP_MAX &&
+                        m_activeResources && m_activeResources->m_LMaterial)
+                    {
+                        const SSideMaterial& material = m_activeResources->m_LMaterial->Front;
+                        if (hardwareLightFlags & LMF_NOSPECULAR)
+                        {
+                            parameters[7] = 0.0f;
+                            parameters[13] = parameters[14] = parameters[15] = 0.0f;
+                        }
+                        else
+                        {
+                            parameters[13] = light->m_SpecColor.r * material.m_Specular.r;
+                            parameters[14] = light->m_SpecColor.g * material.m_Specular.g;
+                            parameters[15] = light->m_SpecColor.b * material.m_Specular.b;
+                        }
+                    }
+                    if (specularOnlyLight && !hardwareSpecularPass)
+                        parameters[4] = parameters[5] = parameters[6] = 0.0f;
+                    parameters[11] = 1.0f;
+                    parameters[12] = 0.0f;
+                    if (pointLight && light->m_fRadius > 0.0f)
+                    {
+                        Vec3d attenuationBoundsCenter = lightBoundsCenter;
+                        float attenuationBoundsRadius = lightBoundsRadius;
+                        if (fixedFunctionLightList)
+                        {
+                            // Preserve EF_SetLights' bCalcDist branch exactly:
+                            // only the first accepted point light uses RE bounds.
+                            if (!m_RP.m_pRE || fixedPointBoundsUsed)
+                            {
+                                attenuationBoundsCenter = Vec3d(0.0f, 0.0f, 0.0f);
+                                attenuationBoundsRadius = 1000.0f;
+                            }
+                            else
+                                fixedPointBoundsUsed = true;
+                        }
+                        const float centerDistance = crymax(0.1f,
+                            (attenuationBoundsCenter - light->m_Origin).Length());
+                        const float maxDistance = clamp_tpl(centerDistance + attenuationBoundsRadius,
+                            light->m_fRadius * 0.1f, light->m_fRadius * 0.99f);
+                        const float minDistance = clamp_tpl(centerDistance - attenuationBoundsRadius,
+                            light->m_fRadius * 0.1f, light->m_fRadius * 0.99f);
+                        const float minAttenuation = 1.0f /
+                            stockRangeAttenuation(minDistance, light->m_fRadius);
+                        const float maxAttenuation = 1.0f /
+                            stockRangeAttenuation(maxDistance, light->m_fRadius);
+                        if (fabsf(minAttenuation - maxAttenuation) < 0.00001f)
+                            parameters[11] = minAttenuation;
+                        else
+                        {
+                            const float attenuationSlope = (maxAttenuation - minAttenuation) /
+                                (maxDistance - minDistance);
+                            const float constantAttenuation = crymax(0.01f,
+                                minAttenuation - attenuationSlope * minDistance);
+                            parameters[11] = constantAttenuation;
+                            parameters[12] = crymax(0.0f,
+                                (minAttenuation - constantAttenuation) / minDistance);
+                        }
+                    }
+                    if ((light->m_Flags & DLF_PROJECT) &&
+                        m_activeHardwarePassType != eSHP_MAX)
+                    {
+                        // TEMP_AMBIENT is independent of projector attenuation
+                        // and its cookie. Preserve it before the legacy payload
+                        // repurposes RGB ambient for the projector direction.
+                        if (hardwareMaterialAmbientProgram && lightPasses.empty() &&
+                            !hardwareSpecularPass)
+                        {
+                            std::array<float, 19> ambientParameters;
+                            memcpy(ambientParameters.data(), materialLighting, sizeof(materialLighting));
+                            ambientParameters[4] = ambientParameters[5] = ambientParameters[6] = 0.0f;
+                            ambientParameters[7] = 1.0f;
+                            appendLightPass(ambientParameters, 0, -1, true);
+                        }
                         const Matrix44 inverseObject = m_RP.m_pCurObject->GetInvMatrix();
                         Vec3d projectorDirection = inverseObject.TransformVectorOLD(
                             light->m_Orientation.m_vForward);
@@ -3351,12 +5757,9 @@ public:
                             const float distance = lightDirection.Length();
                             const float normalizedDistance = light->m_fRadius > 0.0f ?
                                 distance / light->m_fRadius : 1.0f;
-                            if (normalizedDistance >= 1.0f)
-                                continue;
-                            const float x2 = normalizedDistance * normalizedDistance;
-                            const float attenuation = 2.0f *
-                                (2.0f * x2 * normalizedDistance - 3.0f * x2 + 1.0f);
-                            const float attenuationScale = crymax(0.0f, attenuation);
+                            // Distance and half angle belong to each surface
+                            // point, not the object's origin. Evaluate in GLSL.
+                            const float attenuationScale = 1.0f;
                             safeNormalize(lightDirection);
                             safeNormalize(viewDirection);
                             Vec3d halfVector = lightDirection + viewDirection;
@@ -3406,31 +5809,164 @@ public:
                             }
                             else
                                 parameters[3] = -10.0f;
-                            parameters[4] = lightSpecular.r * specularMaterial[0] * lightScale;
-                            parameters[5] = lightSpecular.g * specularMaterial[1] * lightScale;
-                            parameters[6] = lightSpecular.b * specularMaterial[2] * lightScale;
+                            parameters[4] = lightSpecular.r * specularMaterial[0];
+                            parameters[5] = lightSpecular.g * specularMaterial[1];
+                            parameters[6] = lightSpecular.b * specularMaterial[2];
                         }
+                        parameters[11] = objectLightPosition.x;
+                        parameters[12] = objectLightPosition.y;
+                        parameters[13] = objectLightPosition.z;
+                        parameters[14] = light->m_fRadius;
+                        parameters[15] = pointLight ?
+                            ((light->m_Flags & DLF_PROJECT) ? 3.0f : 2.0f) : 1.0f;
+                        parameters[16] = objectCameraPosition.x;
+                        parameters[17] = objectCameraPosition.y;
+                        parameters[18] = objectCameraPosition.z;
                     }
                     // Emit material ambient once; following lights use additive
-                    // RGB blending and must contribute only their diffuse term.
+                    // RGB blending and must contribute only their direct term.
                     if (!lightPasses.empty())
+                    {
                         parameters[7] = 0.0f;
-                    if (light->m_Flags & DLF_PROJECT)
+                        if (!(light->m_Flags & DLF_PROJECT) && !hardwareSpecularPass)
+                            parameters[8] = parameters[9] = parameters[10] = 0.0f;
+                    }
+                    if ((light->m_Flags & DLF_PROJECT) &&
+                        m_activeHardwarePassType != eSHP_MAX)
                     {
                         const float halfAngle = clamp_tpl(light->m_fLightFrustumAngle,
                                                           0.0f, 89.9f);
                         parameters[7] = -crymax(0.001f,
                             cry_cosf(halfAngle * gf_PI / 180.0f));
                     }
-                    lightPasses.push_back(parameters);
+                    // Programmable OpenGL LightColor/LightsColor components
+                    // normalize overbright RGB when HDR is off. The separate
+                    // fixed-function EF_SetLights path does not, so leave the
+                    // eSHP_MAX emulation untouched here.
+                    if (m_activeHardwarePassType != eSHP_MAX &&
+                        !(m_RP.m_PersFlags & RBPF_HDR))
+                    {
+                        const float maxLightChannel = crymax(parameters[4],
+                            crymax(parameters[5], parameters[6]));
+                        if (maxLightChannel > 1.1f)
+                        {
+                            parameters[4] /= maxLightChannel;
+                            parameters[5] /= maxLightChannel;
+                            parameters[6] /= maxLightChannel;
+                        }
+                    }
+                    int specularOcclusionTextureId = 0;
+                    int specularOcclusionChannel = -1;
+                    if (hardwareMultiLightsAmbient && specularOnlyLight &&
+                        m_RP.m_pCurObject->m_nLMId > 0 &&
+                        m_RP.m_pCurObject->m_nOcclId > 0)
+                    {
+                        const uint8_t encodedLightId =
+                            static_cast<uint8_t>(light->m_Id + 1);
+                        for (int channel = 0; channel < 4; ++channel)
+                        {
+                            if (m_RP.m_pCurObject->m_OcclLights[channel] ==
+                                encodedLightId)
+                            {
+                                specularOcclusionTextureId =
+                                    m_RP.m_pCurObject->m_nOcclId;
+                                specularOcclusionChannel = channel;
+                                break;
+                            }
+                        }
+                    }
+                    appendLightPass(parameters);
+                    hasTranslatedDynamicLightPass = true;
+
+                    // OpenGL marks DLF_LM lights as specular-only on baked
+                    // lightmapped receivers. The original Light pass combines
+                    // diffuse and specular in one shader, while MultiLights
+                    // encodes this distinction per light. Vulkan's stock
+                    // approximation emits the specular contribution as its
+                    // own additive draw for both pass types.
+                    if ((m_activeHardwarePassType == eSHP_Light ||
+                         m_activeHardwarePassType == eSHP_MultiLights) &&
+                        (!stockLightTemplate || (stockHardwarePass->m_StockProgramMask & 0x2ull)) &&
+                        !(hardwareLightFlags & (LMF_NOSPECULAR | LMF_NOADDSPECULAR)) &&
+                        (light->m_SpecColor.r != 0.0f || light->m_SpecColor.g != 0.0f ||
+                         light->m_SpecColor.b != 0.0f))
+                    {
+                        const auto safeNormalize = [](Vec3d& value)
+                        {
+                            if (value.Normalize() == 0.0f)
+                                value = Vec3d(0.0f, 0.0f, 1.0f);
+                        };
+                        Vec3d cameraPosition = GetCamera().GetPos();
+                        Vec3d objectCameraPosition;
+                        Matrix44 inverseObject = m_RP.m_pCurObject->GetInvMatrix();
+                        TransformPosition(objectCameraPosition, cameraPosition, inverseObject);
+                        Vec3d viewDirection = objectCameraPosition;
+                        Vec3d lightDirection = objectLightPosition;
+                        const float specularAttenuation = pointLight ?
+                            1.0f / crymax(1.0e-6f, parameters[11] +
+                                parameters[12] * lightDirection.Length()) : 1.0f;
+                        safeNormalize(lightDirection);
+                        safeNormalize(viewDirection);
+                        Vec3d halfVector = lightDirection + viewDirection;
+                        safeNormalize(halfVector);
+
+                        std::array<float, 19> specularParameters = parameters;
+                        specularParameters[0] = halfVector.x;
+                        specularParameters[1] = halfVector.y;
+                        specularParameters[2] = halfVector.z;
+                        float specularMaterial[3] = { 1.0f, 1.0f, 1.0f };
+                        if (m_activeResources && m_activeResources->m_LMaterial)
+                        {
+                            const SSideMaterial& material = m_activeResources->m_LMaterial->Front;
+                            specularMaterial[0] = material.m_Specular.r;
+                            specularMaterial[1] = material.m_Specular.g;
+                            specularMaterial[2] = material.m_Specular.b;
+                            specularParameters[3] = -crymax(1.0f, material.m_SpecShininess);
+                        }
+                        else
+                            specularParameters[3] = -10.0f;
+                        specularParameters[4] = light->m_SpecColor.r * specularMaterial[0] *
+                            specularAttenuation;
+                        specularParameters[5] = light->m_SpecColor.g * specularMaterial[1] *
+                            specularAttenuation;
+                        specularParameters[6] = light->m_SpecColor.b * specularMaterial[2] *
+                            specularAttenuation;
+                        if (!(m_RP.m_PersFlags & RBPF_HDR))
+                        {
+                            const float maxSpecularChannel = crymax(specularParameters[4],
+                                crymax(specularParameters[5], specularParameters[6]));
+                            if (maxSpecularChannel > 1.1f)
+                            {
+                                specularParameters[4] /= maxSpecularChannel;
+                                specularParameters[5] /= maxSpecularChannel;
+                                specularParameters[6] /= maxSpecularChannel;
+                            }
+                        }
+                        specularParameters[8] = specularParameters[9] =
+                            specularParameters[10] = 0.0f;
+                        appendLightPass(specularParameters,
+                                        specularOcclusionTextureId,
+                                        specularOcclusionChannel);
+                    }
                 }
             }
         }
+        // CGLRenderer::EF_LightMaterial falls back to
+        // EF_ConstantLightMaterial when no GL light slot was populated. Keep
+        // that ambient-only result for fixed-function materials that require
+        // normals; otherwise the prepared object/material ambient was lost
+        // whenever the Vulkan dynamic-light list was empty or fully filtered.
+        const bool fixedFunctionAmbientOnlyPass =
+            fixedFunctionMaterialLighting &&
+            !hasTranslatedDynamicLightPass;
         if (lightPasses.empty())
         {
-            std::array<float, 11> parameters;
+            std::array<float, 19> parameters;
             memcpy(parameters.data(), materialLighting, sizeof(materialLighting));
-            lightPasses.push_back(parameters);
+            if (m_activeHardwarePassType == eSHP_MultiLights ||
+                fixedFunctionAmbientOnlyPass)
+                parameters[4] = parameters[5] = parameters[6] = 0.0f;
+            appendLightPass(parameters);
         }
         // Pass state is installed before mfDraw; render elements can refine it
         // locally through EF_SetState. The NULL implementation stores that
@@ -3441,6 +5977,8 @@ public:
         float globalOpacity = 1.0f;
         float alphaTestRef = 0.0f;
         bool additiveMaterial = false;
+        int objectAlphaTextureEnvMode = 0;
+        float objectAlphaOpacity = 1.0f;
         float primaryColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
         float primaryColorMask[4] = {};
         const bool applyResourceStates = !m_RP.m_pShader ||
@@ -3448,44 +5986,209 @@ public:
         if (m_activeResources && applyResourceStates)
         {
             alphaTestRef = m_activeResources->m_AlphaRef;
-            globalOpacity = m_activeResources->m_Opacity;
             additiveMaterial = (m_activeResources->m_ResFlags & MTLFLAG_ADDITIVE) != 0;
+            // Match EF_SetResourcesState in the OpenGL renderer: AlphaRef
+            // takes precedence over material opacity. That path installs an
+            // alpha test and does not switch the pass to blending when both
+            // resource values are set.
+            if (alphaTestRef == 0.0f)
+                globalOpacity = m_activeResources->m_Opacity;
             if (globalOpacity != 1.0f)
             {
                 renderState &= ~(GS_BLEND_MASK | GS_DEPTHWRITE);
                 renderState |= additiveMaterial ?
                     (GS_BLSRC_ONE | GS_BLDST_ONE) :
                     (GS_BLSRC_SRCALPHA | GS_BLDST_ONEMINUSSRCALPHA);
-                if (lightPasses.size() > 1)
-                    lightPasses.resize(1);
+                // EF_SetResourcesState preserves this state for object-alpha
+                // evaluation, which must not replace resource blending.
+                m_RP.m_ResourceState = renderState;
+                m_RP.m_fCurOpacity = m_activeResources->m_Opacity;
+                m_RP.m_FlagsPerFlush |= RBSI_ALPHABLEND | RBSI_DEPTHWRITE | RBSI_ALPHAGEN;
+                m_RP.m_ObjFlags &= ~FOB_LIGHTPASS;
+                if (lightPasses.size() > 1 && !fixedFunctionMaterialLighting)
+                {
+                    lightPasses.resize(hardwareMultiLightsAmbient ? 2 : 1);
+                    lightPassSpecularOcclusion.resize(lightPasses.size());
+                    ambientOnlyLightPasses.resize(lightPasses.size());
+                }
             }
         }
         globalOpacity = clamp_tpl(globalOpacity, 0.0f, 1.0f);
-        if (m_activePass)
-            EvaluatePassColor(*m_activePass, primaryColor, primaryColorMask);
-        if (m_activeStateShaderState)
+        if (m_activeHardwarePassType == eSHP_MAX)
         {
-            const SEfState& stateShader = *m_activeStateShaderState;
-            const float invByte = 1.0f / 255.0f;
-            if ((stateShader.m_Flags & ESF_RGBGEN) && stateShader.m_eEvalRGB == eERGB_Fixed)
+            // EF_SetResourcesState installs an 8-bit global color on the
+            // fixed-function path, truncating rather than rounding opacity.
+            globalOpacity = static_cast<uint8_t>(globalOpacity * 255.0f) / 255.0f;
+        }
+        if (fixedFunctionMaterialLighting)
+        {
+            // GL applies the light material once before the fixed pass loop.
+            // Constant lighting installs a packed texture-environment color;
+            // it does not multiply the vertex primary by ambient again.
+            if (m_RP.m_RendPass <= 1)
             {
-                // Match the legacy renderer's byte exchange before it stores
-                // the fixed-function global color (RGBA bytes are BGRA on the
-                // old packed-color path).
-                primaryColor[0] = stateShader.m_FixedColor[3] * invByte;
-                primaryColor[1] = stateShader.m_FixedColor[1] * invByte;
-                primaryColor[2] = stateShader.m_FixedColor[2] * invByte;
-                primaryColor[3] = stateShader.m_FixedColor[0] * invByte;
-                primaryColorMask[0] = primaryColorMask[1] = primaryColorMask[2] = 1.0f;
+                if (fixedFunctionAmbientOnlyPass)
+                {
+                    EF_ConstantLightMaterial(m_activeResources->m_LMaterial,
+                        hardwareLightFlags);
+                    m_RP.m_CurGlobalColor = m_RP.m_NeedGlobalColor;
+                }
+                else
+                {
+                    m_RP.m_FlagsPerFlush &= ~(RBSI_GLOBALRGB | RBSI_GLOBALALPHA);
+                    // EF_LightMaterial restores the primary-color selectors
+                    // before mfSetTexture. A NOSET unit inherits these args;
+                    // an explicit render-element override occurs afterward.
+                    if (!(m_stageStateOverrides[0] & 4u))
+                        m_stageColorArgs[0] = DEF_TEXARG0;
+                    if (!(m_stageStateOverrides[0] & 8u))
+                        m_stageAlphaArgs[0] = DEF_TEXARG0;
+                }
             }
-            if ((stateShader.m_Flags & ESF_ALPHAGEN) && stateShader.m_eEvalAlpha == eEALPHA_Fixed)
+            if (fixedFunctionAmbientOnlyPass)
+                globalOpacity = 1.0f;
+        }
+        if (m_activeStateShaderState &&
+            (m_activeStateShaderState->m_Flags & (ESF_RGBGEN | ESF_ALPHAGEN)))
+            for (int channel = 0; channel < 4; ++channel)
             {
-                primaryColor[3] = (stateShader.m_Flags & ESF_RGBGEN) ?
-                    stateShader.m_FixedColor[0] * invByte : 0.0f;
-                primaryColorMask[3] = 1.0f;
+                primaryColor[channel] = m_RP.m_NeedGlobalColor.bcolor[channel] / 255.0f;
+                primaryColorMask[channel] = 1.0f;
+            }
+        // With a render element, these generators change the global color only.
+        // Evaluate the same GL state transition without copying the vertex array.
+        // Retained colors from a previous vertex-writing pass still take the full path.
+        if (m_activePass && stockVertexFormatValid && colorOffset != 0xffffffffu &&
+            IsGlobalOnlyColorPass(*m_activePass) &&
+            !(m_stockColorCacheFrame == m_RP.m_Frame &&
+              m_stockGeneratedColors.find(vertices) != m_stockGeneratedColors.end()))
+        {
+            if (EvaluateCpuDrawColor(m_activePass))
+                for (int channel = 0; channel < 4; ++channel)
+                {
+                    primaryColor[channel] = m_RP.m_NeedGlobalColor.bcolor[channel] / 255.0f;
+                    primaryColorMask[channel] = 1.0f;
+                }
+            m_RP.m_CurGlobalColor = m_RP.m_NeedGlobalColor;
+        }
+        else if (m_activePass && stockVertexFormatValid && colorOffset != 0xffffffffu)
+        {
+            uint8_t* scratch = ensureVertexCopy();
+            const int first = m_RP.m_FirstVertex;
+            const int count = m_RP.m_RendNumVerts;
+            if (scratch && (m_activePass->m_eEvalAlpha != eEALPHA_Beam ||
+                !m_RP.m_pRE || sourceTangentBasis) &&
+                first >= 0 && count >= 0 && first <= vertices->m_NumVerts &&
+                count <= vertices->m_NumVerts - first)
+            {
+                SCpuDrawStream stream;
+                stream.source = sourcePositionData;
+                stream.sourceStride = cpuSourceFormat.stride;
+                for (uint32_t attribute = 0; attribute < cpuSourceFormat.attributeCount; ++attribute)
+                {
+                    const auto& sourceAttribute = cpuSourceFormat.attributes[attribute];
+                    switch (sourceAttribute.location)
+                    {
+                    case 0: stream.sourcePositionOffset = sourceAttribute.offset; break;
+                    case 1: stream.sourceNormalOffset = sourceAttribute.offset; break;
+                    case 2: stream.sourceColorOffset = sourceAttribute.offset; break;
+                    case 3: stream.sourceTexCoordOffset = sourceAttribute.offset; break;
+                    case 4: stream.sourceSecondaryColorOffset = sourceAttribute.offset; break;
+                    default: break;
+                    }
+                }
+                stream.destination = scratch;
+                stream.tangents = reinterpret_cast<const byte*>(sourceTangentBasis);
+                stream.stride = stockVertexFormat.stride;
+                stream.tangentStride = sizeof(SPipTangents);
+                stream.firstVertex = first;
+                stream.positionOffset = positionOffset == 0xffffffffu ? -1 : positionOffset;
+                stream.normalOffset = normalOffset == 0xffffffffu ? -1 : normalOffset;
+                stream.colorOffset = colorOffset;
+                stream.secondaryColorOffset = secondaryColorOffset == 0xffffffffu ? -1 : secondaryColorOffset;
+                stream.texCoordOffset = uv0Offset == 0xffffffffu ? -1 : uv0Offset;
+                const SCpuDrawStream* savedStream = m_pCpuDrawStream;
+                const auto savedPointer = m_RP.m_Ptr;
+                const int savedStride = m_RP.m_Stride, savedColorOffset = m_RP.m_OffsD;
+                const int savedNormalOffset = m_RP.m_OffsN, savedTexCoordOffset = m_RP.m_OffsT;
+                m_pCpuDrawStream = &stream;
+                m_RP.m_Ptr.PtrB = scratch + static_cast<size_t>(first) * stream.stride;
+                m_RP.m_Stride = stream.stride;
+                m_RP.m_OffsD = colorOffset;
+                m_RP.m_OffsN = normalOffset == 0xffffffffu ? 0 : normalOffset;
+                m_RP.m_OffsT = uv0Offset == 0xffffffffu ? 0 : uv0Offset;
+                const bool generatedGlobalColor = EvaluateCpuDrawColor(m_activePass);
+                // OpenGL's modified color stream survives subsequent passes
+                // of this flush. The next private upload starts from it.
+                StockGeneratedColors& retained = m_stockGeneratedColors[vertices];
+                retained.vertexFormat = vertices->m_vertexformat;
+                retained.colors.resize(static_cast<size_t>(vertices->m_NumVerts) * 4u);
+                for (int vertex = 0; vertex < vertices->m_NumVerts; ++vertex)
+                    memcpy(retained.colors.data() + static_cast<size_t>(vertex) * 4u,
+                        scratch + static_cast<size_t>(vertex) * stream.stride + colorOffset, 4u);
+                m_pCpuDrawStream = savedStream;
+                m_RP.m_Ptr = savedPointer;
+                m_RP.m_Stride = savedStride; m_RP.m_OffsD = savedColorOffset;
+                m_RP.m_OffsN = savedNormalOffset; m_RP.m_OffsT = savedTexCoordOffset;
+                if (generatedGlobalColor)
+                    for (int channel = 0; channel < 4; ++channel)
+                    {
+                        primaryColor[channel] = m_RP.m_NeedGlobalColor.bcolor[channel] / 255.0f;
+                        primaryColorMask[channel] = 1.0f;
+                    }
+                // Even a guarded generator retains the preceding expected
+                // texture-environment color at the OpenGL commit boundary.
+                m_RP.m_CurGlobalColor = m_RP.m_NeedGlobalColor;
+            }
+            else
+            {
+                m_frameRenderer->RequirePanelFallback();
+                EvaluatePassColor(*m_activePass, primaryColor, primaryColorMask);
             }
         }
-
+        else if (m_activePass)
+            EvaluatePassColor(*m_activePass, primaryColor, primaryColorMask);
+        // OpenGL calls CCObject::SetAlphaState for FOB_HASALPHA objects on
+        // general and light passes. Carry the object fade into the Vulkan
+        // fragment opacity and reproduce its standard blend/depth-write
+        // transition when neither the pass nor material selected a blend.
+        if (applyResourceStates && m_RP.m_pRE &&
+            m_RP.m_pRE->mfGetType() == eDATA_OcLeaf && m_RP.m_pCurObject &&
+            (m_RP.m_pCurObject->m_ObjFlags & FOB_HASALPHA))
+        {
+            const float objectOpacity = clamp_tpl(m_RP.m_pCurObject->m_Color.a, 0.0f, 1.0f);
+            objectAlphaOpacity = objectOpacity;
+            m_RP.m_fCurOpacity = m_RP.m_pCurObject->m_Color.a;
+            const uint32_t resourceBlendState = m_RP.m_ResourceState & GS_BLEND_MASK;
+            const uint32_t objectBlendState = resourceBlendState ?
+                resourceBlendState : (renderState & GS_BLEND_MASK);
+            if (m_activeHardwarePassType == eSHP_MAX &&
+                (objectBlendState == (GS_BLSRC_DSTCOL | GS_BLDST_ZERO) ||
+                 objectBlendState == (GS_BLSRC_ZERO | GS_BLDST_SRCCOL)))
+                objectAlphaTextureEnvMode = 1;
+            else if (m_activeHardwarePassType == eSHP_MAX &&
+                     objectBlendState == (GS_BLSRC_ONE | GS_BLDST_ONE))
+                objectAlphaTextureEnvMode = 2;
+            else if (m_activeHardwarePassType == eSHP_MAX)
+                objectAlphaTextureEnvMode = 3;
+            else
+                globalOpacity *= objectOpacity;
+            if (objectAlphaTextureEnvMode)
+                globalOpacity = 1.0f;
+            if (!(renderState & GS_BLEND_MASK) && !(m_RP.m_ResourceState & GS_BLEND_MASK))
+            {
+                renderState &= ~(GS_BLEND_MASK | GS_DEPTHWRITE);
+                renderState |= GS_BLSRC_SRCALPHA | GS_BLDST_ONEMINUSSRCALPHA;
+            }
+            else if (renderState & GS_DEPTHFUNC_EQUAL)
+                renderState &= ~GS_DEPTHFUNC_EQUAL;
+            m_RP.m_FlagsPerFlush |= RBSI_ALPHABLEND | RBSI_DEPTHWRITE | RBSI_ALPHAGEN;
+            if (objectOpacity != 1.0f &&
+                m_activeHardwarePassType == eSHP_MAX &&
+                ((renderState & GS_BLEND_MASK) == (GS_BLSRC_ONE | GS_BLDST_ONE)))
+                additiveMaterial = true;
+        }
+        globalOpacity = clamp_tpl(globalOpacity, 0.0f, 1.0f);
         // GL's EF_Eval_RGBAGen writes generated global channels to
         // m_NeedGlobalColor, then EF_SetGlobalColor installs the byte color
         // used by EF_SetColorOp as GL_TEXTURE_ENV_COLOR on each TMU. Keep that
@@ -3497,11 +6200,109 @@ public:
             if (primaryColorMask[channel] > 0.5f)
             {
                 const float clamped = clamp_tpl(primaryColor[channel], 0.0f, 1.0f);
-                m_RP.m_CurGlobalColor.bcolor[channel] =
-                    static_cast<uint8_t>(clamped * 255.0f);
+                m_RP.m_NeedGlobalColor.bcolor[channel] =
+                static_cast<uint8_t>(clamped * 255.0f);
+                // The GL generator stores UCol before the color reaches
+                // either primary-color modulation or texture env constants.
+                // Both Vulkan inputs must consume that same truncated byte.
+                primaryColor[channel] =
+                    m_RP.m_NeedGlobalColor.bcolor[channel] / 255.0f;
             }
         }
-        const uint32_t textureEnvironmentColor = m_RP.m_CurGlobalColor.dcolor;
+        // Successful global generators install a complete packed color.
+        // Keep the expected value available to later pass preparation,
+        // separately from the committed texture environment cache.
+        if (primaryColorMask[0] > 0.5f || primaryColorMask[1] > 0.5f ||
+            primaryColorMask[2] > 0.5f || primaryColorMask[3] > 0.5f)
+            m_RP.m_CurGlobalColor = m_RP.m_NeedGlobalColor;
+        uint32_t textureEnvironmentColor = m_RP.m_CurGlobalColor.dcolor;
+        if (objectAlphaTextureEnvMode)
+        {
+            UCol objectAlphaColor = m_RP.m_CurGlobalColor;
+            const float rgbValue = objectAlphaTextureEnvMode == 1 ?
+                1.0f - objectAlphaOpacity : objectAlphaOpacity;
+            const uint8_t rgbByte = static_cast<uint8_t>(
+                clamp_tpl(rgbValue, 0.0f, 1.0f) * 255.0f);
+            const uint8_t alphaByte = static_cast<uint8_t>(objectAlphaOpacity * 255.0f);
+            if (objectAlphaTextureEnvMode != 3)
+            {
+                objectAlphaColor.bcolor[0] = rgbByte;
+                objectAlphaColor.bcolor[1] = rgbByte;
+                objectAlphaColor.bcolor[2] = rgbByte;
+            }
+            objectAlphaColor.bcolor[3] = alphaByte;
+            m_RP.m_NeedGlobalColor = objectAlphaColor;
+            m_RP.m_CurGlobalColor = objectAlphaColor;
+            m_RP.m_FlagsPerFlush |= objectAlphaTextureEnvMode == 3 ?
+                RBSI_GLOBALALPHA : RBSI_GLOBALRGB;
+            textureEnvironmentColor = objectAlphaColor.dcolor;
+        }
+
+        const auto resolveObjectTextureId = [&](int resourceSlot, int textureStage) -> int
+        {
+            if (!m_RP.m_pCurObject)
+                return 0;
+            switch (resourceSlot)
+            {
+            case EFTT_LIGHTMAP: return m_RP.m_pCurObject->m_nLMId;
+            case EFTT_LIGHTMAP_DIR: return m_RP.m_pCurObject->m_nLMDirId;
+            case EFTT_OCCLUSION: return m_RP.m_pCurObject->m_nOcclId;
+            default: break;
+            }
+            // Techniques can declare their lightmap solely through the
+            // eSrcPointer_TexLM pointer; in that case the stage carries no
+            // EFTT_LIGHTMAP template bind, but OpenGL still uses the object's
+            // m_nLMId for the selected lightmap stage. An explicit resource
+            // bind (including LIGHTMAP_HDR) keeps its own OpenGL resource and
+            // must not be replaced just because it occupies that UV stage.
+            return resourceSlot < 0 && textureStage == lightmapStage ?
+                m_RP.m_pCurObject->m_nLMId : 0;
+        };
+        const auto resolveCustomTextureId = [&](const SShaderTexUnit* unit) -> int
+        {
+            if (!unit || !unit->m_TexPic)
+                return 0;
+            const int bind = unit->m_TexPic->m_Bind;
+            if (bind < TO_FROMRE0 || bind > TO_FROMRE7)
+                return 0;
+            const int customStage = bind - TO_FROMRE0;
+            return m_RP.m_pRE ? m_RP.m_pRE->m_CustomTexBind[customStage] :
+                                m_RP.m_RECustomTexBind[customStage];
+        };
+        // Cg terrain passes generate every detail UV from FromRE projection
+        // planes. Their texture units deliberately have no fixed-function
+        // texgen; the terrain translation below supplies those coordinates.
+        const bool terrainProgramTexgen = stockHardwarePass &&
+            !strnicmp(stockHardwarePass->m_StockFragmentProgram, "CGRCTerrain", 11);
+        const auto resolveStageTextureId = [&](const SShaderTexUnit* unit,
+                                                int resourceSlot,
+                                                int textureStage) -> int
+        {
+            // mfSetTextures runs before mfDraw in GL. A later explicit
+            // element binding wins over the pass/resource texture token.
+            if (textureStage >= 0 && textureStage < 8 &&
+                (m_stageStateOverrides[textureStage] & 32u))
+                return m_stageTextureIds[textureStage];
+            // GLTextures::mfSet uses the object's image for $FromObj
+            // (particle sprites), rather than binding the placeholder.
+            if (unit && unit->m_TexPic && unit->m_TexPic->m_Bind == TO_FROMOBJ)
+                return m_RP.m_pCurObject ? crymax(0, m_RP.m_pCurObject->m_NumCM) : 0;
+            const int objectTextureId = resolveObjectTextureId(resourceSlot, textureStage);
+            if (objectTextureId > 0)
+                return objectTextureId;
+            const int customTextureId = resolveCustomTextureId(unit);
+            if (customTextureId > 0)
+                return customTextureId;
+            // A FromRE unit's GetTextureID is its reserved binding token, not
+            // the texture selected for the current render element. Do not
+            // expose that token as a Vulkan legacy texture ID when the
+            // render element has no binding for this stage.
+            if (unit && unit->m_TexPic &&
+                unit->m_TexPic->m_Bind >= TO_FROMRE0 &&
+                unit->m_TexPic->m_Bind <= TO_FROMRE7)
+                return 0;
+            return unit && unit->m_ITexPic ? unit->m_ITexPic->GetTextureID() : 0;
+        };
 
         uint32_t colorWriteMaskOverride = 0xffffffffu;
         if (m_activeStateShaderState && (m_activeStateShaderState->m_Flags & ESF_COLORMASK))
@@ -3530,8 +6331,12 @@ public:
                     {
                         const uint textureFlags = diffuse->m_TU.GetTexFlags();
                         const uint textureFlags2 = diffuse->m_TU.GetTexFlags2();
-                        ITexPic* loaded = EF_LoadTexture(diffuse->m_Name.c_str(),
-                            textureFlags, textureFlags2, eTT_Base,
+                        // Use the stock resolver: its first fallback combines
+                        // the material directory with the basename, handling
+                        // obsolete exporter/server paths in character assets.
+                        ITexPic* loaded = m_cEF.LoadVulkanResourceTexture(diffuse->m_Name.c_str(),
+                            m_activeResources->m_TexturePath.c_str(), textureFlags,
+                            textureFlags2, eTT_Base, m_RP.m_pShader, diffuse,
                             static_cast<float>(diffuse->m_Amount));
                         if ((!loaded || !loaded->IsTextureLoaded()) &&
                             !m_activeResources->m_TexturePath.empty())
@@ -3560,6 +6365,48 @@ public:
                     applyStockTextureMatrixOps(0, textureMatrices[0]);
                 }
             }
+            // WaterVolume has no template texture stages, although its
+            // resources carry an animated normal map in EFTT_BUMP.
+            if (textureIds[0] <= 0 && m_RP.m_pShader &&
+                !stricmp(m_RP.m_pShader->m_Name.c_str(), "watervolume"))
+            {
+                SEfResTexture* waterNormal = m_activeResources->m_Textures[EFTT_BUMP];
+                if (waterNormal)
+                {
+                    if (!waterNormal->m_TU.m_ITexPic && !waterNormal->m_Name.empty())
+                    {
+                        const uint textureFlags = waterNormal->m_TU.GetTexFlags();
+                        const uint textureFlags2 = waterNormal->m_TU.GetTexFlags2();
+                        ITexPic* loaded = EF_LoadTexture(waterNormal->m_Name.c_str(),
+                            textureFlags, textureFlags2, eTT_Base,
+                            static_cast<float>(waterNormal->m_Amount));
+                        if ((!loaded || !loaded->IsTextureLoaded()) &&
+                            !m_activeResources->m_TexturePath.empty())
+                        {
+                            if (loaded)
+                                loaded->Release(false);
+                            std::string texturePath = m_activeResources->m_TexturePath.c_str();
+                            if (!texturePath.empty() && texturePath.back() != '/' &&
+                                texturePath.back() != '\\')
+                                texturePath.push_back('/');
+                            texturePath += waterNormal->m_Name.c_str();
+                            loaded = EF_LoadTexture(texturePath.c_str(), textureFlags,
+                                textureFlags2, eTT_Base,
+                                static_cast<float>(waterNormal->m_Amount));
+                        }
+                        if (loaded && loaded->IsTextureLoaded())
+                            waterNormal->m_TU.m_ITexPic = loaded;
+                        else if (loaded)
+                            loaded->Release(false);
+                    }
+                    waterNormal->m_TU.mfUpdate();
+                    if (waterNormal->m_TU.m_ITexPic)
+                    {
+                        textureIds[0] = waterNormal->m_TU.m_ITexPic->GetTextureID();
+                        textureLodBias[0] = waterNormal->m_TU.m_fTexFilterLodBias;
+                    }
+                }
+            }
             if (m_activePass->m_TUnits.Num() > 8)
                 m_frameRenderer->RequirePanelFallback();
             for (int stage = 0; stage < 2 && stage < m_activePass->m_TUnits.Num(); ++stage)
@@ -3578,28 +6425,46 @@ public:
                                              textureMatrices[stage]);
                     unit = &textureResource->m_TU;
                 }
-                if (stage == 1 && hasLightmapTexCoordSource)
-                    textureStage1UsesTexCoord1 = lightmapStage == 1;
+                if (stage == 1 && textureCoordinatePointers[stage])
+                    textureStage1UsesTexCoord1 =
+                        textureCoordinatePointers[stage]->ePT == eSrcPointer_TexLM;
+                else if (stage == 1 && hasLightmapTexCoordSource)
+                    textureStage1UsesTexCoord1 = lightmapStage == 1 ||
+                        resourceSlot == EFTT_LIGHTMAP ||
+                        resourceSlot == EFTT_LIGHTMAP_DIR ||
+                        resourceSlot == EFTT_OCCLUSION;
                 applyStockTextureMatrixOps(stage, textureMatrices[stage]);
-                generateLegacyTexCoords(stage, unit);
+                generateLegacyTexCoords(stage, unit, textureMatrices[stage]);
                 const_cast<SShaderTexUnit*>(unit)->mfUpdate();
                 textureLodBias[stage] = unit->m_fTexFilterLodBias;
-                if (unit->m_ITexPic)
+                // Match GL/D3D: object-owned lightmap, directional-lightmap,
+                // and occlusion IDs override the corresponding resource slot.
+                const int resolvedTextureId = resolveStageTextureId(unit, resourceSlot, stage);
+                captureShadowStage(stage, unit, resolvedTextureId);
+                if (m_stageStateOverrides[stage] & 32u)
+                    textureIds[stage] = resolvedTextureId;
+                if (resolvedTextureId > 0)
                 {
-                    textureIds[stage] = unit->m_ITexPic->GetTextureID();
+                    textureIds[stage] = resolvedTextureId;
                     // Use the texture selected by this actual template pass.
                     // EFTT_BUMP may be a stock-combined BUMP+NORMALMAP image;
                     // EFTT_BUMP_DIFFUSE is the corresponding $BumpDiffuse map.
                     if (resourceSlot == EFTT_BUMP || resourceSlot == EFTT_BUMP_DIFFUSE)
                     {
                         normalMapTextureId = textureIds[stage];
+                        normalMapTextureStage = stage;
                         normalMapLodBias = textureLodBias[stage];
                     }
                 }
-                colorOps[stage] = unit->m_eColorOp;
-                alphaOps[stage] = unit->m_eAlphaOp;
-                colorArgs[stage] = unit->m_eColorArg;
-                alphaArgs[stage] = unit->m_eAlphaArg;
+                // GL's mfSetTexture resolves the image through pSTU, but
+                // installs combiner operations from the pass itself (this).
+                // Material texture defaults must not replace decal opacity
+                // or multiplicative-decal combiner arguments.
+                const SShaderTexUnit& passUnit = m_activePass->m_TUnits[stage];
+                colorOps[stage] = passUnit.m_eColorOp;
+                alphaOps[stage] = passUnit.m_eAlphaOp;
+                colorArgs[stage] = passUnit.m_eColorArg;
+                alphaArgs[stage] = passUnit.m_eAlphaArg;
             }
 
             if (m_activePass->m_TUnits.Num() > 2)
@@ -3617,10 +6482,14 @@ public:
                     unit = &textureResource->m_TU;
                 }
                 applyStockTextureMatrixOps(2, stage2Matrix);
+                generateLegacyTexCoords(2, unit, stage2Matrix);
                 const_cast<SShaderTexUnit*>(unit)->mfUpdate();
-                if (unit->m_ITexPic)
+                const int resolvedTextureId = resolveStageTextureId(unit, resourceSlot, 2);
+                captureShadowStage(2, unit, resolvedTextureId);
+                if (resolvedTextureId > 0)
                 {
-                    if (unit->m_eGenTC != eGTC_Base && unit->m_eGenTC != eGTC_LightMap)
+                    if (!terrainProgramTexgen && !linearTexgen[2].enabled && unit->m_eGenTC != eGTC_Base && unit->m_eGenTC != eGTC_LightMap &&
+                        unit->m_eGenTC != eGTC_ShadowMap)
                     {
                         // This three-stage shader can address either UV set
                         // already carried by the stock vertex layout. Shader
@@ -3629,15 +6498,22 @@ public:
                     }
                     else
                     {
-                        const bool useTexCoord1 = unit->m_eGenTC == eGTC_LightMap ||
-                                                  lightmapStage == 2;
-                        textureStage2.textureId = unit->m_ITexPic->GetTextureID();
-                        textureStage2.colorOp = unit->m_eColorOp;
-                        textureStage2.alphaOp = unit->m_eAlphaOp;
-                        textureStage2.colorArg = unit->m_eColorArg;
-                        textureStage2.alphaArg = unit->m_eAlphaArg;
+                        const bool useTexCoord1 = textureCoordinatePointers[2] ?
+                            textureCoordinatePointers[2]->ePT == eSrcPointer_TexLM :
+                            (unit->m_eGenTC == eGTC_LightMap ||
+                                                  lightmapStage == 2 ||
+                                                  resourceSlot == EFTT_LIGHTMAP ||
+                                                  resourceSlot == EFTT_LIGHTMAP_DIR ||
+                                                  resourceSlot == EFTT_OCCLUSION);
+                        textureStage2.textureId = resolvedTextureId;
+                        const SShaderTexUnit& passUnit = m_activePass->m_TUnits[2];
+                        textureStage2.colorOp = passUnit.m_eColorOp;
+                        textureStage2.alphaOp = passUnit.m_eAlphaOp;
+                        textureStage2.colorArg = passUnit.m_eColorArg;
+                        textureStage2.alphaArg = passUnit.m_eAlphaArg;
                         textureStage2.lodBias = unit->m_fTexFilterLodBias;
-                        textureStage2.useTexCoord1 = useTexCoord1;
+                        textureStage2.useTexCoord1 = useTexCoord1 &&
+                            (!lightmapTexCoords.empty() || vertices->m_vertexformat == 16);
                         setStockUvTransform(textureStage2, stage2Matrix);
                         if (m_stageStateOverrides[2] & 1u) textureStage2.colorOp = m_stageColorOps[2];
                         if (m_stageStateOverrides[2] & 2u) textureStage2.alphaOp = m_stageAlphaOps[2];
@@ -3662,22 +6538,34 @@ public:
                     unit = &textureResource->m_TU;
                 }
                 applyStockTextureMatrixOps(3, stage3Matrix);
+                generateLegacyTexCoords(3, unit, stage3Matrix);
                 const_cast<SShaderTexUnit*>(unit)->mfUpdate();
-                if (unit->m_ITexPic)
+                const int resolvedTextureId = resolveStageTextureId(unit, resourceSlot, 3);
+                captureShadowStage(3, unit, resolvedTextureId);
+                if (resolvedTextureId > 0)
                 {
-                    if (unit->m_eGenTC != eGTC_Base && unit->m_eGenTC != eGTC_LightMap)
+                    if (!terrainProgramTexgen && !linearTexgen[3].enabled && unit->m_eGenTC != eGTC_Base && unit->m_eGenTC != eGTC_LightMap &&
+                        unit->m_eGenTC != eGTC_ShadowMap)
                         m_frameRenderer->RequirePanelFallback();
                     else
                     {
-                        const bool useTexCoord1 = unit->m_eGenTC == eGTC_LightMap ||
-                                                  lightmapStage == 3;
-                        textureStage3.textureId = unit->m_ITexPic->GetTextureID();
-                        textureStage3.colorOp = unit->m_eColorOp;
-                        textureStage3.alphaOp = unit->m_eAlphaOp;
-                        textureStage3.colorArg = unit->m_eColorArg;
-                        textureStage3.alphaArg = unit->m_eAlphaArg;
+                        const bool useTexCoord1 = textureCoordinatePointers[3] ?
+                            textureCoordinatePointers[3]->ePT == eSrcPointer_TexLM :
+                            (unit->m_eGenTC == eGTC_LightMap ||
+                                                  lightmapStage == 3 ||
+                                                  directionalLightmapPass ||
+                                                  resourceSlot == EFTT_LIGHTMAP ||
+                                                  resourceSlot == EFTT_LIGHTMAP_DIR ||
+                                                  resourceSlot == EFTT_OCCLUSION);
+                        textureStage3.textureId = resolvedTextureId;
+                        const SShaderTexUnit& passUnit = m_activePass->m_TUnits[3];
+                        textureStage3.colorOp = passUnit.m_eColorOp;
+                        textureStage3.alphaOp = passUnit.m_eAlphaOp;
+                        textureStage3.colorArg = passUnit.m_eColorArg;
+                        textureStage3.alphaArg = passUnit.m_eAlphaArg;
                         textureStage3.lodBias = unit->m_fTexFilterLodBias;
-                        textureStage3.useTexCoord1 = useTexCoord1;
+                        textureStage3.useTexCoord1 = useTexCoord1 &&
+                            (!lightmapTexCoords.empty() || vertices->m_vertexformat == 16);
                         setStockUvTransform(textureStage3, stage3Matrix);
                         if (m_stageStateOverrides[3] & 1u) textureStage3.colorOp = m_stageColorOps[3];
                         if (m_stageStateOverrides[3] & 2u) textureStage3.alphaOp = m_stageAlphaOps[3];
@@ -3702,29 +6590,41 @@ public:
                     unit = &textureResource->m_TU;
                 }
                 applyStockTextureMatrixOps(stageIndex, stageMatrix);
+                generateLegacyTexCoords(stageIndex, unit, stageMatrix);
                 const_cast<SShaderTexUnit*>(unit)->mfUpdate();
                 CryVR::VulkanStockTextureStage& translated = textureStages4To7[stageIndex - 4];
-                translated.colorOp = unit->m_eColorOp;
-                translated.alphaOp = unit->m_eAlphaOp;
-                translated.colorArg = unit->m_eColorArg;
-                translated.alphaArg = unit->m_eAlphaArg;
+                const SShaderTexUnit& passUnit = m_activePass->m_TUnits[stageIndex];
+                translated.colorOp = passUnit.m_eColorOp;
+                translated.alphaOp = passUnit.m_eAlphaOp;
+                translated.colorArg = passUnit.m_eColorArg;
+                translated.alphaArg = passUnit.m_eAlphaArg;
                 translated.lodBias = unit->m_fTexFilterLodBias;
                 translated.constant = 0xffffffffu;
                 if (m_stageStateOverrides[stageIndex] & 1u) translated.colorOp = m_stageColorOps[stageIndex];
                 if (m_stageStateOverrides[stageIndex] & 2u) translated.alphaOp = m_stageAlphaOps[stageIndex];
                 if (m_stageStateOverrides[stageIndex] & 4u) translated.colorArg = m_stageColorArgs[stageIndex];
                 if (m_stageStateOverrides[stageIndex] & 8u) translated.alphaArg = m_stageAlphaArgs[stageIndex];
-                if (!unit->m_ITexPic)
+                const int resolvedTextureId = resolveStageTextureId(unit, resourceSlot, stageIndex);
+                captureShadowStage(stageIndex, unit, resolvedTextureId);
+                if (resolvedTextureId <= 0)
                     continue;
-                if (unit->m_eGenTC != eGTC_Base && unit->m_eGenTC != eGTC_LightMap)
+                if (!linearTexgen[stageIndex].enabled && unit->m_eGenTC != eGTC_Base && unit->m_eGenTC != eGTC_LightMap &&
+                    unit->m_eGenTC != eGTC_ShadowMap)
                 {
                     m_frameRenderer->RequirePanelFallback();
                     continue;
                 }
-                translated.useTexCoord1 = unit->m_eGenTC == eGTC_LightMap ||
-                    stageIndex == lightmapStage;
+                translated.useTexCoord1 =
+                    (textureCoordinatePointers[stageIndex] ?
+                     textureCoordinatePointers[stageIndex]->ePT == eSrcPointer_TexLM :
+                     (unit->m_eGenTC == eGTC_LightMap ||
+                     stageIndex == lightmapStage ||
+                     resourceSlot == EFTT_LIGHTMAP ||
+                     resourceSlot == EFTT_LIGHTMAP_DIR ||
+                     resourceSlot == EFTT_OCCLUSION)) &&
+                    (!lightmapTexCoords.empty() || vertices->m_vertexformat == 16);
                 setStockUvTransform(translated, stageMatrix);
-                translated.textureId = unit->m_ITexPic->GetTextureID();
+                translated.textureId = resolvedTextureId;
                 translated.wrapMode = TextureWrapModeForId(translated.textureId);
             }
             textureStages4To7Ptr = textureStages4To7;
@@ -3738,21 +6638,25 @@ public:
             if (m_stageTextureIds[2] > 0)
             {
                 textureStage2.textureId = m_stageTextureIds[2];
+                textureStage2.lodBias = m_stageLodBias[2];
                 textureStage2.colorOp = m_stageColorOps[2];
                 textureStage2.alphaOp = m_stageAlphaOps[2];
                 textureStage2.colorArg = m_stageColorArgs[2];
                 textureStage2.alphaArg = m_stageAlphaArgs[2];
-                textureStage2.useTexCoord1 = true;
+                textureStage2.useTexCoord1 = !lightmapTexCoords.empty() ||
+                    vertices->m_vertexformat == 16;
                 textureStage2Ptr = &textureStage2;
             }
             if (m_stageTextureIds[3] > 0)
             {
                 textureStage3.textureId = m_stageTextureIds[3];
+                textureStage3.lodBias = m_stageLodBias[3];
                 textureStage3.colorOp = m_stageColorOps[3];
                 textureStage3.alphaOp = m_stageAlphaOps[3];
                 textureStage3.colorArg = m_stageColorArgs[3];
                 textureStage3.alphaArg = m_stageAlphaArgs[3];
-                textureStage3.useTexCoord1 = true;
+                textureStage3.useTexCoord1 = !lightmapTexCoords.empty() ||
+                    vertices->m_vertexformat == 16;
                 textureStage3Ptr = &textureStage3;
             }
             for (int stageIndex = 4; stageIndex < 8; ++stageIndex)
@@ -3761,6 +6665,7 @@ public:
                     continue;
                 CryVR::VulkanStockTextureStage& translated = textureStages4To7[stageIndex - 4];
                 translated.textureId = m_stageTextureIds[stageIndex];
+                translated.lodBias = m_stageLodBias[stageIndex];
                 translated.colorOp = m_stageColorOps[stageIndex];
                 translated.alphaOp = m_stageAlphaOps[stageIndex];
                 translated.colorArg = m_stageColorArgs[stageIndex];
@@ -3770,6 +6675,53 @@ public:
             }
             textureStages4To7Ptr = textureStages4To7;
         }
+        if (m_activePass)
+        {
+            // GL mfSetTexture gates all four combiner fields on the pass's
+            // color op. NOSET preserves the complete prior TMU combiner,
+            // even if alpha op/arguments in this unit contain other values.
+            for (int stage = 0; stage < 8 && stage < m_activePass->m_TUnits.Num(); ++stage)
+            {
+                const SShaderTexUnit& passUnit = m_activePass->m_TUnits[stage];
+                const uint8_t overrides = m_stageStateOverrides[stage];
+                if (passUnit.m_eColorOp != eCO_NOSET)
+                {
+                    // mfSetTexture installs all four cached combiner fields.
+                    // Keep the legacy cache current for later NOSET passes and
+                    // global-color substitution, preserving element overrides.
+                    if (!(overrides & 1u)) m_stageColorOps[stage] = passUnit.m_eColorOp;
+                    if (!(overrides & 2u)) m_stageAlphaOps[stage] = passUnit.m_eAlphaOp;
+                    if (!(overrides & 4u)) m_stageColorArgs[stage] = passUnit.m_eColorArg;
+                    if (!(overrides & 8u)) m_stageAlphaArgs[stage] = passUnit.m_eAlphaArg;
+                    continue;
+                }
+                if (stage < 2)
+                {
+                    if (!(overrides & 1u)) colorOps[stage] = 255;
+                    if (!(overrides & 2u)) alphaOps[stage] = 255;
+                    if (!(overrides & 4u)) colorArgs[stage] = m_stageColorArgs[stage];
+                    if (!(overrides & 8u)) alphaArgs[stage] = m_stageAlphaArgs[stage];
+                }
+                else
+                {
+                    auto& translated = stage == 2 ? textureStage2 :
+                        (stage == 3 ? textureStage3 : textureStages4To7[stage - 4]);
+                    if (!(overrides & 1u)) translated.colorOp = 255;
+                    if (!(overrides & 2u)) translated.alphaOp = 255;
+                    if (!(overrides & 4u)) translated.colorArg = m_stageColorArgs[stage];
+                    if (!(overrides & 8u)) translated.alphaArg = m_stageAlphaArgs[stage];
+                }
+            }
+        }
+        // A render element can refine bias after the material binds its
+        // texture units. Preserve that final TMU value for later direct draws.
+        const auto commitStockLodBias = [&](int stage, float& bias)
+        {
+            if (m_stageStateOverrides[stage] & 16u)
+                bias = m_stageLodBias[stage];
+            else
+                m_stageLodBias[stage] = bias;
+        };
         for (int stage = 0; stage < 2; ++stage)
         {
             if (m_stageStateOverrides[stage] & 1u) colorOps[stage] = m_stageColorOps[stage];
@@ -3777,8 +6729,216 @@ public:
             if (m_stageStateOverrides[stage] & 4u) colorArgs[stage] = m_stageColorArgs[stage];
             if (m_stageStateOverrides[stage] & 8u) alphaArgs[stage] = m_stageAlphaArgs[stage];
         }
-        if (m_forceCurrentTextureForClientDraw && m_currentTextureId > 0)
-            textureIds[0] = m_currentTextureId;
+        // EF_CommitTexStageState substitutes only argument 1 of stage zero.
+        // These are effective draw arguments, not edits to cached material
+        // state; keep the other selectors and every higher stage intact.
+        if (m_RP.m_FlagsPerFlush & RBSI_GLOBALRGB)
+        {
+            if (colorArgs[0] == 255u) colorArgs[0] = m_stageColorArgs[0];
+            colorArgs[0] = (colorArgs[0] & ~(7u << 3)) |
+                (static_cast<uint32_t>(eCA_Constant) << 3);
+        }
+        if (m_RP.m_FlagsPerFlush & RBSI_GLOBALALPHA)
+        {
+            if (alphaArgs[0] == 255u) alphaArgs[0] = m_stageAlphaArgs[0];
+            alphaArgs[0] = (alphaArgs[0] & ~(7u << 3)) |
+                (static_cast<uint32_t>(eCA_Constant) << 3);
+        }
+        if (objectAlphaTextureEnvMode)
+        {
+            // Match CCObject::SetAlphaState's fixed-function texture-env
+            // changes for its two nonstandard blend pairs.
+            if (objectAlphaTextureEnvMode != 3)
+                colorOps[0] = objectAlphaTextureEnvMode == 1 ? eCO_ADD : eCO_MODULATE;
+            alphaOps[0] = eCO_MODULATE;
+            const uint32_t textureTimesConstant = static_cast<uint32_t>(
+                eCA_Texture | (eCA_Constant << 3));
+            if (objectAlphaTextureEnvMode != 3)
+                colorArgs[0] = textureTimesConstant;
+            alphaArgs[0] = textureTimesConstant;
+        }
+        if (m_forceCurrentTextureForClientDraw)
+        {
+            if (m_currentTextureId > 0) textureIds[0] = m_currentTextureId;
+            // The render element has already set its GL state. Do not
+            // replace its global constant with the enclosing pass RGBGen.
+            UCol clientConstant;
+            for (int channel = 0; channel < 4; ++channel)
+                clientConstant.bcolor[channel] = static_cast<byte>(
+                    clamp_tpl(m_materialColor[channel], 0.0f, 1.0f) * 255.0f);
+            textureEnvironmentColor = clientConstant.dcolor;
+            memset(primaryColorMask, 0, sizeof(primaryColorMask));
+        }
+
+        // NULL's loaded flag does not prove that an image exists in Vulkan.
+        // OpenGL's bind path uploads/reloads such images before sampling them.
+        // Recover a missing file-backed base image once, keeping its bind ID.
+        if (textureIds[0] > 0 && !m_frameRenderer->HasLegacyTexture(textureIds[0]))
+        {
+            static std::vector<int> attemptedTextureUploads;
+            STexPic* image = m_TexMan ? m_TexMan->GetByID(textureIds[0]) : nullptr;
+            if (image && image->m_SearchName.c_str()[0] && image->m_SearchName.c_str()[0] != '$' &&
+                std::find(attemptedTextureUploads.begin(), attemptedTextureUploads.end(), textureIds[0]) == attemptedTextureUploads.end())
+            {
+                attemptedTextureUploads.push_back(textureIds[0]);
+                EF_LoadTexture(image->m_SearchName.c_str(), image->m_Flags,
+                    image->m_Flags2 | FT2_RELOAD, image->m_eTT,
+                    image->m_fAmount1, image->m_fAmount2, image->m_Id, image->m_Bind);
+            }
+        }
+        if (lightmapStage == 1 && textureIds[1] <= 0 && m_RP.m_pCurObject &&
+            m_RP.m_pCurObject->m_nLMId > 0)
+            textureIds[1] = m_RP.m_pCurObject->m_nLMId;
+        if (lightmapStage == 1 && textureIds[1] <= 0 && m_activeResources &&
+            m_activeResources->m_Textures[EFTT_LIGHTMAP])
+        {
+            SEfResTexture* lightmap = m_activeResources->m_Textures[EFTT_LIGHTMAP];
+            lightmap->m_TU.mfUpdate();
+            if (lightmap->m_TU.m_ITexPic && lightmap->m_TU.m_ITexPic->IsTextureLoaded())
+                textureIds[1] = lightmap->m_TU.m_ITexPic->GetTextureID();
+        }
+
+        const bool hardwareBumpLightPass = hardwareMaterialLightPass &&
+            !(activeHardwareLightFlags & LMF_NOBUMP) && m_RP.m_pShader &&
+            m_RP.m_pShader->m_eSort != eS_Decal;
+        if ((directionalLightmapPass || hardwareBumpLightPass) && m_activeResources && m_RP.m_pCurObject)
+        {
+            SEfResTexture* bump = m_activeResources->m_Textures[EFTT_BUMP];
+            if (bump && (!bump->m_TU.m_ITexPic ||
+                         !bump->m_TU.m_ITexPic->IsTextureLoaded()) &&
+                !bump->m_Name.empty())
+            {
+                const char* resourcePath = m_activeResources->m_TexturePath.c_str();
+                auto failedLoad = m_failedBumpTextureLoads.find(bump);
+                bool retryLoad = failedLoad == m_failedBumpTextureLoads.end();
+                if (failedLoad != m_failedBumpTextureLoads.end())
+                {
+                    const FailedBumpTextureLoad& cached = failedLoad->second;
+                    const bool sameResource = cached.name == bump->m_Name.c_str() &&
+                        cached.path == resourcePath;
+                    retryLoad = !sameResource;
+                    if (!sameResource)
+                        m_failedBumpTextureLoads.erase(failedLoad);
+                }
+                if (retryLoad)
+                {
+                    const uint textureFlags = bump->m_TU.GetTexFlags();
+                    const uint textureFlags2 = bump->m_TU.GetTexFlags2();
+                    ITexPic* loaded = EF_LoadTexture(bump->m_Name.c_str(), textureFlags,
+                        textureFlags2, eTT_Bumpmap, static_cast<float>(bump->m_Amount));
+                    if ((!loaded || !loaded->IsTextureLoaded()) && resourcePath[0])
+                    {
+                        if (loaded)
+                            loaded->Release(false);
+                        std::string texturePath = resourcePath;
+                        if (texturePath.back() != '/' && texturePath.back() != '\\')
+                            texturePath.push_back('/');
+                        texturePath += bump->m_Name.c_str();
+                        loaded = EF_LoadTexture(texturePath.c_str(), textureFlags,
+                            textureFlags2, eTT_Bumpmap, static_cast<float>(bump->m_Amount));
+                    }
+                    if (loaded && loaded->IsTextureLoaded())
+                    {
+                        bump->m_TU.m_ITexPic = loaded;
+                        m_failedBumpTextureLoads.erase(bump);
+                    }
+                    else
+                    {
+                        if (loaded)
+                            loaded->Release(false);
+                        if (m_failedBumpTextureLoads.size() >= 2048 &&
+                            m_failedBumpTextureLoads.find(bump) == m_failedBumpTextureLoads.end())
+                            m_failedBumpTextureLoads.erase(m_failedBumpTextureLoads.begin());
+                        FailedBumpTextureLoad& cached = m_failedBumpTextureLoads[bump];
+                        cached.name = bump->m_Name.c_str();
+                        cached.path = resourcePath;
+                    }
+                }
+            }
+            if (bump)
+            {
+                // AmbPassTempl binds EFTT_BUMP outside SShaderPassHW::m_TUnits,
+                // but OpenGL still applies the material's stage-1 texture
+                // transform and the active technique/pass matrix operations.
+                updateStockTextureMatrix(bump, 1, textureMatrices[1]);
+                applyStockTextureMatrixOps(1, textureMatrices[1]);
+                bump->m_TU.mfUpdate();
+                if (bump->m_TU.m_ITexPic)
+                {
+                    textureIds[1] = bump->m_TU.m_ITexPic->GetTextureID();
+                    textureLodBias[1] = bump->m_TU.m_fTexFilterLodBias;
+                    textureStage1UsesTexCoord1 = false;
+                    if (hardwareBumpLightPass && !directionalLightmapPass)
+                    {
+                        normalMapTextureId = textureIds[1];
+                        normalMapTextureStage = 1;
+                        normalMapLodBias = textureLodBias[1];
+                    }
+                }
+            }
+            if (directionalLightmapPass && (!bump ||
+                (stockAmbientTemplate && !(stockHardwarePass->m_StockProgramMask & 0x1000ull))))
+            {
+                // CGRCAmbientTempl initializes the tangent normal to (0,0,1)
+                // when this variant has no bump sampler. It still evaluates
+                // direction alpha and directional lightmap intensity.
+                if (!m_flatLightmapNormalTextureId)
+                {
+                    byte flatNormal[4] = {128, 128, 255, 255};
+                    STexPic* flat = m_TexMan->CreateTexture("$VulkanFlatLightmapNormal", 1, 1, 1,
+                        FT_NOMIPS | FT_NOSTREAM, 0, flatNormal, eTT_Base,
+                        -1.0f, -1.0f, 0, nullptr, 0, eTF_8888);
+                    if (flat) m_flatLightmapNormalTextureId = flat->GetTextureID();
+                }
+                textureIds[1] = m_flatLightmapNormalTextureId;
+                textureStage1UsesTexCoord1 = false;
+            }
+            if (directionalLightmapPass && textureIds[1] > 0)
+            {
+                int lightmapTextureId = m_RP.m_pCurObject->m_nLMId;
+                if (lightmapTextureId <= 0 &&
+                    m_activeResources->m_Textures[EFTT_LIGHTMAP])
+                {
+                    SEfResTexture* lightmap =
+                        m_activeResources->m_Textures[EFTT_LIGHTMAP];
+                    lightmap->m_TU.mfUpdate();
+                    if (lightmap->m_TU.m_ITexPic)
+                        lightmapTextureId = lightmap->m_TU.m_ITexPic->GetTextureID();
+                }
+                int lightmapDirectionTextureId = m_RP.m_pCurObject->m_nLMDirId;
+                if (lightmapDirectionTextureId <= 0 &&
+                    m_activeResources->m_Textures[EFTT_LIGHTMAP_DIR])
+                {
+                    SEfResTexture* lightmapDirection =
+                        m_activeResources->m_Textures[EFTT_LIGHTMAP_DIR];
+                    lightmapDirection->m_TU.mfUpdate();
+                    if (lightmapDirection->m_TU.m_ITexPic)
+                        lightmapDirectionTextureId =
+                            lightmapDirection->m_TU.m_ITexPic->GetTextureID();
+                }
+                textureStage2.textureId = lightmapTextureId;
+                textureStage2.colorOp = eCO_MODULATE;
+                textureStage2.alphaOp = eCO_MODULATE;
+                textureStage2.useTexCoord1 = !lightmapTexCoords.empty() ||
+                    vertices->m_vertexformat == 16;
+                textureStage2.wrapMode = TextureWrapModeForId(textureStage2.textureId);
+                textureStage3.textureId = lightmapDirectionTextureId;
+                textureStage3.colorOp = eCO_MODULATE;
+                textureStage3.alphaOp = eCO_MODULATE;
+                textureStage3.useTexCoord1 = !lightmapTexCoords.empty() ||
+                    vertices->m_vertexformat == 16;
+                textureStage3.wrapMode = TextureWrapModeForId(textureStage3.textureId);
+                float lightmapMatrix[16]{};
+                lightmapMatrix[0] = lightmapMatrix[5] =
+                    lightmapMatrix[10] = lightmapMatrix[15] = 1.0f;
+                setStockUvTransform(textureStage2, lightmapMatrix);
+                setStockUvTransform(textureStage3, lightmapMatrix);
+                textureStage2Ptr = &textureStage2;
+                textureStage3Ptr = &textureStage3;
+            }
+            else if (directionalLightmapPass)
+                m_frameRenderer->RequirePanelFallback();
+        }
 
         textureStage2.constant = textureEnvironmentColor;
         textureStage3.constant = textureEnvironmentColor;
@@ -3796,40 +6956,846 @@ public:
                                m_RP.m_pCurObject->m_Matrix.GetData(), g_CpuFlags);
         else
             memcpy(modelView, m_CameraMatrix.GetData(), sizeof(modelView));
+        float waterReflectionModelView[16]{};
+        float waterReflectionClipPlane[4]{};
+        const bool hasWaterReflectionTransform = CV_r_waterreflections && iSystem &&
+            iSystem->GetI3DEngine();
+        if (hasWaterReflectionTransform)
+        {
+            const float waterLevel = iSystem->GetI3DEngine()->GetWaterLevel();
+            float reflection[16]{};
+            reflection[0] = reflection[5] = reflection[15] = 1.0f;
+            reflection[10] = -1.0f;
+            reflection[14] = 2.0f * waterLevel;
+            float identity[16]{};
+            identity[0] = identity[5] = identity[10] = identity[15] = 1.0f;
+            const float* objectMatrix = identity;
+            if (m_RP.m_pCurObject && (m_RP.m_pCurObject->m_ObjFlags & FOB_TRANS_MASK))
+                objectMatrix = m_RP.m_pCurObject->m_Matrix.GetData();
+            float reflectedObject[16]{};
+            mathMatrixMultiply(reflectedObject, reflection,
+                               const_cast<float*>(objectMatrix), g_CpuFlags);
+            mathMatrixMultiply(waterReflectionModelView, m_CameraMatrix.GetData(),
+                               reflectedObject, g_CpuFlags);
+
+            waterReflectionClipPlane[2] = 1.0f;
+            waterReflectionClipPlane[3] = -waterLevel;
+            if (GetCamera().GetPos().z < waterLevel)
+            {
+                waterReflectionClipPlane[2] = -1.0f;
+                waterReflectionClipPlane[3] = waterLevel;
+            }
+            if (m_RP.m_pCurObject && (m_RP.m_pCurObject->m_ObjFlags & FOB_TRANS_MASK))
+            {
+                const float worldPlane[4] = {
+                    0.0f, 0.0f, waterReflectionClipPlane[2], waterReflectionClipPlane[3]
+                };
+                for (int row = 0; row < 4; ++row)
+                    waterReflectionClipPlane[row] =
+                        worldPlane[0] * m_RP.m_pCurObject->m_Matrix(row, 0) +
+                        worldPlane[1] * m_RP.m_pCurObject->m_Matrix(row, 1) +
+                        worldPlane[2] * m_RP.m_pCurObject->m_Matrix(row, 2) +
+                        worldPlane[3] * m_RP.m_pCurObject->m_Matrix(row, 3);
+            }
+        }
+        CryVR::VulkanWaterReflectionUpdate waterReflectionUpdate{};
+        const CryVR::VulkanWaterReflectionUpdate* waterReflectionUpdatePtr = nullptr;
+        if (hasWaterReflectionTransform)
+        {
+            I3DEngine* engine = iSystem->GetI3DEngine();
+            if (engine)
+            {
+                waterReflectionUpdate.realTime = m_RP.m_RealTime;
+                waterReflectionUpdate.updateInterval =
+                    engine->GetDistanceToSectorWithWater() * CRenderer::CV_r_waterupdateFactor;
+                if (waterReflectionUpdate.updateInterval > 0.3f)
+                    waterReflectionUpdate.updateInterval = 0.3f;
+                waterReflectionUpdate.cameraDistanceThreshold = CRenderer::CV_r_waterupdateDistance;
+                waterReflectionUpdate.cameraAngleThreshold = CRenderer::CV_r_waterupdateDeltaAngle;
+                const Vec3d cameraPosition = GetCamera().GetPos();
+                const Vec3d cameraAngles = GetCamera().GetAngles();
+                waterReflectionUpdate.cameraPosition[0] = cameraPosition.x;
+                waterReflectionUpdate.cameraPosition[1] = cameraPosition.y;
+                waterReflectionUpdate.cameraPosition[2] = cameraPosition.z;
+                waterReflectionUpdate.cameraAngles[0] = cameraAngles.x;
+                waterReflectionUpdate.cameraAngles[1] = cameraAngles.y;
+                waterReflectionUpdate.cameraAngles[2] = cameraAngles.z;
+                waterReflectionUpdate.fieldOfView = GetCamera().GetFov();
+                waterReflectionUpdatePtr = &waterReflectionUpdate;
+            }
+        }
+        // Implicit hardware-resource binding (including AmbPassTempl bump)
+        // is reconstructed above. In GL it precedes the element's mfDraw,
+        // so an explicit element bind must remain the final sampler choice.
+        const auto applyExplicitStageState = [&](int stage,
+                                                  CryVR::VulkanStockTextureStage& translated)
+        {
+            const uint8_t overrides = m_stageStateOverrides[stage];
+            const bool addedStage = m_activePass && stage >= m_activePass->m_TUnits.Num();
+            if (addedStage || (overrides & 1u)) translated.colorOp = m_stageColorOps[stage];
+            if (addedStage || (overrides & 2u)) translated.alphaOp = m_stageAlphaOps[stage];
+            if (addedStage || (overrides & 4u)) translated.colorArg = m_stageColorArgs[stage];
+            if (addedStage || (overrides & 8u)) translated.alphaArg = m_stageAlphaArgs[stage];
+            if (addedStage || (overrides & 16u)) translated.lodBias = m_stageLodBias[stage];
+        };
+        for (int stage = 0; stage < 2; ++stage)
+        {
+            if (m_stageStateOverrides[stage] & 32u)
+                textureIds[stage] = m_stageTextureIds[stage];
+        }
+        if (m_stageStateOverrides[2] & 32u)
+        {
+            textureStage2.textureId = m_stageTextureIds[2];
+            applyExplicitStageState(2, textureStage2);
+            textureStage2.wrapMode = TextureWrapModeForId(textureStage2.textureId);
+            textureStage2Ptr = textureStage2.textureId > 0 ? &textureStage2 : nullptr;
+        }
+        if (m_stageStateOverrides[3] & 32u)
+        {
+            textureStage3.textureId = m_stageTextureIds[3];
+            applyExplicitStageState(3, textureStage3);
+            textureStage3.wrapMode = TextureWrapModeForId(textureStage3.textureId);
+            textureStage3Ptr = textureStage3.textureId > 0 ? &textureStage3 : nullptr;
+        }
+        for (int stage = 4; stage < 8; ++stage)
+        {
+            if (!(m_stageStateOverrides[stage] & 32u)) continue;
+            auto& translated = textureStages4To7[stage - 4];
+            translated.textureId = m_stageTextureIds[stage];
+            applyExplicitStageState(stage, translated);
+            translated.wrapMode = TextureWrapModeForId(translated.textureId);
+            textureStages4To7Ptr = textureStages4To7;
+        }
+        if (normalMapTextureStage >= 0 &&
+            (m_stageStateOverrides[normalMapTextureStage] & 32u))
+        {
+            normalMapTextureId = m_stageTextureIds[normalMapTextureStage];
+            normalMapLodBias = (m_stageStateOverrides[normalMapTextureStage] & 16u) ?
+                m_stageLodBias[normalMapTextureStage] : textureLodBias[normalMapTextureStage];
+        }
         memcpy(textureMatrix, textureMatrices[0], sizeof(textureMatrix));
 
         const uint16_t* indexData = static_cast<const uint16_t*>(indices->m_VData) + firstIndex;
-        std::vector<uint16_t> triangulatedQuads;
+        auto& triangulatedQuads = scratchStorage.triangulatedQuads;
+        triangulatedQuads.clear();
         uint32_t drawIndexCount = static_cast<uint32_t>(indexCount);
         const void* finalVertexData = flareDeformActive ?
             static_cast<const void*>(flareVertexData.data()) : drawVertexData;
         const uint32_t finalVertexCount = flareDeformActive ? 16u :
             static_cast<uint32_t>(vertices->m_NumVerts);
+        // Material groups reference only a part of their shared leaf buffer.
+        // Convert that range; unrelated vertices are never fetched by this draw.
+        uint32_t conversionFirst = 0, conversionEnd = finalVertexCount;
+        if (!flareDeformActive && indexCount > 0)
+        {
+            uint32_t minimum = finalVertexCount, maximum = 0;
+            for (int index = 0; index < indexCount; ++index)
+            {
+                minimum = crymin(minimum, static_cast<uint32_t>(indexData[index]));
+                maximum = crymax(maximum, static_cast<uint32_t>(indexData[index]));
+            }
+            if (maximum >= finalVertexCount)
+            {
+                m_frameRenderer->RequirePanelFallback();
+                return;
+            }
+            conversionFirst = minimum;
+            conversionEnd = maximum + 1;
+        }
         int finalVertexFormat = flareDeformActive ? VERTEX_FORMAT_P3F_COL4UB_TEX2F :
             vertices->m_vertexformat;
-        std::vector<struct_VERTEX_FORMAT_P3F_TEX2F> hardwareTexturedVertices;
+        auto& waterDeformedVertices = scratchStorage.waterDeformedVertices;
+        if ((stockWaterMode == 7 || stockWaterMode == 9) && finalVertexData)
+        {
+            CryVR::VulkanVertexFormat format{};
+            if (CryVR::GetVulkanVertexFormat(static_cast<uint32_t>(finalVertexFormat), format))
+            {
+                // PosWaterDeform_PlusWaterLevel uses GL's 32-entry Perlin
+                // gradient/permutation table. Evaluate the identical script
+                // on CPU so P3F_COL4UB ocean meshes retain their input layout.
+                static Vec3d gradients[66];
+                static int permutation[32];
+                static bool initialized = false;
+                if (!initialized)
+                {
+                    for (int i = 0; i < 32; ++i)
+                    {
+                        permutation[i] = i;
+                        gradients[i].x = static_cast<float>(rand()) / RAND_MAX;
+                        gradients[i].y = static_cast<float>(rand()) / RAND_MAX;
+                        gradients[i].z = static_cast<float>(rand()) / RAND_MAX;
+                        gradients[i].Normalize();
+                    }
+                    for (int i = 0; i < 32; ++i)
+                    {
+                        int j = (rand() >> 4) & 31;
+                        std::swap(permutation[j], permutation[i]);
+                        gradients[i + 32] = gradients[i];
+                    }
+                    gradients[64] = gradients[0]; gradients[65] = gradients[1];
+                    initialized = true;
+                }
+                SParamComp_User amplitudeParameter;
+                amplitudeParameter.m_Name = "WaveAmplitude";
+                float amplitude = amplitudeParameter.mfGet();
+                float waterLevel = iSystem->GetI3DEngine()->GetWaterLevel();
+                uint32_t beachUvOffset = ~0u;
+                float beachShift[4]{};
+                if (stockWaterMode == 9)
+                {
+                    for (uint32_t attribute = 0; attribute < format.attributeCount; ++attribute)
+                        if (format.attributes[attribute].location == 3)
+                            beachUvOffset = format.attributes[attribute].offset;
+                    SShaderPassHW* beachPass = const_cast<SShaderPassHW*>(stockHardwarePass);
+                    TArray<SCGParam4f>* lists[] = { &beachPass->m_VPParamsNoObj, &beachPass->m_VPParamsObj };
+                    for (auto* list : lists)
+                        for (int parameter = 0; parameter < list->Num(); ++parameter)
+                            if (!stricmp(list->Get(parameter).m_Name.c_str(), "TexShift"))
+                                memcpy(beachShift, list->Get(parameter).mfGet(), sizeof(beachShift));
+                }
+                waterDeformedVertices.resize(static_cast<size_t>(finalVertexCount) * format.stride);
+                memcpy(waterDeformedVertices.data(), finalVertexData, waterDeformedVertices.size());
+                for (uint32_t i = 0; i < finalVertexCount; ++i)
+                {
+                    Vec3d position;
+                    byte* destination = waterDeformedVertices.data() + i * format.stride;
+                    memcpy(&position, destination, sizeof(position));
+                    float vx = position.x + m_RP.m_RealTime * (stockWaterMode == 9 ? 0.6f : 0.8f);
+                    float vy = position.y + m_RP.m_RealTime * 0.6f;
+                    int ix = static_cast<int>(floorf(vx)) & 31;
+                    int iy = static_cast<int>(floorf(vy)) & 31;
+                    float fx = vx-floorf(vx), fy = vy-floorf(vy);
+                    int p0 = permutation[ix] + iy;
+                    int p1 = permutation[(ix+1)&31] + iy;
+                    float r0 = gradients[p0].x*fx + gradients[p0].y*fy;
+                    float r1 = gradients[p1].x*(fx-1.0f) + gradients[p1].y*fy;
+                    float r2 = gradients[p0+1].x*fx + gradients[p0+1].y*(fy-1.0f);
+                    float r3 = gradients[p1+1].x*(fx-1.0f) + gradients[p1+1].y*(fy-1.0f);
+                    float sx = fx*fx*(3.0f-2.0f*fx), sy = fy*fy*(3.0f-2.0f*fy);
+                    float a = r0 + (r2-r0)*sy, b = r1 + (r3-r1)*sy;
+                    const float noise = a + (b - a) * sx;
+                    position.z = (stockWaterMode == 9 ? position.z : waterLevel) + noise * amplitude;
+                    if (stockWaterMode == 9 && beachUvOffset != ~0u && fabsf(beachShift[1]) > 1.e-6f)
+                    {
+                        float uv[2];
+                        memcpy(uv, destination + beachUvOffset, sizeof(uv));
+                        uv[1] += noise * beachShift[2] / beachShift[1];
+                        memcpy(destination + beachUvOffset, uv, sizeof(uv));
+                    }
+                    memcpy(destination, &position, sizeof(position));
+                }
+                finalVertexData = waterDeformedVertices.data();
+            }
+        }
+        auto& hardwareTexturedVertices = scratchStorage.hardwareTexturedVertices;
+        auto& separateUvVertices = scratchStorage.separateUvVertices;
+        separateUvVertices.clear();
+        auto& terrainLowResTexturedVertices = scratchStorage.terrainLowResTexturedVertices;
+        auto& terrainFogLayeredTexturedVertices = scratchStorage.terrainFogLayeredTexturedVertices;
+        auto& terrainTexturedVertices = scratchStorage.terrainTexturedVertices;
         int hardwareTempTexCoordCount = -1;
         if (!flareDeformActive && textureIds[0] > 0 &&
-            m_activeHardwarePassType != eSHP_MAX &&
-            vertices->m_vertexformat == VERTEX_FORMAT_P3F &&
+            uv0Offset == 0xffffffffu && !linearTexgen[0].enabled &&
             m_RP.m_pRE && m_RP.m_pRE->mfGetType() == eDATA_OcLeaf)
         {
             CREOcLeaf* leafElement = static_cast<CREOcLeaf*>(m_RP.m_pRE);
             CLeafBuffer* leafBuffer = leafElement->m_pBuffer ?
                 leafElement->m_pBuffer->GetVertexContainer() : nullptr;
-            if (leafBuffer && leafBuffer->m_TempTexCoords)
+            if (leafBuffer && leafBuffer->m_TempTexCoords &&
+                finalVertexCount <= static_cast<uint32_t>(leafBuffer->m_SecVertCount))
             {
                 hardwareTempTexCoordCount = leafBuffer->m_SecVertCount;
-                const Vec3* positions = static_cast<const Vec3*>(finalVertexData);
-                hardwareTexturedVertices.resize(finalVertexCount);
+                // CREOcLeaf exposes this source independently of the packed
+                // position/normal/color stream. Preserve all those attributes
+                // while adding UVs, including skinned normal-bearing layouts.
+                const int withUv = m_RP.m_VFormatsMerge[finalVertexFormat][VERTEX_FORMAT_P3F_TEX2F];
+                CryVR::VulkanVertexFormat sourceFormat{}, destinationFormat{};
+                if (CryVR::GetVulkanVertexFormat(finalVertexFormat, sourceFormat) &&
+                    CryVR::GetVulkanVertexFormat(withUv, destinationFormat))
+                {
+                    separateUvVertices.resize(static_cast<size_t>(finalVertexCount) * destinationFormat.stride, 0);
+                    for (uint32_t vertex = 0; vertex < finalVertexCount; ++vertex)
+                    {
+                        byte* output = separateUvVertices.data() + vertex * destinationFormat.stride;
+                        const byte* input = static_cast<const byte*>(finalVertexData) + vertex * sourceFormat.stride;
+                        for (uint32_t dst = 0; dst < destinationFormat.attributeCount; ++dst)
+                        {
+                            const auto& target = destinationFormat.attributes[dst];
+                            if (target.location == 3)
+                            {
+                                memcpy(output + target.offset, leafBuffer->m_TempTexCoords[vertex].vert, sizeof(float) * 2);
+                                continue;
+                            }
+                            for (uint32_t src = 0; src < sourceFormat.attributeCount; ++src)
+                            {
+                                const auto& original = sourceFormat.attributes[src];
+                                if (original.location != target.location || original.format != target.format) continue;
+                                const size_t size = original.format == VK_FORMAT_R32G32B32_SFLOAT ? 12 :
+                                    (original.format == VK_FORMAT_R32G32_SFLOAT ? 8 : 4);
+                                memcpy(output + target.offset, input + original.offset, size);
+                                break;
+                            }
+                        }
+                    }
+                    finalVertexData = separateUvVertices.data();
+                    finalVertexFormat = withUv;
+                }
+            }
+        }
+        if (stockHardwarePass &&
+            !stricmp(stockHardwarePass->m_StockVertexProgram, "CGVProgTexGen_1Unit") &&
+            m_RP.m_pShader && !strnicmp(m_RP.m_pShader->GetName(), "TerrainWaterBottom", 18) &&
+            finalVertexFormat == VERTEX_FORMAT_P3F)
+        {
+            float planes[2][4]{};
+            const char* names[] = { "BaseTexGen0", "BaseTexGen1" };
+            SShaderPassHW* pass = const_cast<SShaderPassHW*>(stockHardwarePass);
+            TArray<SCGParam4f>* lists[] = { &pass->m_VPParamsNoObj, &pass->m_VPParamsObj };
+            for (auto* list : lists)
+                for (int i = 0; i < list->Num(); ++i)
+                    for (int plane = 0; plane < 2; ++plane)
+                        if (!stricmp(list->Get(i).m_Name.c_str(), names[plane]))
+                            memcpy(planes[plane], list->Get(i).mfGet(), sizeof(planes[plane]));
+            const Vec3d* positions = static_cast<const Vec3d*>(finalVertexData);
+            hardwareTexturedVertices.resize(finalVertexCount);
+            for (uint32_t i = 0; i < finalVertexCount; ++i)
+            {
+                auto& output = hardwareTexturedVertices[i];
+                output.xyz = positions[i];
+                Vec3d world = positions[i];
+                if (m_RP.m_pCurObject)
+                {
+                    Vec3d local = positions[i];
+                    TransformPosition(world, local, m_RP.m_pCurObject->m_Matrix);
+                }
+                for (int plane = 0; plane < 2; ++plane)
+                    output.st[plane] = world.x*planes[plane][0] + world.y*planes[plane][1] +
+                        world.z*planes[plane][2] + planes[plane][3];
+            }
+            finalVertexData = hardwareTexturedVertices.data();
+            finalVertexFormat = VERTEX_FORMAT_P3F_TEX2F;
+        }
+        // CGVProgMuzzleFlash drives the Training sunlight meshes as well as
+        // muzzle flashes. Its RGB comes from the object-space view/normal angle.
+        const bool muzzleFlashShader = m_RP.m_pShader &&
+            (!stricmp(m_RP.m_pShader->GetName(), "templmuzzleflash_auto") ||
+             !stricmp(m_RP.m_pShader->GetName(), "templmuzzleflash_auto_fp"));
+        const bool muzzleFlashAngularFade = muzzleFlashShader &&
+            !stricmp(m_RP.m_pShader->GetName(), "templmuzzleflash_auto");
+        const bool stockPlantsProgram = stockHardwarePass &&
+            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCPlants");
+        const bool stockSimplePlantsProgram = stockPlantsProgram &&
+            (!stricmp(stockHardwarePass->m_StockVertexProgram, "CGVProgSimple_Plant") ||
+             !stricmp(stockHardwarePass->m_StockVertexProgram, "CGVProgSimple_Plant_Bended"));
+        if ((stockAmbientTemplate || stockLightTemplate) &&
+            !stockHardwarePass->m_StockUsesVertexColors)
+        {
+            // CG templates sample albedo/lighting independently of input
+            // mesh RGB unless the VERTCOLORS program feature is enabled.
+            // The fixed-function vertex color is not an extra lighting term.
+            primaryColor[0] = primaryColor[1] = primaryColor[2] = 1.0f;
+            primaryColorMask[0] = primaryColorMask[1] = primaryColorMask[2] = 1.0f;
+        }
+        if (stockAmbientTemplate || (stockHardwarePass &&
+            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCLightTempl") &&
+            (stockHardwarePass->m_StockProgramMask & 0x20000000ull)))
+        {
+            // CGRCAmbientTempl/CGRCLightTempl output diffuse alpha only
+            // for the corresponding expanded material variant. A gloss or
+            // glow channel is not automatically the surface opacity.
+            const uint64 mask = stockHardwarePass->m_StockProgramMask;
+            const bool diffuseAlpha = !(mask & 0x2000ull) && (mask & 0x4000ull);
+            const bool useTextureAlpha = stockAmbientTemplate ?
+                (diffuseAlpha || ((mask & 0x2000ull) && (mask & 0x01000000ull))) :
+                (diffuseAlpha && !(mask & 0x20ull));
+            alphaOps[0] = useTextureAlpha ? eCO_MODULATE : eCO_REPLACE;
+            alphaArgs[0] = useTextureAlpha ?
+                eCA_Texture | (eCA_Diffuse << 3) : eCA_Diffuse;
+            primaryColor[3] = 1.0f;
+            primaryColorMask[3] = 1.0f;
+        }
+        int stockTerrainLayers = -1;
+        int stockTerrainOnlyLayers = 0;
+        int stockTerrainAmbientMode = 0;
+        int stockTerrainFogLayers = -1;
+        if (stockHardwarePass)
+        {
+            const char* program = stockHardwarePass->m_StockFragmentProgram;
+            if (!stricmp(program, "CGRCTerrain")) stockTerrainLayers = 0;
+            else if (!stricmp(program, "CGRCTerrain_1Layers")) stockTerrainLayers = 1;
+            else if (!stricmp(program, "CGRCTerrain_2Layers")) stockTerrainLayers = 2;
+            else if (!stricmp(program, "CGRCTerrain_3Layers")) stockTerrainLayers = 3;
+            else if (!stricmp(program, "CGRCTerrain_1Layers_Only")) stockTerrainOnlyLayers = 1;
+            else if (!stricmp(program, "CGRCTerrain_2Layers_Only")) stockTerrainOnlyLayers = 2;
+            else if (!stricmp(program, "CGRCTerrain_3Layers_Only")) stockTerrainOnlyLayers = 3;
+            else if (!stricmp(program, "CGRCTerrain_4Layers_Only")) stockTerrainOnlyLayers = 4;
+            else if (!stricmp(program, "CGRCTerrain_NoCol")) stockTerrainAmbientMode = 1;
+            else if (!stricmp(program, "CGRCTerrain_Far")) stockTerrainAmbientMode = 2;
+            else if (!stricmp(program, "CGRCTerrain_DetTex")) stockTerrainAmbientMode = 3;
+            else if (!stricmp(program, "CGRCTerrain_VF")) stockTerrainAmbientMode = 4;
+            else if (!stricmp(program, "CGRCTerrain_1Layers_VF")) stockTerrainFogLayers = 1;
+            else if (!stricmp(program, "CGRCTerrain_2Layers_VF")) stockTerrainFogLayers = 2;
+        }
+        if (stockPlantsProgram || stockTerrainLayers >= 0)
+        {
+            // CGRCPlants/CGRCTerrain encode the albedo/color product by x2.
+            colorOps[0] = eCO_MODULATE2X;
+            colorArgs[0] = eCA_Texture | (eCA_Diffuse << 3);
+            alphaOps[0] = eCO_REPLACE;
+            alphaArgs[0] = eCA_Texture;
+            primaryColorMask[0] = primaryColorMask[1] = primaryColorMask[2] = 0.0f;
+            primaryColor[3] = 1.0f;
+            primaryColorMask[3] = 1.0f;
+        }
+        auto& muzzleFlashVertices = scratchStorage.muzzleFlashVertices;
+        muzzleFlashVertices.clear();
+        if (muzzleFlashShader)
+        {
+            renderState = (renderState & ~(GS_BLEND_MASK | GS_DEPTHWRITE)) |
+                GS_BLSRC_ONE | GS_BLDST_ONE;
+            colorOps[0] = muzzleFlashAngularFade ? eCO_MODULATE : eCO_REPLACE;
+            alphaOps[0] = eCO_MODULATE;
+            colorArgs[0] = alphaArgs[0] = eCA_Texture | (eCA_Diffuse << 3);
+            memset(primaryColorMask, 0, sizeof(primaryColorMask));
+            CryVR::VulkanVertexFormat format{};
+            uint32_t posOffset = ~0u, texOffset = ~0u, normOffset = ~0u;
+            if (CryVR::GetVulkanVertexFormat(finalVertexFormat, format))
+                for (uint32_t i = 0; i < format.attributeCount; ++i)
+                {
+                    const auto& attribute = format.attributes[i];
+                    if (attribute.location == 0) posOffset = attribute.offset;
+                    if (attribute.location == 1) normOffset = attribute.offset;
+                    if (attribute.location == 3) texOffset = attribute.offset;
+                }
+            const byte* normals = nullptr;
+            int normalStride = 0;
+            if (normOffset != ~0u)
+            {
+                normals = static_cast<const byte*>(finalVertexData) + normOffset;
+                normalStride = format.stride;
+            }
+            else if (m_RP.m_pRE && m_RP.m_pRE->mfGetType() == eDATA_OcLeaf)
+            {
+                auto* element = static_cast<CREOcLeaf*>(m_RP.m_pRE);
+                CLeafBuffer* leaf = element->m_pBuffer ?
+                    element->m_pBuffer->GetVertexContainer() : nullptr;
+                if (leaf && leaf->m_pSecVertBuffer &&
+                    leaf->m_SecVertCount >= static_cast<int>(finalVertexCount) &&
+                    (gBufInfoTable[leaf->m_pSecVertBuffer->m_vertexformat].OffsNormal ||
+                     leaf->m_TempNormals))
+                    normals = leaf->GetNormalPtr(normalStride);
+            }
+            if (muzzleFlashAngularFade && posOffset != ~0u && texOffset != ~0u && normals)
+            {
+                Vec3d camera = GetCamera().GetPos();
+                if (m_RP.m_pCurObject)
+                {
+                    Vec3d worldCamera = camera;
+                    TransformPosition(camera, worldCamera,
+                        m_RP.m_pCurObject->GetInvMatrix());
+                }
+                muzzleFlashVertices.resize(finalVertexCount);
+                for (uint32_t i = 0; i < finalVertexCount; ++i)
+                {
+                    const byte* source = static_cast<const byte*>(finalVertexData) + i * format.stride;
+                    auto& output = muzzleFlashVertices[i];
+                    memcpy(&output.xyz, source + posOffset, sizeof(output.xyz));
+                    memcpy(output.st, source + texOffset, sizeof(output.st));
+                    Vec3d normal;
+                    memcpy(&normal, normals + i * normalStride, sizeof(normal));
+                    Vec3d view = camera - output.xyz;
+                    view.Normalize();
+                    float d = 2.0f * fabsf(view.Dot(normal));
+                    d *= d;
+                    d = crymin(1.0f, d * d);
+                    const byte intensity = static_cast<byte>(d * 255.0f);
+                    output.color.bcolor[0] = output.color.bcolor[1] =
+                        output.color.bcolor[2] = intensity;
+                    output.color.bcolor[3] = 255;
+                }
+                finalVertexData = muzzleFlashVertices.data();
+                finalVertexFormat = VERTEX_FORMAT_P3F_COL4UB_TEX2F;
+            }
+        }
+        // EF_CommitStreams overrides the normal pointer with current TNormal
+        // for resources requiring normals, including animated tangent streams.
+        auto& leafLitVertices = scratchStorage.litVertices;
+        // Keep the previous size as well as capacity; the referenced range is
+        // overwritten below, so clearing would zero unrelated mesh vertices.
+        const bool resourceNormalOverride = m_RP.m_pShaderResources &&
+            m_RP.m_pShaderResources->m_bNeedNormals;
+        if (!muzzleFlashShader && !stockSimplePlantsProgram && (normalPointer || resourceNormalOverride || hardwareLightPass || hardwareAmbientPass ||
+            fixedFunctionMaterialLighting) &&
+            (normalPointer || resourceNormalOverride || !HasStockVertexNormal(finalVertexFormat)) &&
+            m_RP.m_pRE && m_RP.m_pRE->mfGetType() == eDATA_OcLeaf)
+        {
+            auto* element = static_cast<CREOcLeaf*>(m_RP.m_pRE);
+            CLeafBuffer* leaf = element->m_pBuffer ? element->m_pBuffer->GetVertexContainer() : nullptr;
+            CryVR::VulkanVertexFormat sourceFormat{}, targetFormat{};
+            uint32_t pos = ~0u, uv = ~0u, color = ~0u, secondary = ~0u, normalOffset = ~0u;
+            if (CryVR::GetVulkanVertexFormat(finalVertexFormat, sourceFormat))
+                for (uint32_t i = 0; i < sourceFormat.attributeCount; ++i)
+                {
+                    const auto& a = sourceFormat.attributes[i];
+                    if (a.location == 0) pos = a.offset;
+                    if (a.location == 1 && a.format == VK_FORMAT_R32G32B32_SFLOAT)
+                        normalOffset = a.offset;
+                    if (a.location == 3) uv = a.offset;
+                    if (a.location == 2) color = a.offset;
+                    if (a.location == 4) secondary = a.offset;
+                }
+            const ESrcPointer committedNormalSource = resourceNormalOverride ? eSrcPointer_TNormal :
+                (normalPointer ? normalPointer->ePT : eSrcPointer_Unknown);
+            const bool floatNormalPointer = resourceNormalOverride || !normalPointer ||
+                normalPointer->Type == GL_FLOAT;
+            const bool tangentNormalPointer = floatNormalPointer &&
+                (committedNormalSource == eSrcPointer_TNormal ||
+                 committedNormalSource == eSrcPointer_Tangent || committedNormalSource == eSrcPointer_Binormal);
+            const SPipTangents* currentTangents = tangentNormalPointer && leaf &&
+                leaf->m_pVertexBuffer && leaf->m_pVertexBuffer->m_NumVerts >= static_cast<int>(finalVertexCount) ?
+                static_cast<const SPipTangents*>(leaf->m_pVertexBuffer->m_VS[VSF_TANGENTS].m_VData) : nullptr;
+            const byte* committedTangentNormal = currentTangents ? reinterpret_cast<const byte*>(
+                committedNormalSource == eSrcPointer_Tangent ? &currentTangents[0].m_Tangent :
+                committedNormalSource == eSrcPointer_Binormal ? &currentTangents[0].m_Binormal :
+                &currentTangents[0].m_TNormal) : nullptr;
+            const byte* committedNormal = committedTangentNormal;
+            int committedNormalStride = sizeof(SPipTangents);
+            if (floatNormalPointer && committedNormalSource == eSrcPointer_Normal && leaf &&
+                leaf->m_pVertexBuffer && leaf->m_pVertexBuffer->m_NumVerts >= static_cast<int>(finalVertexCount) &&
+                leaf->m_pVertexBuffer->m_VS[VSF_GENERAL].m_VData)
+            {
+                const int sourceNormalOffset = gBufInfoTable[leaf->m_pVertexBuffer->m_vertexformat].OffsNormal;
+                if (sourceNormalOffset)
+                {
+                    committedNormal = static_cast<const byte*>(leaf->m_pVertexBuffer->m_VS[VSF_GENERAL].m_VData) +
+                        sourceNormalOffset;
+                    committedNormalStride = m_VertexSize[leaf->m_pVertexBuffer->m_vertexformat];
+                }
+            }
+            const bool secondaryNormals = leaf && leaf->m_pSecVertBuffer &&
+                leaf->m_SecVertCount >= static_cast<int>(finalVertexCount) &&
+                (gBufInfoTable[leaf->m_pSecVertBuffer->m_vertexformat].OffsNormal || leaf->m_TempNormals) &&
+                (leaf->m_TempNormals || leaf->m_pSecVertBuffer->m_VS[VSF_GENERAL].m_VData);
+            if (committedNormal && normalOffset != ~0u &&
+                normalOffset + sizeof(float) * 3 <= sourceFormat.stride)
+            {
+                if (committedNormalStride != static_cast<int>(sourceFormat.stride) ||
+                    committedNormal != static_cast<const byte*>(finalVertexData) + normalOffset)
+                {
+                // Preserve secondary colors, extra UVs and every other attribute
+                // when the layout already has room for the committed normal.
+                const size_t bytes = static_cast<size_t>(finalVertexCount) * sourceFormat.stride;
+                leafLitVertices.resize(bytes);
+                const size_t start = static_cast<size_t>(conversionFirst) * sourceFormat.stride;
+                memcpy(leafLitVertices.data() + start, static_cast<const byte*>(finalVertexData) + start,
+                    static_cast<size_t>(conversionEnd - conversionFirst) * sourceFormat.stride);
+                for (uint32_t i = conversionFirst; i < conversionEnd; ++i)
+                    memcpy(leafLitVertices.data() + static_cast<size_t>(i) * sourceFormat.stride + normalOffset,
+                        committedNormal + static_cast<size_t>(i) * committedNormalStride, sizeof(float) * 3);
+                finalVertexData = leafLitVertices.data();
+                }
+            }
+            else if ((committedNormal || (!resourceNormalOverride && !normalPointer && secondaryNormals)) &&
+                pos != ~0u && (finalVertexFormat == VERTEX_FORMAT_P3F ||
+                    finalVertexFormat == VERTEX_FORMAT_P3F_COL4UB ||
+                    finalVertexFormat == VERTEX_FORMAT_P3F_COL4UB_COL4UB ||
+                    finalVertexFormat == VERTEX_FORMAT_P3F_COL4UB_COL4UB_TEX2F ||
+                    finalVertexFormat == VERTEX_FORMAT_P3F_TEX2F ||
+                    finalVertexFormat == VERTEX_FORMAT_P3F_COL4UB_TEX2F ||
+                    finalVertexFormat == VERTEX_FORMAT_P3F_N_TEX2F ||
+                    finalVertexFormat == VERTEX_FORMAT_P3F_N_COL4UB_TEX2F))
+            {
+                const int target = secondary != ~0u ?
+                    (uv == ~0u ? VERTEX_FORMAT_P3F_N_COL4UB_COL4UB : VERTEX_FORMAT_P3F_N_COL4UB_COL4UB_TEX2F) :
+                    uv == ~0u ?
+                    (color == ~0u ? VERTEX_FORMAT_P3F_N : VERTEX_FORMAT_P3F_N_COL4UB) :
+                    (color == ~0u ? VERTEX_FORMAT_P3F_N_TEX2F : VERTEX_FORMAT_P3F_N_COL4UB_TEX2F);
+                if (CryVR::GetVulkanVertexFormat(target, targetFormat))
+                {
+                    int stride = 0;
+                    const byte* normals = committedNormal ?
+                        committedNormal : leaf->GetNormalPtr(stride);
+                    if (committedNormal) stride = committedNormalStride;
+                    leafLitVertices.resize(static_cast<size_t>(finalVertexCount) * targetFormat.stride);
+                    for (uint32_t i = conversionFirst; i < conversionEnd; ++i)
+                    {
+                        const byte* source = static_cast<const byte*>(finalVertexData) + i * sourceFormat.stride;
+                        byte* output = leafLitVertices.data() + i * targetFormat.stride;
+                        memcpy(output, source + pos, 12);
+                        memcpy(output + 12, normals + i * stride, 12);
+                        if (color != ~0u) memcpy(output + 24, source + color, 4);
+                        if (secondary != ~0u) memcpy(output + 28, source + secondary, 4);
+                        if (uv != ~0u)
+                            memcpy(output + (secondary != ~0u ? 32 : color == ~0u ? 24 : 28), source + uv, 8);
+                    }
+                    finalVertexData = leafLitVertices.data();
+                    finalVertexFormat = target;
+                }
+            }
+        }
+        // Terrain surface, light and fog passes keep base-cover texgen on the
+        // render element instead of storing UVs. The low-resolution terrain
+        // uses P3F; sectors use P3F_N_COL4UB_COL4UB and carry detail masks.
+        // Materialize OpenGL's (y * scale + offsetY, x * scale + offsetX)
+        // mapping into a Vulkan texture-coordinate layout. Terrain shadow
+        // receivers retain their explicit shadow-map texgen path.
+        const bool terrainShaderSort = m_RP.m_pShader &&
+            (m_RP.m_pShader->m_eSort == eS_Terrain ||
+             m_RP.m_pShader->m_eSort == eS_TerrainDetailTextures ||
+             m_RP.m_pShader->m_eSort == eS_TerrainLightPass ||
+             m_RP.m_pShader->m_eSort == eS_TerrainFogPass ||
+             (stockTerrainShadowProgram &&
+              m_RP.m_pShader->m_eSort == eS_TerrainShadowPass));
+        const bool terrainDetailSort = m_RP.m_pShader &&
+            m_RP.m_pShader->m_eSort == eS_TerrainDetailTextures;
+        const bool terrainSectorVertices =
+            vertices->m_vertexformat == VERTEX_FORMAT_P3F_N_COL4UB_COL4UB &&
+            (finalVertexFormat == VERTEX_FORMAT_P3F_N_COL4UB_COL4UB ||
+             finalVertexFormat == VERTEX_FORMAT_P3F_N_COL4UB_COL4UB_TEX2F);
+        const bool terrainShadowVertices = stockTerrainShadowProgram &&
+            finalVertexFormat == VERTEX_FORMAT_P3F_N_COL4UB;
+        const bool terrainLowResVertices =
+            finalVertexFormat == VERTEX_FORMAT_P3F &&
+            m_RP.m_pShader && m_RP.m_pShader->m_eSort == eS_Terrain;
+        // TerrainWithFog uses its own compact vertex layouts: the base and
+        // one-layer variants carry P3F+Color, while the two-layer variant
+        // carries P3F+Color+Color1. Include these layouts in terrain texgen
+        // setup or the fog/layer shaders receive no RE terrain projection.
+        const bool terrainFogColorVertices =
+            finalVertexFormat == VERTEX_FORMAT_P3F_COL4UB &&
+            (stockTerrainAmbientMode == 4 || stockTerrainFogLayers == 1);
+        const bool terrainFogLayeredVertices =
+            finalVertexFormat == VERTEX_FORMAT_P3F_COL4UB_COL4UB &&
+            stockTerrainFogLayers == 2;
+        if (!flareDeformActive && (terrainSectorVertices || terrainLowResVertices ||
+            terrainShadowVertices || terrainFogColorVertices || terrainFogLayeredVertices) &&
+            m_RP.m_pRE && m_RP.m_pRE->m_CustomData && finalVertexData &&
+            finalVertexCount > 0 && terrainShaderSort)
+        {
+            const float* terrainTexgen = static_cast<const float*>(m_RP.m_pRE->m_CustomData);
+            const float offsetY = terrainTexgen[0];
+            const float offsetX = terrainTexgen[1];
+            const float scale = terrainTexgen[2];
+            if (!terrainDetailSort)
+            {
+                terrainProjectionRows[0][0][1] = scale;
+                terrainProjectionRows[0][0][3] = offsetY;
+                terrainProjectionRows[1][0][0] = scale;
+                terrainProjectionRows[1][0][3] = offsetX;
+                for (uint32_t stage = 1; stage < 8 && terrainSectorVertices; ++stage)
+                {
+                    const float* projection = terrainTexgen + 4 + (stage - 1) * 8;
+                    for (int axis = 0; axis < 4; ++axis)
+                    {
+                        terrainProjectionRows[0][stage][axis] = projection[axis];
+                        terrainProjectionRows[1][stage][axis] = projection[4 + axis];
+                    }
+                }
+            }
+            else if (terrainSectorVertices)
+            {
+                // TerrainDetailLayers binds $FromRE4..7 as shader stages 0..3.
+                // Its Cg parameters address FromRE[28..58]; slots 0..3 are
+                // occupied by the base terrain textures and are not these layers.
+                for (uint32_t stage = 0; stage < 4; ++stage)
+                {
+                    const float* projection = terrainTexgen + 28 + stage * 8;
+                    for (int axis = 0; axis < 4; ++axis)
+                    {
+                        terrainProjectionRows[0][stage][axis] = projection[axis];
+                        terrainProjectionRows[1][stage][axis] = projection[4 + axis];
+                    }
+                }
+            }
+            hasTerrainProjection = true;
+            if (stockTerrainLayers >= 0)
+                terrainProjectionRows[1][7][3] = 100.0f + stockTerrainLayers;
+            else if (terrainDetailSort && stockTerrainOnlyLayers > 0)
+                terrainProjectionRows[1][7][3] = 200.0f + stockTerrainOnlyLayers;
+            else if (stockTerrainAmbientMode > 0)
+                terrainProjectionRows[1][7][3] = 300.0f + stockTerrainAmbientMode;
+            else if (stockTerrainFogLayers > 0)
+                terrainProjectionRows[1][7][3] = 410.0f + stockTerrainFogLayers;
+            else if (stockTerrainShadowProgram)
+                terrainProjectionRows[1][7][3] = 400.0f;
+            if (stockTerrainAmbientMode == 4 || stockTerrainFogLayers > 0)
+            {
+                terrainProjectionRows[0][7][0] = hardwareTerrainFogColor[0];
+                terrainProjectionRows[0][7][1] = hardwareTerrainFogColor[1];
+                terrainProjectionRows[0][7][2] = hardwareTerrainFogColor[2];
+                terrainProjectionRows[0][7][3] = hardwareAmbientParameter[3];
+                CryVR::VulkanStockLinearTexgen fogEnterTexgen{};
+                CryVR::VulkanStockLinearTexgen fogTexgen{};
+                if (BuildStockFogTexgen(fogEnterTexgen, true) &&
+                    BuildStockFogTexgen(fogTexgen, false))
+                {
+                    // FogEnter occupies projected stage 4; Fog occupies
+                    // stage 5. Keep the independent maps/planes for the
+                    // TerrainWithFog, _1Layers_VF and _2Layers_VF programs.
+                    memcpy(terrainProjectionRows[0][4], fogEnterTexgen.planes[0],
+                           sizeof(float) * 4);
+                    memcpy(terrainProjectionRows[1][4], fogEnterTexgen.planes[1],
+                           sizeof(float) * 4);
+                    memcpy(terrainProjectionRows[0][5], fogTexgen.planes[0],
+                           sizeof(float) * 4);
+                    memcpy(terrainProjectionRows[1][5], fogTexgen.planes[1],
+                           sizeof(float) * 4);
+                }
+            }
+            if (terrainSectorVertices)
+            {
+                const auto* source = static_cast<const struct_VERTEX_FORMAT_P3F_N_COL4UB_COL4UB*>(
+                    vertices->m_VS[VSF_GENERAL].m_VData);
+                Vec3d objectCameraPosition(0.0f, 0.0f, 0.0f);
+                const float terrainDetailFadeDistance = terrainDetailSort ?
+                    crymax(0.001f, terrainTexgen[3]) : 1.0f;
+                if ((terrainDetailSort || stockTerrainLayers > 0) && m_RP.m_pCurObject)
+                {
+                    Vec3d cameraPosition = GetCamera().GetPos();
+                    objectCameraPosition = cameraPosition;
+                    if (m_RP.m_pCurObject->m_ObjFlags & FOB_TRANS_MASK)
+                        TransformPosition(objectCameraPosition, cameraPosition,
+                                          m_RP.m_pCurObject->GetInvMatrix());
+                }
+                terrainTexturedVertices.resize(finalVertexCount);
+                for (uint32_t vertex = conversionFirst; vertex < conversionEnd; ++vertex)
+                {
+                    struct_VERTEX_FORMAT_P3F_N_COL4UB_COL4UB_TEX2F& destination =
+                        terrainTexturedVertices[vertex];
+                    destination.xyz = source[vertex].xyz;
+                    destination.normal = source[vertex].normal;
+                    destination.color = source[vertex].color;
+                    if (stockTerrainLayers >= 0 && !terrainDetailSort)
+                    {
+                        // Shaders/HWScripts/Techniques/terrain.csl routes the
+                        // base terrain pass through CGVProgTerrain, whose
+                        // output is IN.Color.www. Preserve the terrain
+                        // lighting weight carried by the vertex alpha instead
+                        // of forwarding the unrelated RGB channels.
+                        destination.color.bcolor[0] = source[vertex].color.bcolor[3];
+                        destination.color.bcolor[1] = source[vertex].color.bcolor[3];
+                        destination.color.bcolor[2] = source[vertex].color.bcolor[3];
+                    }
+                    destination.seccolor = source[vertex].seccolor;
+                    if (stockTerrainLayers > 0 && !terrainDetailSort)
+                    {
+                        const Vec3d position(source[vertex].xyz.x, source[vertex].xyz.y,
+                                             source[vertex].xyz.z);
+                        float fade = crymin((objectCameraPosition - position).GetLength() /
+                            crymax(0.001f, terrainTexgen[3]), 1.0f);
+                        fade *= fade;
+                        fade *= fade;
+                        for (int channel = 0; channel < 3; ++channel)
+                            destination.seccolor.bcolor[channel] = static_cast<byte>(
+                                source[vertex].color.bcolor[channel] * fade);
+                    }
+                    if (terrainDetailSort)
+                    {
+                        const Vec3d vertexPosition(source[vertex].xyz.x,
+                            source[vertex].xyz.y, source[vertex].xyz.z);
+                        float fade = crymin((objectCameraPosition - vertexPosition).GetLength() /
+                                            terrainDetailFadeDistance, 1.0f);
+                        fade *= fade;
+                        fade *= fade;
+                        // CGVProgTerrain_4Layers_Only writes detail weights to
+                        // Color.b, Color.a, Color1.b and Color1.g respectively.
+                        destination.color.bcolor[2] = static_cast<uint8_t>(
+                            clamp_tpl(static_cast<float>(source[vertex].seccolor.bcolor[0]) * fade, 0.0f, 255.0f));
+                        destination.color.bcolor[3] = static_cast<uint8_t>(
+                            clamp_tpl(static_cast<float>(source[vertex].seccolor.bcolor[3]) * fade, 0.0f, 255.0f));
+                        destination.seccolor.bcolor[2] = static_cast<uint8_t>(
+                            clamp_tpl(static_cast<float>(source[vertex].seccolor.bcolor[1]) * fade, 0.0f, 255.0f));
+                        destination.seccolor.bcolor[1] = static_cast<uint8_t>(
+                            clamp_tpl(static_cast<float>(source[vertex].seccolor.bcolor[2]) * fade, 0.0f, 255.0f));
+                    }
+                    destination.st[0] = source[vertex].xyz.y * scale + offsetY;
+                    destination.st[1] = source[vertex].xyz.x * scale + offsetX;
+                }
+                finalVertexData = terrainTexturedVertices.data();
+                finalVertexFormat = VERTEX_FORMAT_P3F_N_COL4UB_COL4UB_TEX2F;
+            }
+            else if (terrainLowResVertices)
+            {
+                const auto* source = static_cast<const struct_VERTEX_FORMAT_P3F*>(finalVertexData);
+                terrainLowResTexturedVertices.resize(finalVertexCount);
                 for (uint32_t vertex = 0; vertex < finalVertexCount; ++vertex)
                 {
-                    hardwareTexturedVertices[vertex].xyz = positions[vertex];
-                    hardwareTexturedVertices[vertex].st[0] = leafBuffer->m_TempTexCoords[vertex].vert[0];
-                    hardwareTexturedVertices[vertex].st[1] = leafBuffer->m_TempTexCoords[vertex].vert[1];
+                    struct_VERTEX_FORMAT_P3F_COL4UB_TEX2F& destination =
+                        terrainLowResTexturedVertices[vertex];
+                    destination.xyz = source[vertex].xyz;
+                    destination.color.bcolor[0] = static_cast<uint8_t>(clamp_tpl(
+                        m_WorldColor.r * 255.0f, 0.0f, 255.0f));
+                    destination.color.bcolor[1] = static_cast<uint8_t>(clamp_tpl(
+                        m_WorldColor.g * 255.0f, 0.0f, 255.0f));
+                    destination.color.bcolor[2] = static_cast<uint8_t>(clamp_tpl(
+                        m_WorldColor.b * 255.0f, 0.0f, 255.0f));
+                    destination.color.bcolor[3] = 255;
+                    destination.st[0] =
+                        source[vertex].xyz.y * scale + offsetY;
+                    destination.st[1] =
+                        source[vertex].xyz.x * scale + offsetX;
                 }
-                finalVertexData = hardwareTexturedVertices.data();
-                finalVertexFormat = VERTEX_FORMAT_P3F_TEX2F;
+                finalVertexData = terrainLowResTexturedVertices.data();
+                finalVertexFormat = VERTEX_FORMAT_P3F_COL4UB_TEX2F;
+            }
+            else if (terrainFogColorVertices)
+            {
+                // The color channels are semantic inputs to TerrainWithFog
+                // (lighting in RGB/alpha and detail weight in R). Preserve
+                // them byte-for-byte while adding the base terrain UV.
+                const auto* source = static_cast<const struct_VERTEX_FORMAT_P3F_COL4UB*>(
+                    finalVertexData);
+                terrainLowResTexturedVertices.resize(finalVertexCount);
+                for (uint32_t vertex = 0; vertex < finalVertexCount; ++vertex)
+                {
+                    struct_VERTEX_FORMAT_P3F_COL4UB_TEX2F& destination =
+                        terrainLowResTexturedVertices[vertex];
+                    destination.xyz = source[vertex].xyz;
+                    destination.color = source[vertex].color;
+                    destination.st[0] = source[vertex].xyz.y * scale + offsetY;
+                    destination.st[1] = source[vertex].xyz.x * scale + offsetX;
+                }
+                finalVertexData = terrainLowResTexturedVertices.data();
+                finalVertexFormat = VERTEX_FORMAT_P3F_COL4UB_TEX2F;
+            }
+            else if (terrainFogLayeredVertices)
+            {
+                // The second vertex color holds the second detail mask used
+                // by CGRCTerrain_2Layers_VF; keep both color sets intact.
+                const auto* source = static_cast<const struct_VERTEX_FORMAT_P3F_COL4UB_COL4UB*>(
+                    finalVertexData);
+                terrainFogLayeredTexturedVertices.resize(finalVertexCount);
+                for (uint32_t vertex = 0; vertex < finalVertexCount; ++vertex)
+                {
+                    struct_VERTEX_FORMAT_P3F_COL4UB_COL4UB_TEX2F& destination =
+                        terrainFogLayeredTexturedVertices[vertex];
+                    destination.xyz = source[vertex].xyz;
+                    destination.color = source[vertex].color;
+                    destination.seccolor = source[vertex].seccolor;
+                    destination.st[0] = source[vertex].xyz.y * scale + offsetY;
+                    destination.st[1] = source[vertex].xyz.x * scale + offsetX;
+                }
+                finalVertexData = terrainFogLayeredTexturedVertices.data();
+                finalVertexFormat = VERTEX_FORMAT_P3F_COL4UB_COL4UB_TEX2F;
+            }
+            if (stockTerrainShadowProgram)
+            {
+                // CGVProgTerrainShadow's base map and shadow map use distinct
+                // generators. The base planes are already reconstructed from
+                // this RE's terrain texgen above; retain ObjPos/ObjColor for
+                // the original distance fade and ambient for the fragment.
+                SShaderPassHW* const pass = const_cast<SShaderPassHW*>(stockHardwarePass);
+                TArray<SCGParam4f>* lists[] = {
+                    &pass->m_VPParamsNoObj, &pass->m_VPParamsObj };
+                const char* names[] = { "ObjPos", "ObjColor" };
+                float* destinations[] = {
+                    terrainProjectionRows[0][2], terrainProjectionRows[0][3] };
+                for (auto* list : lists)
+                    for (int i = 0; i < list->Num(); ++i)
+                        for (int parameter = 0; parameter < 2; ++parameter)
+                            if (!stricmp(list->Get(i).m_Name.c_str(), names[parameter]))
+                                memcpy(destinations[parameter], list->Get(i).mfGet(),
+                                       sizeof(float) * 4);
             }
         }
         if (m_auditFrameActive && finalVertexData && finalVertexCount > 0)
@@ -3953,45 +7919,144 @@ public:
                 m_RP.m_CurClipPlane.m_Dist
             };
             CCObject* object = m_RP.m_pCurObject;
-            if (object && (object->m_ObjFlags & FOB_TRANS_MASK))
+            if (object && (m_RP.m_ObjFlags & FOB_TRANS_MASK))
             {
-                // A world-space plane transforms to object space by M^T,
-                // since worldPosition = objectMatrix * objectPosition.
-                for (int column = 0; column < 4; ++column)
-                    objectClipPlane[column] = worldPlane[0] * object->m_Matrix(0, column) +
-                        worldPlane[1] * object->m_Matrix(1, column) +
-                        worldPlane[2] * object->m_Matrix(2, column) +
-                        worldPlane[3] * object->m_Matrix(3, column);
+                // Legacy Matrix44 uses row vectors (TransformPointOLD),
+                // including translation in row 3. Substitute that world
+                // position into dot(worldPlane, worldPosition): each object
+                // coefficient is one legacy row dotted with the plane.
+                for (int row = 0; row < 4; ++row)
+                    objectClipPlane[row] = worldPlane[0] * object->m_Matrix(row, 0) +
+                        worldPlane[1] * object->m_Matrix(row, 1) +
+                        worldPlane[2] * object->m_Matrix(row, 2) +
+                        worldPlane[3] * object->m_Matrix(row, 3);
             }
             else
                 memcpy(objectClipPlane, worldPlane, sizeof(objectClipPlane));
             clipPlane = objectClipPlane;
         }
+        // Ambient/bump templates can resolve additional textures after the
+        // ordinary unit list, so commit final bias only after those bindings.
+        commitStockLodBias(0, textureLodBias[0]);
+        if (!directionalLightmapPass && normalMapTextureId)
+            commitStockLodBias(1, normalMapLodBias);
+        else
+            commitStockLodBias(1, textureLodBias[1]);
+        if (textureStage2Ptr) commitStockLodBias(2, textureStage2.lodBias);
+        if (textureStage3Ptr) commitStockLodBias(3, textureStage3.lodBias);
+        if (textureStages4To7Ptr)
+            for (int stage = 4; stage < 8; ++stage)
+                if (textureStages4To7[stage - 4].textureId > 0)
+                    commitStockLodBias(stage, textureStages4To7[stage - 4].lodBias);
+        const bool textureStage0UsesTexCoord1 = textureCoordinatePointers[0] ?
+            textureCoordinatePointers[0]->ePT == eSrcPointer_TexLM : lightmapStage == 0;
+        std::array<std::array<float, 16>, 8> fixedLights{};
+        uint32_t fixedLightCount = 0;
+        if (fixedFunctionMaterialLighting && hasTranslatedDynamicLightPass)
+        {
+            for (const auto& parameters : lightPasses)
+            {
+                if (fixedLightCount == fixedLights.size()) break;
+                auto& light = fixedLights[fixedLightCount++];
+                for (int channel = 0; channel < 4; ++channel) light[channel] = parameters[channel];
+                for (int channel = 0; channel < 3; ++channel)
+                {
+                    light[4 + channel] = parameters[4 + channel];
+                    light[8 + channel] = parameters[13 + channel];
+                }
+                light[11] = materialLighting[7];
+                light[12] = parameters[11]; light[13] = parameters[12];
+            }
+            // GL enables all accepted fixed lights for one material draw.
+            lightPasses.resize(1);
+            lightPasses[0][7] = materialLighting[7];
+        }
+        if (textureCoordinatePointers[1])
+            textureStage1UsesTexCoord1 =
+                textureCoordinatePointers[1]->ePT == eSrcPointer_TexLM;
         for (size_t lightPass = 0; lightPass < lightPasses.size(); ++lightPass)
         {
+            // The engine queues fog objects separately from their lit base
+            // objects, without lightmap IDs. Redrawing that base here replaces
+            // the baked lighting. Keep the geometry for the volume overlay
+            // after this loop, matching GL's bFog general-pass dispatch.
+            if (m_RP.m_ObjFlags & FOB_FOGPASS)
+                continue;
+            m_frameRenderer->ResetStockLinearTexgen();
+            for (int stage = 0; stage < 8; ++stage)
+            {
+                if (!linearTexgen[stage].enabled) continue;
+                if (stage < 2)
+                    memcpy(linearTexgen[stage].textureMatrix, textureMatrices[stage],
+                           sizeof(linearTexgen[stage].textureMatrix));
+                linearTexgen[stage].useTexCoord1 = stage == 0 ?
+                    textureStage0UsesTexCoord1 : (stage == 1 ? textureStage1UsesTexCoord1 :
+                    (stage == 2 ? textureStage2.useTexCoord1 : (stage == 3 ?
+                     textureStage3.useTexCoord1 : textureStages4To7[stage - 4].useTexCoord1)));
+                m_frameRenderer->SetStockLinearTexgen(stage, linearTexgen[stage]);
+            }
             const float* drawTextureMatrix0 = textureMatrix;
             const float* drawTextureMatrix1 = textureMatrices[1];
-            if (lightmapStage == 0)
-            {
-                if (textureIds[1] > 0)
-                {
-                    drawTextureMatrix0 = textureMatrices[1];
-                    drawTextureMatrix1 = textureMatrix;
-                }
-                else
-                    drawTextureMatrix1 = textureMatrix;
-            }
+            // Texture matrices belong to destination stages, independently
+            // of which coordinate array each stage selects in the fragment.
             uint32_t passState = renderState;
-            if (lightPass > 0)
+            // Each hardware Light/DiffuseLight/SpecularLight pass is submitted
+            // by its own DrawRenderItem call, so its translated direct-light
+            // contribution is lightPass 0 of a one-draw vector. OpenGL applies
+            // these passes over the already-rendered General/lightmap pass;
+            // preserve that result with additive RGB blending and do not
+            // replace its depth. The per-vector lightPass > 0 case still
+            // handles additional packed lights from MultiLights/fixed paths.
+            if ((hardwareMaterialLightPass && hasTranslatedDynamicLightPass &&
+                 (m_RP.m_RendPass > 1 || (m_RP.m_ObjFlags & FOB_LIGHTPASS))) || lightPass > 0)
             {
                 passState &= ~(GS_BLEND_MASK | GS_DEPTHWRITE);
                 passState |= GS_BLSRC_ONE | GS_BLDST_ONE | GS_COLMASKONLYRGB;
             }
             int projectorCookieTextureId = 0;
+            int secondaryTextureId = textureIds[1];
+            if (hardwareMultiLightsAmbient && !directionalLightmapPass &&
+                lightmapStage == 1 && lightPass > 0)
+                secondaryTextureId = 0;
+            if ((stockTerrainAmbientMode == 4 || stockTerrainFogLayers > 0) && m_TexMan)
+            {
+                InitializeStockFogTextures();
+                const int fogEnterTexture = m_TexMan->m_Text_Fog_Enter ?
+                    m_TexMan->m_Text_Fog_Enter->GetTextureID() : 0;
+                const int fogTexture = m_TexMan->m_Text_Fog ?
+                    m_TexMan->m_Text_Fog->GetTextureID() : 0;
+                const auto configureFogStage = [](CryVR::VulkanStockTextureStage& stage,
+                                                  int textureId)
+                {
+                    stage = {};
+                    stage.textureId = textureId;
+                    stage.colorOp = stage.alphaOp = eCO_REPLACE;
+                    stage.useTexCoord1 = false;
+                };
+                if (stockTerrainAmbientMode == 4)
+                {
+                    secondaryTextureId = textureIds[1] = fogEnterTexture;
+                    configureFogStage(textureStage2, fogTexture);
+                    textureStage2Ptr = fogTexture ? &textureStage2 : nullptr;
+                }
+                else if (stockTerrainFogLayers == 1)
+                {
+                    configureFogStage(textureStage2, fogEnterTexture);
+                    configureFogStage(textureStage3, fogTexture);
+                    textureStage2Ptr = fogEnterTexture ? &textureStage2 : nullptr;
+                    textureStage3Ptr = fogTexture ? &textureStage3 : nullptr;
+                }
+                else
+                {
+                    configureFogStage(textureStage3, fogTexture);
+                    textureStage3Ptr = fogTexture ? &textureStage3 : nullptr;
+                }
+            }
             float projectorBasis[9]{};
             float projectorFrustumScale = 1.0f;
             CDLight* const currentLight = m_RP.m_pCurLight;
-            if (currentLight && (currentLight->m_Flags & DLF_PROJECT) &&
+            if (!ambientOnlyLightPasses[lightPass] && m_activeHardwarePassType != eSHP_MAX && currentLight &&
+                (currentLight->m_Flags & DLF_PROJECT) &&
                 currentLight->m_pLightImage && m_RP.m_pCurObject)
             {
                 projectorCookieTextureId = currentLight->m_pLightImage->GetTextureID();
@@ -4030,14 +8095,38 @@ public:
             m_frameRenderer->SetStockFogRangeScale(fogRangeScale);
             if (m_auditFrameActive)
             {
-                CryLogAlways("Vulkan audit SUBMIT frame=%d list=%d item=%d lightPass=%d/%d indices=%u topology=%d vertexFormat=%d vertices=%u state=0x%x cull=%d textures=(%d,%d) normal=%d opacity=%.3f alphaRef=%.3f fogScale=%.3f lightmapStage=%d lmuv=%d generatedVertices=%d",
+                if (!lightmapTexCoords.empty())
+                {
+                    float minUv[2] = { lightmapTexCoords[0], lightmapTexCoords[1] };
+                    float maxUv[2] = { minUv[0], minUv[1] };
+                    uint32_t invalidUvCount = 0;
+                    for (size_t coordinate = 0; coordinate < lightmapTexCoords.size(); ++coordinate)
+                    {
+                        const float value = lightmapTexCoords[coordinate];
+                        if (!std::isfinite(value)) { ++invalidUvCount; continue; }
+                        const size_t axis = coordinate % 2;
+                        minUv[axis] = std::min(minUv[axis], value);
+                        maxUv[axis] = std::max(maxUv[axis], value);
+                    }
+                    CryLogAlways("Vulkan audit LM_UV frame=%d list=%d item=%d count=%u first=(%.6f,%.6f) min=(%.6f,%.6f) max=(%.6f,%.6f) invalid=%u stage2=%d stage3=%d shadowMask=0x%x",
+                        GetFrameID(), m_auditCurrentList, m_auditCurrentItem,
+                        static_cast<unsigned int>(lightmapTexCoords.size() / 2),
+                        lightmapTexCoords[0], lightmapTexCoords[1], minUv[0], minUv[1],
+                        maxUv[0], maxUv[1], invalidUvCount,
+                        textureStage2Ptr ? textureStage2Ptr->textureId : 0,
+                        textureStage3Ptr ? textureStage3Ptr->textureId : 0, shadowMapStageMask);
+                }
+                CryLogAlways("Vulkan audit SUBMIT frame=%d list=%d item=%d lightPass=%d/%d indices=%u topology=%d vertexFormat=%d vertices=%u state=0x%x cull=%d textures=(%d,%d) normal=%d opacity=%.3f alphaRef=%.3f fogScale=%.3f lightmapStage=%d lmuv=%d dot3lm=%d bump=%d lmDir=%d generatedVertices=%d",
                     GetFrameID(), m_auditCurrentList, m_auditCurrentItem,
                     static_cast<int>(lightPass + 1), static_cast<int>(lightPasses.size()),
                     drawIndexCount, topology, finalVertexFormat, finalVertexCount, passState,
-                    m_activePass ? m_activeCull : m_currentCullMode,
-                    textureIds[0], textureIds[1], normalMapTextureId, globalOpacity,
+                    ResolveStockCullMode(),
+                textureIds[0], secondaryTextureId, normalMapTextureId, globalOpacity,
                     alphaTestRef, fogRangeScale, lightmapStage,
                     lightmapTexCoords.empty() ? 0 : 1,
+                    directionalLightmapPass ? 1 : 0,
+                    directionalLightmapPass && textureIds[1] > 0 ? textureIds[1] : 0,
+                    directionalLightmapPass ? m_RP.m_pCurObject->m_nLMDirId : 0,
                     flareDeformActive ? 1 : (generatedVertexData.empty() ? 0 : 1));
                 CryLogAlways("Vulkan audit MODELVIEW frame=%d row0=(%.6f,%.6f,%.6f,%.6f) row1=(%.6f,%.6f,%.6f,%.6f) row2=(%.6f,%.6f,%.6f,%.6f) row3=(%.6f,%.6f,%.6f,%.6f)",
                     GetFrameID(), modelView[0], modelView[1], modelView[2], modelView[3],
@@ -4050,12 +8139,407 @@ public:
                     drawTextureMatrix0[8], drawTextureMatrix0[9], drawTextureMatrix0[10], drawTextureMatrix0[11],
                     drawTextureMatrix0[12], drawTextureMatrix0[13], drawTextureMatrix0[14], drawTextureMatrix0[15]);
             }
+            m_frameRenderer->SetStockShadowTransforms(
+                shadowMapTransforms, shadowMapStageMask);
+            // The original water programs generate UVs from object positions;
+            // they do not require a mesh UV stream and do not use generic lighting.
+            const bool translatedWaterEffect = stockWaterMode != 0;
+            // CGVProgSimple_Plant computes WorldObjColor/Opacity per vertex;
+            // CGRCPlants only samples albedo, encodes RGB and applies fog.
+            // Keep bump, sprite, texgen and additional-light variants on their
+            // own material paths rather than treating every leaf as this program.
+            const bool simplePlantsVertex = stockSimplePlantsProgram;
+            CryVR::VulkanVertexFormat plantsFormat{};
+            bool plantsHasColor = false, plantsHasUv = false;
+            if (simplePlantsVertex && CryVR::GetVulkanVertexFormat(finalVertexFormat, plantsFormat))
+                for (uint32_t attribute = 0; attribute < plantsFormat.attributeCount; ++attribute)
+                {
+                    plantsHasColor |= plantsFormat.attributes[attribute].location == 2;
+                    plantsHasUv |= plantsFormat.attributes[attribute].location == 3;
+                }
+            if (simplePlantsVertex && plantsHasColor && plantsHasUv &&
+                lightPass == 0)
+            {
+                // Cg declarations supply default parameters even when the
+                // technique does not repeat them as CGVPParam overrides.
+                // Use the original component evaluators for those defaults.
+                for (int channel = 0; channel < 3; ++channel)
+                {
+                    SParamComp_WorldColor world;
+                    world.m_Offs = channel | 0x80000000u;
+                    terrainProjectionRows[0][6][channel] = world.mfGet();
+                }
+                SParamComp_Opacity opacity;
+                terrainProjectionRows[0][6][3] = opacity.mfGet();
+                const bool bendedPlants = !stricmp(stockHardwarePass->m_StockVertexProgram,
+                                                  "CGVProgSimple_Plant_Bended");
+                if (bendedPlants && m_RP.m_pCurObject)
+                {
+                    SParamComp_ObjWave wave;
+                    wave.mfGet4f(terrainProjectionRows[1][6]);
+                }
+                else
+                {
+                    memset(terrainProjectionRows[1][6], 0, sizeof(float) * 4);
+                    terrainProjectionRows[1][6][3] = 1.0f;
+                }
+                const TArray<SCGParam4f>* lists[] = {
+                    &stockHardwarePass->m_VPParamsNoObj, &stockHardwarePass->m_VPParamsObj };
+                for (const auto* list : lists)
+                    if (list)
+                        for (int parameter = 0; parameter < list->Num(); ++parameter)
+                        {
+                            SCGParam4f& value = const_cast<SCGParam4f&>(list->Get(parameter));
+                            if (!stricmp(value.m_Name.c_str(), "Ambient"))
+                            {
+                                memcpy(terrainProjectionRows[0][6], value.mfGet(), sizeof(float) * 4);
+                            }
+                            else if (!stricmp(value.m_Name.c_str(), "Bend"))
+                                memcpy(terrainProjectionRows[1][6], value.mfGet(), sizeof(float) * 4);
+                        }
+                {
+                    hasTerrainProjection = true;
+                    terrainProjectionRows[0][7][3] = -13.0f;
+                    terrainProjectionRows[1][7][3] =
+                        !stricmp(stockHardwarePass->m_StockVertexProgram, "CGVProgSimple_Plant_Bended") ? 1.0f : 0.0f;
+                    // Ambient.w is the original evaluated Opacity, including
+                    // object fade. Do not apply the generic opacity again.
+                    globalOpacity = 1.0f;
+                    // CGRCPlants declares only texunit0. Other bound TMUs and
+                    // fixed-function texgen do not participate in this Cg draw.
+                    // They must neither block the program nor select a generic
+                    // multitexture/bump pipeline for it.
+                    secondaryTextureId = 0;
+                    normalMapTextureId = 0;
+                    textureStage2Ptr = textureStage3Ptr = nullptr;
+                    textureStages4To7Ptr = nullptr;
+                    m_frameRenderer->ResetStockLinearTexgen();
+                }
+            }
+            if (stockParticleAmbient)
+            {
+                hasTerrainProjection = true;
+                terrainProjectionRows[1][7][3] = -12.0f;
+                terrainProjectionRows[0][6][3] = 1.0f;
+                SShaderPassHW* particlePass = const_cast<SShaderPassHW*>(stockHardwarePass);
+                TArray<SCGParam4f>* parameters[] = {
+                    particlePass->m_CGFSParamsNoObj, particlePass->m_CGFSParamsObj };
+                for (auto* list : parameters)
+                    if (list)
+                        for (int parameter = 0; parameter < list->Num(); ++parameter)
+                            if (!stricmp(list->Get(parameter).m_Name.c_str(), "Ambient"))
+                                memcpy(terrainProjectionRows[0][6], list->Get(parameter).mfGet(), sizeof(float) * 4);
+                for (int channel = 0; channel < 4; ++channel)
+                    primaryColorMask[channel] = 0.0f;
+                normalMapTextureId = 0;
+                // Opacity is already evaluated by the Cg Ambient.w
+                // parameter (including the object's alpha). Do not fade the
+                // fragment a second time through fixed-function overrides.
+                globalOpacity = 1.0f;
+                additiveMaterial = false;
+            }
+            if (stockTerrainLayerBase)
+            {
+                hasTerrainProjection = true;
+                normalMapTextureId = 0;
+                memset(terrainProjectionRows, 0, sizeof(terrainProjectionRows));
+                auto layerParameter = [&](const char* name, float* destination)
+                {
+                    const TArray<SCGParam4f>* lists[] = {
+                        &stockHardwarePass->m_VPParamsNoObj,
+                        &stockHardwarePass->m_VPParamsObj,
+                        stockHardwarePass->m_CGFSParamsNoObj,
+                        stockHardwarePass->m_CGFSParamsObj };
+                    for (const auto* list : lists)
+                    {
+                        if (!list) continue;
+                        for (int i = 0; i < list->Num(); ++i)
+                            if (!stricmp(list->Get(i).m_Name.c_str(), name))
+                            {
+                                memcpy(destination, const_cast<SCGParam4f&>(list->Get(i)).mfGet(),
+                                    sizeof(float) * 4);
+                                return;
+                            }
+                    }
+                };
+                layerParameter("LayerTexGen0", terrainProjectionRows[0][0]);
+                layerParameter("LayerTexGen1", terrainProjectionRows[0][1]);
+                layerParameter("CameraPos", terrainProjectionRows[0][2]);
+                layerParameter("FadingDist", terrainProjectionRows[0][3]);
+                if (m_RP.m_pRE && m_RP.m_pRE->m_CustomData && m_RP.m_pCurObject)
+                {
+                    // TerrainLayerTemplate supplies three-component planes;
+                    // FromRE[3] is a fade distance, not a UV translation.
+                    const float* data = static_cast<const float*>(m_RP.m_pRE->m_CustomData);
+                    for (int axis = 0; axis < 3; ++axis)
+                    {
+                        terrainProjectionRows[0][0][axis] = data[axis];
+                        terrainProjectionRows[0][1][axis] = data[4 + axis];
+                    }
+                    terrainProjectionRows[0][0][3] = 0.0f;
+                    terrainProjectionRows[0][1][3] = 0.0f;
+                    terrainProjectionRows[0][3][0] = data[3];
+                    Vec3d camera = GetCamera().GetPos(), localCamera = camera;
+                    if (m_RP.m_pCurObject->m_ObjFlags & FOB_TRANS_MASK)
+                        TransformPosition(localCamera, camera, m_RP.m_pCurObject->GetInvMatrix());
+                    terrainProjectionRows[0][2][0] = localCamera.x;
+                    terrainProjectionRows[0][2][1] = localCamera.y;
+                    terrainProjectionRows[0][2][2] = localCamera.z;
+                }
+                layerParameter("LightPos", terrainProjectionRows[0][4]);
+                layerParameter("Diffuse", terrainProjectionRows[0][5]);
+                float layerBumpOffset[4]{};
+                layerParameter("BumpOffset", layerBumpOffset);
+                terrainProjectionRows[0][7][0] =
+                    static_cast<float>(stockHardwarePass->m_StockProgramMask & 0xffffu);
+                terrainProjectionRows[0][7][1] = layerBumpOffset[0];
+                terrainProjectionRows[0][7][3] = -11.0f;
+#if defined(__ANDROID__)
+                static unsigned int detailSamples = 0;
+                static int lastDetailFrame = -240;
+                if (detailSamples < 32u && GetFrameID() - lastDetailFrame >= 240 && finalVertexData)
+                {
+                    if (FILE* probe = fopen("/sdcard/FarCry/vulkan_terrain_detail_probe.txt",
+                        detailSamples == 0 ? "wb" : "ab"))
+                    {
+                        const float* position = static_cast<const float*>(finalVertexData);
+                        fprintf(probe, "frame=%d texture=%d format=%d vertices=%u camera=%.5f,%.5f,%.5f fade=%.5f vertex0=%.5f,%.5f,%.5f planeS=%.5f,%.5f,%.5f planeT=%.5f,%.5f,%.5f state=%x clip=%.5f,%.5f,%.5f,%.5f\n",
+                            GetFrameID(), textureIds[0], finalVertexFormat, finalVertexCount,
+                            terrainProjectionRows[0][2][0], terrainProjectionRows[0][2][1], terrainProjectionRows[0][2][2],
+                            terrainProjectionRows[0][3][0], position[0], position[1], position[2],
+                            terrainProjectionRows[0][0][0], terrainProjectionRows[0][0][1], terrainProjectionRows[0][0][2],
+                            terrainProjectionRows[0][1][0], terrainProjectionRows[0][1][1], terrainProjectionRows[0][1][2],
+                            passState, clipPlane ? clipPlane[0] : 0.0f,
+                            clipPlane ? clipPlane[1] : 0.0f,
+                            clipPlane ? clipPlane[2] : 0.0f,
+                            clipPlane ? clipPlane[3] : 1.0f);
+                        fclose(probe);
+                    }
+                    lastDetailFrame = GetFrameID();
+                    ++detailSamples;
+                }
+#endif
+            }
+            auto& waterColorVertices = scratchStorage.waterColorVertices;
+            struct RestoreWaterVertexData
+            {
+                const void*& target;
+                const void* original;
+                ~RestoreWaterVertexData() { target = original; }
+            } restoreWaterVertexData{ finalVertexData, finalVertexData };
+            if (translatedWaterEffect)
+            {
+                const SArrayPointer* waterColorPointer = nullptr;
+                const auto inspectWaterColorPointers = [&](const TArray<SArrayPointer*>& pointers)
+                {
+                    for (int pointerIndex = 0; pointerIndex < pointers.Num(); ++pointerIndex)
+                    {
+                        const SArrayPointer* pointer = pointers[pointerIndex];
+                        if (pointer && pointer->eDst == eDstPointer_Color)
+                            waterColorPointer = pointer;
+                    }
+                };
+                if (m_RP.m_pCurTechnique)
+                    inspectWaterColorPointers(m_RP.m_pCurTechnique->m_Pointers);
+                inspectWaterColorPointers(stockHardwarePass->m_Pointers);
+                const bool waterColorArrayDeclared = waterColorPointer != nullptr;
+                if (waterColorPointer)
+                {
+                    CryVR::VulkanVertexFormat colorFormat{};
+                    uint32_t sourceOffset = ~0u, destinationOffset = ~0u;
+                    const bool byteColor = waterColorPointer->Type == 0x1401;
+                    const bool validComponents = waterColorPointer->NumComponents == 3 ||
+                        waterColorPointer->NumComponents == 4;
+                    if (CryVR::GetVulkanVertexFormat(finalVertexFormat, colorFormat))
+                        for (uint32_t attribute = 0; attribute < colorFormat.attributeCount; ++attribute)
+                        {
+                            const auto& value = colorFormat.attributes[attribute];
+                            if (value.location == 2) destinationOffset = value.offset;
+                            if ((waterColorPointer->ePT == eSrcPointer_Color && value.location == 2) ||
+                                (waterColorPointer->ePT == eSrcPointer_SecColor && value.location == 4) ||
+                                (waterColorPointer->ePT == eSrcPointer_Vert && value.location == 0) ||
+                                (waterColorPointer->ePT == eSrcPointer_Normal && value.location == 1) ||
+                                (waterColorPointer->ePT == eSrcPointer_Tex && value.location == 3))
+                                sourceOffset = value.offset;
+                        }
+                    const byte* colorSource = static_cast<const byte*>(finalVertexData);
+                    uint32_t colorSourceStride = colorFormat.stride;
+                    const bool tangentColorSource = waterColorPointer->ePT == eSrcPointer_Tangent ||
+                        waterColorPointer->ePT == eSrcPointer_Binormal ||
+                        waterColorPointer->ePT == eSrcPointer_TNormal;
+                    if (tangentColorSource)
+                    {
+                        colorSource = reinterpret_cast<const byte*>(sourceTangentBasis);
+                        colorSourceStride = sizeof(SPipTangents);
+                        sourceOffset = waterColorPointer->ePT == eSrcPointer_Tangent ? 0u :
+                            (waterColorPointer->ePT == eSrcPointer_Binormal ? 12u : 24u);
+                    }
+                    if (byteColor && validComponents && sourceOffset != ~0u && destinationOffset != ~0u &&
+                        colorSource && (!tangentColorSource || finalVertexCount <= static_cast<uint32_t>(vertices->m_NumVerts)) &&
+                        sourceOffset + waterColorPointer->NumComponents <= colorSourceStride &&
+                        destinationOffset + 4u <= colorFormat.stride)
+                    {
+                        if (tangentColorSource || sourceOffset != destinationOffset || waterColorPointer->NumComponents == 3)
+                        {
+                            const size_t size = static_cast<size_t>(finalVertexCount) * colorFormat.stride;
+                            waterColorVertices.resize(size);
+                            memcpy(waterColorVertices.data(), finalVertexData, size);
+                            for (uint32_t vertex = 0; vertex < finalVertexCount; ++vertex)
+                            {
+                                const byte* source = colorSource +
+                                    static_cast<size_t>(vertex) * colorSourceStride + sourceOffset;
+                                byte* destination = waterColorVertices.data() +
+                                    static_cast<size_t>(vertex) * colorFormat.stride + destinationOffset;
+                                memcpy(destination, source, waterColorPointer->NumComponents);
+                                if (waterColorPointer->NumComponents == 3) destination[3] = 255;
+                            }
+                            finalVertexData = waterColorVertices.data();
+                        }
+                    }
+                    else
+                        m_frameRenderer->RequirePanelFallback();
+                }
+                // This mask selects the shader's input array, not glColor or
+                // the independently committed texture-environment constant.
+                for (int channel = 0; channel < 4; ++channel)
+                {
+                    primaryColor[channel] = 1.0f;
+                    primaryColorMask[channel] = waterColorArrayDeclared ? 0.0f : 1.0f;
+                }
+                normalMapTextureId = 0;
+                hasTerrainProjection = true;
+                memset(terrainProjectionRows, 0, sizeof(terrainProjectionRows));
+                bool waterMatrixRectangle = false;
+                auto waterParameter = [&](const char* name, float* target)
+                {
+                    SShaderPassHW* pass = const_cast<SShaderPassHW*>(stockHardwarePass);
+                    TArray<SCGParam4f>* lists[] = { &pass->m_VPParamsNoObj, &pass->m_VPParamsObj,
+                        pass->m_CGFSParamsNoObj, pass->m_CGFSParamsObj };
+                    for (auto* list : lists)
+                    {
+                        if (!list) continue;
+                        for (int i = 0; i < list->Num(); ++i)
+                            if (!stricmp(list->Get(i).m_Name.c_str(), name))
+                            {
+                                memcpy(target, list->Get(i).mfGet(), sizeof(float) * 4);
+                                if (!stricmp(name, "Matrix"))
+                                    waterMatrixRectangle = (list->Get(i).m_dwBind & 0x80000) != 0;
+                                return true;
+                            }
+                    }
+                    return false;
+                };
+                const char* names[] = { "TexGenRipple0", "TexGenRipple1", "TexShiftRipple",
+                    "TexDetailScale", "Matrix", "Ambient", "WaterColor", "CameraPos" };
+                for (int i = 0; i < 8; ++i)
+                    waterParameter(names[i], terrainProjectionRows[0][i]);
+                terrainProjectionRows[0][7][3] = static_cast<float>(stockWaterMode);
+                if (waterMatrixRectangle)
+                {
+                    // GLCGPShader::mfParameter4f multiplies CGPSParmRect by
+                    // r_embm * screen dimensions. Convert those pixel offsets
+                    // to normalized coordinates for the Vulkan screen sampler.
+                    float width = static_cast<float>(crymax(1, GetWidth()));
+                    float height = static_cast<float>(crymax(1, GetHeight()));
+                    float* matrix = terrainProjectionRows[0][4];
+                    matrix[0] *= CRenderer::CV_r_embm;
+                    matrix[1] *= CRenderer::CV_r_embm * width / height;
+                    matrix[2] *= CRenderer::CV_r_embm * height / width;
+                    matrix[3] *= CRenderer::CV_r_embm;
+                }
+                if (stockWaterMode == 4)
+                    terrainProjectionRows[0][6][0] = terrainProjectionRows[0][6][1] =
+                        terrainProjectionRows[0][6][2] = 1.0f;
+                if (stockWaterMode == 8 || stockWaterMode == 9 || stockWaterMode == 10)
+                    waterParameter("TexShift", terrainProjectionRows[1][0]);
+                if (stockWaterMode == 10)
+                {
+                    waterParameter("TexScale", terrainProjectionRows[1][1]);
+                    terrainProjectionRows[0][5][0] = terrainProjectionRows[0][5][1] =
+                        terrainProjectionRows[0][5][2] = terrainProjectionRows[0][5][3] = 1.0f;
+                }
+                if (stockWaterMode == 7)
+                {
+                    waterParameter("ReflectAmount", terrainProjectionRows[1][6]);
+                    // Preserve the stock material/base-water pass until the
+                    // separate mirrored-camera reflection pass is available.
+                    terrainProjectionRows[1][6][0] = terrainProjectionRows[1][6][1] =
+                        terrainProjectionRows[1][6][2] = 0.0f;
+                    // CGRCWater has four samplers even though the mesh has no
+                    // stored UV stream. Its Fresnel and base samplers are not
+                    // optional fixed-function texture-combine stages.
+                    static ITexPic* fresnel = EF_LoadTexture("Defaults/fresnel14",
+                        FT_NOSTREAM | FT_CLAMP, 0, eTT_Base);
+                    static ITexPic* baseWater = EF_LoadTexture("water_lm",
+                        FT_NOSTREAM, 0, eTT_Base);
+                    if (fresnel)
+                    {
+                        textureStage2.textureId = fresnel->GetTextureID();
+                        textureStage2.colorOp = textureStage2.alphaOp = eCO_REPLACE;
+                        textureStage2.useTexCoord1 = false;
+                        textureStage2Ptr = &textureStage2;
+                    }
+                    if (baseWater)
+                    {
+                        textureStage3.textureId = baseWater->GetTextureID();
+                        textureStage3.colorOp = textureStage3.alphaOp = eCO_REPLACE;
+                        textureStage3.useTexCoord1 = false;
+                        textureStage3Ptr = &textureStage3;
+                    }
+                }
+                if (stockWaterMode == 6)
+                {
+                    waterParameter("RippleTexGen0", terrainProjectionRows[0][0]);
+                    waterParameter("RippleTexGen1", terrainProjectionRows[0][1]);
+                    waterParameter("WaterColor0", terrainProjectionRows[0][6]);
+                    waterParameter("WaterColor1", terrainProjectionRows[1][5]);
+                    waterParameter("ColorMinFresnel", terrainProjectionRows[1][0]);
+                    waterParameter("ColorMaxFresnel", terrainProjectionRows[1][1]);
+                    waterParameter("Constants", terrainProjectionRows[1][2]);
+                }
+                if (stockWaterMode == 6 || stockWaterMode == 7)
+                {
+                    // Retain the stock non-reflection fallback. Mode 6 uses
+                    // the mirrored WaterMap descriptor when reflections are
+                    // enabled; mode 7 uses this texture as its base-water map.
+                    static ITexPic* environment = EF_LoadTexture("water_lm", FT_NOSTREAM, 0, eTT_Base);
+                    if (environment)
+                    {
+                        STexPic* pic = static_cast<STexPic*>(environment);
+                        if (!m_frameRenderer->HasLegacyTexture(pic->m_Bind))
+                            EF_LoadTexture(pic->m_SearchName.c_str(), pic->m_Flags,
+                                pic->m_Flags2 | FT2_RELOAD, pic->m_eTT,
+                                pic->m_fAmount1, pic->m_fAmount2, pic->m_Id, pic->m_Bind);
+                        secondaryTextureId = textureIds[1] = pic->m_Bind;
+                    }
+                }
+            }
+            if (fixedFunctionMaterialLighting && hasTranslatedDynamicLightPass)
+            {
+                // GL_COLOR_MATERIAL is disabled: pass-generated glColor
+                // cannot replace the primary produced by vertex lighting.
+                // Texture-environment constants remain independently active.
+                for (int channel = 0; channel < 4; ++channel)
+                    primaryColorMask[channel] = 0.0f;
+            }
+            Matrix44 fixedNormalMatrix;
+            fixedNormalMatrix.SetIdentity();
+            if (fixedLightCount)
+            {
+                mathMatrixInverse(fixedNormalMatrix.GetData(), modelView, g_CpuFlags);
+                fixedNormalMatrix.Transpose();
+            }
+            m_frameRenderer->SetStockFixedLights(fixedLights, fixedLightCount,
+                modelView, fixedNormalMatrix.GetData());
+            m_frameRenderer->SetStockProfilePlants(stockPlantsProgram);
+            m_frameRenderer->SetStockDecalDraw(m_RP.m_pShader &&
+                m_RP.m_pShader->m_eSort == eS_Decal);
             const bool queued = m_frameRenderer->QueueStockClientIndexedDraw(
                 finalVertexData,
                 finalVertexCount, indexData,
                 drawIndexCount, finalVertexFormat, topology,
-                passState, m_activePass ? m_activeCull : m_currentCullMode,
-                textureIds[0], textureIds[1],
+                passState, ResolveStockCullMode(),
+                textureIds[0], secondaryTextureId,
                 colorOps[0], alphaOps[0], colorOps[1], alphaOps[1],
                 colorArgs[0], alphaArgs[0], textureEnvironmentColor,
                 colorArgs[1], alphaArgs[1], textureEnvironmentColor,
@@ -4064,8 +8548,11 @@ public:
                 lightPass > 0, globalOpacity, alphaTestRef,
                 reinterpret_cast<const CryVR::VulkanBuffer*>(
                     vertices->m_VS[VSF_TANGENTS].m_VulkanBufferHandle),
-                normalMapTextureId, primaryColor, primaryColorMask, colorWriteMaskOverride,
-                textureLodBias[0], normalMapTextureId ? normalMapLodBias : textureLodBias[1],
+                directionalLightmapPass ? 0 : normalMapTextureId,
+                primaryColor, primaryColorMask, colorWriteMaskOverride,
+                textureLodBias[0],
+                !directionalLightmapPass && normalMapTextureId ?
+                    normalMapLodBias : textureLodBias[1],
                 textureStage2Ptr, textureStage3Ptr, m_activePolygonOffset,
                 m_activePolygonOffsetFactor, m_activePolygonOffsetUnits, clipPlane,
                 TextureWrapModeForId(textureIds[0]),
@@ -4074,10 +8561,387 @@ public:
                 TextureWrapModeForId(textureStage3Ptr ? textureStage3Ptr->textureId : 0),
                 textureStages4To7Ptr,
                 lightmapTexCoords.empty() ? nullptr : lightmapTexCoords.data(),
-                textureStage1UsesTexCoord1, lightmapStage == 0,
-                m_activePass && m_activePass->m_eEvalRGB == eERGB_OneMinusFromClient,
+                textureStage1UsesTexCoord1, textureStage0UsesTexCoord1,
+                (m_activePass && m_activePass->m_eEvalRGB == eERGB_OneMinusFromClient) ||
+                    terrainDetailSort,
                 m_RP.m_pCurObject &&
-                    (m_RP.m_pCurObject->m_ObjFlags & FOB_NEAREST) != 0);
+                    (m_RP.m_pCurObject->m_ObjFlags & FOB_NEAREST) != 0,
+                translatedWaterEffect,
+                // The baked-lightmap fragment branch adds Ambient itself.
+                // Applying evaluateStockLighting to its primary color first
+                // would multiply that term by ambient a second time.
+                kVulkanDynamicLightingEnabled && !shaderLightingDisabled && !translatedWaterEffect &&
+                    !stockParticleAmbient &&
+                    !stockTerrainLayerBase &&
+                    // CGRCTerrain programs own their ambient term in the
+                    // fragment program (CGPSParam Ambient). Feeding them
+                    // through generic per-pixel lighting multiplies the
+                    // terrain vertex weights a second time and adds a
+                    // diffuse term absent from the OpenGL terrain shaders.
+                    stockTerrainLayers < 0 && stockTerrainOnlyLayers == 0 &&
+                    stockTerrainAmbientMode == 0 && stockTerrainFogLayers < 0 &&
+                    !(activeHardwareLightmapBasePass && lightPass == 0) &&
+                    (hardwareLightPass || hardwareAmbientPass ||
+                     (!hardwareAmbientPass && hasTranslatedDynamicLightPass) ||
+                     (fixedFunctionAmbientOnlyPass && !fixedFunctionMaterialLighting)) ?
+                    (m_activeHardwarePassType == eSHP_MAX && m_RP.m_pShader &&
+                     (m_RP.m_pShader->m_Flags & EF_NEEDNORMALS) ? 2.0f : 1.0f) : 0.0f,
+                directionalLightmapPass && textureStage2Ptr && textureStage3Ptr,
+                activeHardwareLightmapBasePass && lightPass == 0 &&
+                    (directionalLightmapPass ||
+                     (lightmapStage == 1 && textureIds[1] > 0)),
+                hasTerrainProjection ? &terrainProjectionRows[0][0][0] : nullptr,
+                lightPassSpecularOcclusion[lightPass][0],
+                lightPassSpecularOcclusion[lightPass][1],
+                // CommonSubroutines::HDREncodeLM uses x4 in the ordinary
+                // LDR pass, even when r_HDRFake defines _HDR_FAKE. Its HDR
+                // branch requires BOTH _HDR and _HDR_FAKE and uses x16,
+                // followed by HDR processing. This Vulkan pass is LDR.
+                4.0f,
+                hasWaterReflectionTransform ? waterReflectionModelView : nullptr,
+                hasWaterReflectionTransform ? waterReflectionClipPlane : nullptr,
+                waterReflectionUpdatePtr);
+            // Auxiliary and subsequent material draws must not inherit this array.
+            m_frameRenderer->SetStockProfilePlants(false);
+            m_frameRenderer->SetStockDecalDraw(false);
+            m_frameRenderer->SetStockFixedLights({}, 0);
+#if defined(__ANDROID__)
+            // Bounded material census for the reported outdoor/character/
+            // sprite failures. Capture unique inputs, not every frame.
+            if (queued && !m_collectingShadowCasters)
+            {
+                // World and decal submissions can be queued without a current
+                // object. Keep them in the material census so GPU draw IDs can
+                // be resolved to their actual texture pair.
+                const int elementType = m_RP.m_pRE ? m_RP.m_pRE->mfGetType() : -1;
+                const bool relevant = (passState & (GS_BLEND_MASK | GS_ALPHATEST_MASK)) ||
+                    terrainShaderSort || (m_RP.m_pCurObject && m_RP.m_pCurObject->m_pCharInstance) ||
+                    (m_RP.m_pCurObject && (m_RP.m_ObjFlags & FOB_NEAREST)) ||
+                    elementType == eDATA_ParticleSpray ||
+                    elementType == eDATA_PolyBlend || elementType == eDATA_AnimPolyBlend ||
+                    elementType == eDATA_ClientPoly;
+                static std::vector<std::array<uint64, 4>> captured;
+                const std::array<uint64, 4> key = {{
+                    reinterpret_cast<uint64>(m_RP.m_pShader),
+                    static_cast<uint64>(static_cast<uint32>(textureIds[0])) |
+                        (static_cast<uint64>(static_cast<uint32>(secondaryTextureId)) << 32),
+                    static_cast<uint64>(finalVertexFormat) | (static_cast<uint64>(elementType) << 32),
+                    static_cast<uint64>(passState) | (static_cast<uint64>(m_activeHardwarePassType) << 32) }};
+                if (relevant && captured.size() < 512 &&
+                    std::find(captured.begin(), captured.end(), key) == captured.end())
+                {
+                    if (FILE* file = fopen("/sdcard/FarCry/vulkan_material_trace.txt", captured.empty() ? "wb" : "ab"))
+                    {
+                        STexPic* image = m_TexMan ? m_TexMan->GetByID(textureIds[0]) : nullptr;
+                        STexPic* image1 = m_TexMan && secondaryTextureId > 0 ?
+                            m_TexMan->GetByID(secondaryTextureId) : nullptr;
+                        SEfResTexture* diffuse = m_activeResources ? m_activeResources->m_Textures[EFTT_DIFFUSE] : nullptr;
+                        fprintf(file, "frame=%d shader=%s program=%s mask=%llx re=%d char=%d flags=%x vf=%d uvSource=%d tex=%d image=%s tex1=%d image1=%s gpu=%d diffuse=%s objTex=%d custom=%d state=%x terrain=%d vp=%s fastPlants=%d\n",
+                            GetFrameID(), m_RP.m_pShader ? m_RP.m_pShader->GetName() : "<none>",
+                            stockHardwarePass ? stockHardwarePass->m_StockFragmentProgram : "fixed",
+                            static_cast<unsigned long long>(stockHardwarePass ? stockHardwarePass->m_StockProgramMask : 0),
+                            elementType, m_RP.m_pCurObject && m_RP.m_pCurObject->m_pCharInstance != nullptr,
+                            m_RP.m_pCurObject ? m_RP.m_ObjFlags : 0,
+                            finalVertexFormat, hardwareTempTexCoordCount, textureIds[0],
+                            image ? image->m_SearchName.c_str() : "<none>", secondaryTextureId,
+                            image1 ? image1->m_SearchName.c_str() : "<none>",
+                            m_frameRenderer->HasLegacyTexture(textureIds[0]),
+                            diffuse ? diffuse->m_Name.c_str() : "<none>",
+                            m_RP.m_pCurObject ? m_RP.m_pCurObject->m_NumCM : -1,
+                            m_RP.m_pRE ? m_RP.m_pRE->m_CustomTexBind[0] : -1, passState,
+                            stockTerrainLayerBase,
+                            stockHardwarePass ? stockHardwarePass->m_StockVertexProgram : "fixed",
+                            hasTerrainProjection && terrainProjectionRows[0][7][3] == -13.0f);
+                        fclose(file);
+                        captured.push_back(key);
+                    }
+                }
+            }
+#endif
+#if defined(__ANDROID__)
+            if (m_sceneTrace && !m_collectingShadowCasters && m_sceneTraceLines++ < 256)
+                fprintf(m_sceneTrace, "DRAW shader=%s program=%s type=%d flags=%x state=%x queued=%d baked=%d dot3=%d tex=%d,%d,%d,%d ambient=%.4f,%.4f,%.4f opacity=%.4f\n",
+                    m_RP.m_pShader ? m_RP.m_pShader->GetName() : "<none>",
+                    stockHardwarePass ? stockHardwarePass->m_StockFragmentProgram : "fixed",
+                    m_activeHardwarePassType, m_RP.m_ObjFlags, passState, queued,
+                    activeHardwareLightmapBasePass, directionalLightmapPass,
+                    textureIds[0], secondaryTextureId, textureStage2.textureId, textureStage3.textureId,
+                    lightPasses[lightPass][8], lightPasses[lightPass][9], lightPasses[lightPass][10], globalOpacity);
+#endif
+#if defined(__ANDROID__) && defined(CRYVR_RENDER_PROBES)
+            if (translatedWaterEffect && queued)
+            {
+                static unsigned waterQueueProbeCounts[9] = {};
+                static bool waterQueueProbeStarted = false;
+                if (stockWaterMode > 0 && stockWaterMode < 9 &&
+                    waterQueueProbeCounts[stockWaterMode] < 8 && GetFrameID() % 120 == 0)
+                {
+                    FILE* probe = fopen("/sdcard/FarCry/vulkan_water_queue_probe.txt",
+                        waterQueueProbeStarted ? "ab" : "wb");
+                    if (probe)
+                    {
+                        const float noClipPlane[4] = {};
+                        const float* waterProbeClipPlane = clipPlane ? clipPlane : noClipPlane;
+                        Vec3d firstPosition(0, 0, 0), lastPosition(0, 0, 0);
+                        if (finalVertexData && finalVertexCount)
+                        {
+                            memcpy(&firstPosition, finalVertexData, sizeof(firstPosition));
+                            CryVR::VulkanVertexFormat format{};
+                            if (CryVR::GetVulkanVertexFormat(static_cast<uint32_t>(finalVertexFormat), format))
+                            {
+                                memcpy(&lastPosition,
+                                    static_cast<const byte*>(finalVertexData) +
+                                        (finalVertexCount - 1) * format.stride,
+                                    sizeof(lastPosition));
+                            }
+                        }
+                        fprintf(probe,
+                            "shader=%s mode=%d queued=%d vertices=%u indices=%u vf=%d tex=%d,%d clip=%.5f,%.5f,%.5f,%.5f shift=%.5f,%.5f,%.5f,%.5f detail=%.5f,%.5f,%.5f,%.5f matrix=%.6f,%.6f,%.6f,%.6f ambient=%.4f,%.4f,%.4f,%.4f water=%.4f,%.4f,%.4f,%.4f camera=%.3f,%.3f,%.3f first=%.3f,%.3f,%.3f last=%.3f,%.3f,%.3f\n",
+                            m_RP.m_pShader ? m_RP.m_pShader->GetName() : "<none>",
+                            stockWaterMode, queued ? 1 : 0, finalVertexCount,
+                            drawIndexCount, finalVertexFormat, textureIds[0],
+                            secondaryTextureId, waterProbeClipPlane[0], waterProbeClipPlane[1],
+                            waterProbeClipPlane[2], waterProbeClipPlane[3],
+                            terrainProjectionRows[0][2][0], terrainProjectionRows[0][2][1],
+                            terrainProjectionRows[0][2][2], terrainProjectionRows[0][2][3],
+                            terrainProjectionRows[0][3][0], terrainProjectionRows[0][3][1],
+                            terrainProjectionRows[0][3][2], terrainProjectionRows[0][3][3],
+                            terrainProjectionRows[0][4][0], terrainProjectionRows[0][4][1],
+                            terrainProjectionRows[0][4][2], terrainProjectionRows[0][4][3],
+                            terrainProjectionRows[0][5][0], terrainProjectionRows[0][5][1],
+                            terrainProjectionRows[0][5][2], terrainProjectionRows[0][5][3],
+                            terrainProjectionRows[0][6][0], terrainProjectionRows[0][6][1],
+                            terrainProjectionRows[0][6][2], terrainProjectionRows[0][6][3],
+                            terrainProjectionRows[0][7][0], terrainProjectionRows[0][7][1],
+                            terrainProjectionRows[0][7][2],
+                            firstPosition.x, firstPosition.y, firstPosition.z,
+                            lastPosition.x, lastPosition.y, lastPosition.z);
+                        fclose(probe);
+                        waterQueueProbeStarted = true;
+                    }
+                    ++waterQueueProbeCounts[stockWaterMode];
+                }
+            }
+#endif
+            CaptureStockLeafStatus(m_RP.m_pRE, m_RP.m_pShader,
+                                   queued ? "draw-queued" : "queue-rejected", passState);
+#if defined(__ANDROID__) && defined(CRYVR_RENDER_PROBES)
+            // Inventory the actual material/program variants of the scene,
+            // rather than limiting the audit to named problem assets. Once
+            // per variant, with a hard bound and no per-frame engine logging.
+            static std::vector<std::array<uint64, 4>> materialProgramProbeKeys;
+            const std::array<uint64, 4> programKey = {
+                m_RP.m_pShader ? static_cast<uint64>(m_RP.m_pShader->m_Id) : 0,
+                stockHardwarePass ? stockHardwarePass->m_StockProgramMask : 0,
+                static_cast<uint64>(passState) |
+                    (static_cast<uint64>(m_activeHardwarePassType) << 32),
+                static_cast<uint64>(activeHardwareLightmapBasePass) |
+                    (static_cast<uint64>(directionalLightmapPass) << 1) |
+                    (static_cast<uint64>(queued) << 2) };
+            if (materialProgramProbeKeys.size() < 256 &&
+                std::find(materialProgramProbeKeys.begin(), materialProgramProbeKeys.end(),
+                          programKey) == materialProgramProbeKeys.end())
+            {
+                FILE* probe = fopen("/sdcard/FarCry/vulkan_material_program_probe.txt",
+                    materialProgramProbeKeys.empty() ? "wb" : "ab");
+                if (probe)
+                {
+                    fprintf(probe, "shader=%s vp=%s fp=%s mask=%llx state=%x hw=%d queued=%d vf=%d textures=%d,%d,%d,%d baked=%d directional=%d ambient=%.5f,%.5f,%.5f opacity=%.5f\n",
+                        m_RP.m_pShader ? m_RP.m_pShader->GetName() : "<none>",
+                        stockHardwarePass ? stockHardwarePass->m_StockVertexProgram : "<fixed>",
+                        stockHardwarePass ? stockHardwarePass->m_StockFragmentProgram : "<fixed>",
+                        static_cast<unsigned long long>(programKey[1]), passState,
+                        m_activeHardwarePassType, queued, finalVertexFormat, textureIds[0],
+                        secondaryTextureId, textureStage2.textureId, textureStage3.textureId,
+                        activeHardwareLightmapBasePass, directionalLightmapPass,
+                        lightPasses[lightPass][8], lightPasses[lightPass][9],
+                        lightPasses[lightPass][10], globalOpacity);
+                    fclose(probe);
+                }
+                materialProgramProbeKeys.push_back(programKey);
+            }
+            // Capture only the reported rays/bone materials, once per state.
+            // No per-frame logging or full texture dumps during level loading.
+            static std::vector<std::array<uint32_t, 4>> rayBoneProbeKeys;
+            STexPic* rayBoneImage = m_TexMan ? m_TexMan->GetByID(textureIds[0]) : nullptr;
+            if (queued && m_RP.m_pShader && rayBoneProbeKeys.size() < 32 &&
+                (muzzleFlashShader || (rayBoneImage &&
+                 (strstr(rayBoneImage->m_SourceName.c_str(), "skeleton") ||
+                  strstr(rayBoneImage->m_SourceName.c_str(), "Skeleton")))))
+            {
+                const std::array<uint32_t, 4> key = {
+                    static_cast<uint32_t>(m_RP.m_pShader->m_Id),
+                    static_cast<uint32_t>(textureIds[0]), passState,
+                    static_cast<uint32_t>(m_activeHardwarePassType) };
+                if (std::find(rayBoneProbeKeys.begin(), rayBoneProbeKeys.end(), key) == rayBoneProbeKeys.end())
+                {
+                    FILE* probe = fopen("/sdcard/FarCry/vulkan_ray_bone_probe.txt",
+                        rayBoneProbeKeys.empty() ? "wb" : "ab");
+                    if (probe)
+                    {
+                        fprintf(probe, "shader=%s texture=%s state=%x hw=%d shaderLM=%x passLM=%x vf=%d ops=%d,%d args=%u,%u baked=%d directional=%d lmStage=%d stage1=%d normal=%d generatedRay=%u lighting=%d ambient=%.5f,%.5f,%.5f gpuTexture=%d primaryMask=%.0f,%.0f,%.0f residentBytes=%llu uploadError=%s\n",
+                            m_RP.m_pShader->GetName(), rayBoneImage ? rayBoneImage->m_SourceName.c_str() : "<missing>",
+                            passState, m_activeHardwarePassType, m_RP.m_pShader->m_LMFlags,
+                            activeHardwareLightFlags, finalVertexFormat, colorOps[0], alphaOps[0],
+                            colorArgs[0], alphaArgs[0], activeHardwareLightmapBasePass,
+                            directionalLightmapPass, lightmapStage, secondaryTextureId,
+                            normalMapTextureId, static_cast<unsigned>(muzzleFlashVertices.size()),
+                            hardwareAmbientPass || hardwareLightPass,
+                            lightPasses[lightPass][8], lightPasses[lightPass][9], lightPasses[lightPass][10],
+                            m_frameRenderer->HasLegacyTexture(textureIds[0]),
+                            primaryColorMask[0], primaryColorMask[1], primaryColorMask[2],
+                            static_cast<unsigned long long>(m_frameRenderer->GetLegacyTextureBytes()),
+                            m_frameRenderer->GetLastError());
+                        fclose(probe);
+                        rayBoneProbeKeys.push_back(key);
+                    }
+                }
+            }
+            // Sample lighting across camera cuts without a per-frame audit.
+            // Two categories retain both baked meshes and unbaked models.
+            static int lightingProbeFrame = -1;
+            static uint32_t lightingProbeRecords = 0;
+            static std::vector<std::array<uint32_t, 3>> lightingProbeKeys[2];
+            if (queued && lightPass == 0 && m_RP.m_pShader &&
+                m_RP.m_pCurObject && m_RP.m_pRE && lightingProbeRecords < 256 &&
+                (activeHardwareLightmapBasePass ||
+                 (m_RP.m_pShader->m_Flags & EF_USELIGHTS)))
+            {
+                if (lightingProbeFrame < 0 || GetFrameID() - lightingProbeFrame >= 600)
+                {
+                    lightingProbeFrame = GetFrameID();
+                    lightingProbeKeys[0].clear();
+                    lightingProbeKeys[1].clear();
+                }
+                const int category = activeHardwareLightmapBasePass ? 0 : 1;
+                auto& keys = lightingProbeKeys[category];
+                const std::array<uint32_t, 3> key = {
+                    static_cast<uint32_t>(m_RP.m_pShader->m_Id),
+                    static_cast<uint32_t>(textureIds[0]), passState };
+                if (GetFrameID() == lightingProbeFrame && keys.size() < 8 &&
+                    std::find(keys.begin(), keys.end(), key) == keys.end())
+                {
+                    FILE* probe = fopen("/sdcard/FarCry/vulkan_lighting_probe.txt",
+                                        lightingProbeRecords ? "ab" : "wb");
+                    if (probe)
+                    {
+                        const auto& p = lightPasses[lightPass];
+                        const Vec3d camera = GetCamera().GetPos();
+                        fprintf(probe, "frame=%d camera=%.2f,%.2f,%.2f shader=%s re=%d vf=%d state=0x%x hw=%d flags=0x%x lm=%d dir=%d baked=%d ambientPass=%d multiAmbient=%d lights=0x%x draws=%u ambient=%.5f,%.5f,%.5f diffuse=%.5f,%.5f,%.5f primary=%.5f,%.5f,%.5f fog=%d texture=%d\n",
+                            GetFrameID(), camera.x, camera.y, camera.z,
+                            m_RP.m_pShader->GetName(), m_RP.m_pRE->mfGetType(),
+                            finalVertexFormat, passState, m_activeHardwarePassType,
+                            activeHardwareLightFlags, m_RP.m_pCurObject->m_nLMId,
+                            m_RP.m_pCurObject->m_nLMDirId, activeHardwareLightmapBasePass,
+                            hardwareAmbientPass, hardwareMultiLightsAmbient, m_RP.m_DynLMask,
+                            static_cast<unsigned>(lightPasses.size()), p[8], p[9], p[10],
+                            p[4], p[5], p[6], primaryColor[0], primaryColor[1], primaryColor[2],
+                            m_RP.m_pFogVolume != nullptr, textureIds[0]);
+                        fclose(probe);
+                        keys.push_back(key);
+                        ++lightingProbeRecords;
+                    }
+                }
+            }
+            // Capture each decal material/state once, bounded to 32 records.
+            // This remains cheap while identifying the actual wall material,
+            // rather than assuming every decal uses alpha blending.
+            static std::vector<std::array<uint32_t, 3>> decalProbeKeys;
+            if (queued && lightPass == 0 && m_RP.m_pShader &&
+                (m_RP.m_pShader->m_eSort == eS_Decal ||
+                 strstr(m_RP.m_pShader->GetName(), "decal")) &&
+                decalProbeKeys.size() < 32)
+            {
+                const std::array<uint32_t, 3> key = {
+                    static_cast<uint32_t>(m_RP.m_pShader->m_Id),
+                    static_cast<uint32_t>(textureIds[0]), passState };
+                if (std::find(decalProbeKeys.begin(), decalProbeKeys.end(), key) == decalProbeKeys.end())
+                {
+                    FILE* probe = fopen("/sdcard/FarCry/vulkan_decal_probe.txt",
+                                        decalProbeKeys.empty() ? "wb" : "ab");
+                    if (probe)
+                    {
+                        STexPic* image = m_TexMan ? m_TexMan->GetByID(textureIds[0]) : nullptr;
+                        fprintf(probe, "shader=%s sort=%d texture=%s id=%d state=0x%x hw=%d objectFlags=0x%x ops=%d,%d args=%u,%u opacity=%.4f primaryAlpha=%.4f ambient=%.4f,%.4f,%.4f lighting=%d resources=%d\n",
+                            m_RP.m_pShader->GetName(), m_RP.m_pShader->m_eSort,
+                            image ? image->m_SourceName.c_str() : "<missing>", textureIds[0],
+                            passState, m_activeHardwarePassType,
+                            m_RP.m_pCurObject ? m_RP.m_pCurObject->m_ObjFlags : 0,
+                            colorOps[0], alphaOps[0], colorArgs[0], alphaArgs[0],
+                            globalOpacity, primaryColor[3], materialLighting[8],
+                            materialLighting[9], materialLighting[10],
+                            hardwareAmbientPass, m_activeResources ? m_activeResources->m_Id : -1);
+                        fclose(probe);
+                        decalProbeKeys.push_back(key);
+                    }
+                }
+            }
+            // One bounded snapshot of opaque LM draws. Unlike the old audit,
+            // this never traces subsequent frames or texture upload traffic.
+            // The binary contains the exact private streams submitted above,
+            // allowing atlas/triangle correspondence to be inspected offline.
+            static int probeFrame = -1;
+            static uint32_t probeRecords = 0;
+            static size_t probeBytes = 0;
+            if (queued && directionalLightmapPass && lightPass == 0 &&
+                (passState & GS_BLEND_MASK) == 0 &&
+                lightmapTexCoords.size() == static_cast<size_t>(finalVertexCount) * 2)
+            {
+                CryVR::VulkanVertexFormat probeFormat{};
+                if (probeFrame < 0) probeFrame = GetFrameID();
+                const size_t recordBytes = static_cast<size_t>(finalVertexCount) *
+                    (sizeof(float) * 2 +
+                     (CryVR::GetVulkanVertexFormat(finalVertexFormat, probeFormat) ? probeFormat.stride : 0)) +
+                    static_cast<size_t>(drawIndexCount) * sizeof(uint16_t) + 2048;
+                if (GetFrameID() == probeFrame && probeRecords < 16 &&
+                    probeFormat.stride && recordBytes < 4u * 1024u * 1024u - probeBytes)
+                {
+                    FILE* probe = fopen("/sdcard/FarCry/vulkan_lightmap_probe.bin",
+                                        probeRecords == 0 ? "wb" : "ab");
+                    if (probe)
+                    {
+                        const uint32_t header[24] = {
+                            0x4c4d5652u, 1u, static_cast<uint32_t>(GetFrameID()), probeRecords,
+                            static_cast<uint32_t>(finalVertexFormat), probeFormat.stride,
+                            finalVertexCount, drawIndexCount, static_cast<uint32_t>(topology),
+                            passState, static_cast<uint32_t>(textureIds[0]),
+                            static_cast<uint32_t>(secondaryTextureId),
+                            static_cast<uint32_t>(textureStage2.textureId),
+                            static_cast<uint32_t>(textureStage3.textureId), shadowMapStageMask,
+                            static_cast<uint32_t>(m_activeHardwarePassType), activeHardwareLightFlags,
+                            static_cast<uint32_t>(m_RP.m_pCurObject->m_ObjFlags),
+                            textureStage1UsesTexCoord1 ? 1u : 0u,
+                            textureStage2.useTexCoord1 ? 1u : 0u,
+                            textureStage3.useTexCoord1 ? 1u : 0u,
+                            static_cast<uint32_t>(firstIndex), 0u, 0u
+                        };
+                        char names[5][256]{};
+                        if (m_RP.m_pShader)
+                            snprintf(names[0], sizeof(names[0]), "%s", m_RP.m_pShader->m_Name.c_str());
+                        for (uint32_t stage = 0; stage < 4; ++stage)
+                            if (STexPic* image = m_TexMan->GetByID(static_cast<int>(header[10 + stage])))
+                                snprintf(names[stage + 1], sizeof(names[stage + 1]), "%s",
+                                         image->m_SearchName.c_str());
+                        fwrite(header, sizeof(header), 1, probe);
+                        fwrite(names, sizeof(names), 1, probe);
+                        fwrite(modelView, sizeof(float) * 16, 1, probe);
+                        fwrite(lightPasses[lightPass].data(), sizeof(float) * 19, 1, probe);
+                        fwrite(drawTextureMatrix0, sizeof(float) * 16, 1, probe);
+                        fwrite(drawTextureMatrix1, sizeof(float) * 16, 1, probe);
+                        fwrite(textureStage2.uvTransform, sizeof(float) * 9, 1, probe);
+                        fwrite(textureStage3.uvTransform, sizeof(float) * 9, 1, probe);
+                        fwrite(finalVertexData, static_cast<size_t>(finalVertexCount) * probeFormat.stride, 1, probe);
+                        fwrite(lightmapTexCoords.data(), static_cast<size_t>(finalVertexCount) * sizeof(float) * 2, 1, probe);
+                        fwrite(indexData, static_cast<size_t>(drawIndexCount) * sizeof(uint16_t), 1, probe);
+                        fclose(probe);
+                        if (probeRecords == 0)
+                            CryLogAlways("Vulkan: saved bounded lightmap input snapshot to vulkan_lightmap_probe.bin (at most one frame, 16 draws, 4 MiB)");
+                        ++probeRecords;
+                        probeBytes += recordBytes;
+                    }
+                }
+            }
+#endif
             if (m_auditFrameActive)
                 CryLogAlways("Vulkan audit SUBMIT_RESULT frame=%d list=%d item=%d lightPass=%d queued=%d pendingUntranslated=%u",
                     GetFrameID(), m_auditCurrentList, m_auditCurrentItem,
@@ -4088,12 +8952,440 @@ public:
             if (!queued)
                 m_frameRenderer->RequirePanelFallback();
         }
+
+        // CGLRenderer draws detail overlays once after the material's final
+        // pass. Reuse this chunk's geometry and the engine's generated $Fog
+        // texture so Vulkan applies the same multiplicative detail blend.
+        // Resource/object overrides have been resolved for the main draw.
+        // OpenGL's subsequent auxiliary passes inherit that effective state.
+        m_CurState = static_cast<int>(renderState);
+        bool finalMaterialPass = false;
+        if (m_RP.m_pShader && m_activePass)
+        {
+            if (m_activeHardwarePassType == eSHP_MAX && m_RP.m_pShader->m_Passes.Num() > 0)
+                finalMaterialPass = m_activePass ==
+                    &m_RP.m_pShader->m_Passes[m_RP.m_pShader->m_Passes.Num() - 1];
+            else if (m_RP.m_pCurTechnique && m_RP.m_pCurTechnique->m_Passes.Num() > 0 &&
+                     m_activePass == &m_RP.m_pCurTechnique->m_Passes[
+                         m_RP.m_pCurTechnique->m_Passes.Num() - 1])
+            {
+                finalMaterialPass = m_activeHardwarePassType == eSHP_General ||
+                                    m_activeHardwarePassType == eSHP_MultiLights;
+                if (!finalMaterialPass &&
+                    (m_activeHardwarePassType == eSHP_Light ||
+                     m_activeHardwarePassType == eSHP_DiffuseLight ||
+                     m_activeHardwarePassType == eSHP_SpecularLight) &&
+                    m_RP.m_pCurLight && m_RP.m_NumActiveDLights > 0)
+                {
+                    const uint32_t passLightTypes = activeHardwareLightFlags & DLF_LIGHTTYPE_MASK;
+                    const uint32_t passLightFlags =
+                        static_cast<SShaderPassHW*>(m_activePass)->m_LightFlags;
+                    const bool hasBakedLightmap =
+                        (m_activeResources && m_activeResources->m_Textures[EFTT_LIGHTMAP]) ||
+                        (m_RP.m_pCurObject && m_RP.m_pCurObject->m_nLMId);
+                    const bool currentLightIsLast = [&]()
+                    {
+                        bool foundCurrent = false;
+                        for (int lightIndex = 0; lightIndex < m_RP.m_NumActiveDLights; ++lightIndex)
+                        {
+                            CDLight* light = m_RP.m_pActiveDLights[lightIndex];
+                            if (!light || (passLightTypes &&
+                                !(passLightTypes & (light->m_Flags & DLF_LIGHTTYPE_MASK))) ||
+                                ((activeHardwareLightFlags & LMF_IGNOREPROJLIGHTS) &&
+                                 (light->m_Flags & DLF_PROJECT)) ||
+                                !(light->m_Flags & (DLF_DIRECTIONAL | DLF_POINT | DLF_PROJECT)))
+                                continue;
+                            if (passLightFlags & DLF_LM)
+                            {
+                                if (!(light->m_Flags & DLF_LM) || !hasBakedLightmap ||
+                                    (light->m_SpecColor.r <= 0.01f &&
+                                     light->m_SpecColor.g <= 0.01f &&
+                                     light->m_SpecColor.b <= 0.01f))
+                                    continue;
+                            }
+                            if (m_activeHardwarePassType == eSHP_DiffuseLight &&
+                                (light->m_Flags & DLF_LM) && hasBakedLightmap)
+                                continue;
+                            if (m_activeHardwarePassType == eSHP_SpecularLight &&
+                                light->m_SpecColor.r == 0.0f &&
+                                light->m_SpecColor.g == 0.0f &&
+                                light->m_SpecColor.b == 0.0f)
+                                continue;
+                            if ((activeHardwareLightFlags & LMF_USEOCCLUSIONMAP) &&
+                                (!m_RP.m_pCurObject ||
+                                 *reinterpret_cast<const int*>(m_RP.m_pCurObject->m_OcclLights) == 0))
+                                continue;
+                            if ((activeHardwareLightFlags & LMF_NOBUMP) && m_activeResources &&
+                                (!m_activeResources->m_Textures[EFTT_BUMP] ||
+                                 !(m_activeResources->m_Textures[EFTT_BUMP]->m_TU.m_nFlags & FTU_NOBUMP)))
+                                continue;
+                            if (light == m_RP.m_pCurLight)
+                            {
+                                foundCurrent = true;
+                                continue;
+                            }
+                            if (foundCurrent)
+                                return false;
+                        }
+                        return foundCurrent;
+                    }();
+                    finalMaterialPass = currentLightIsLast;
+                }
+            }
+        }
+        CryVR::VulkanVertexFormat detailVertexFormat{};
+        uint32_t detailPositionOffset = 0xffffffffu;
+        uint32_t detailUvOffset = 0xffffffffu;
+        if (CryVR::GetVulkanVertexFormat(finalVertexFormat, detailVertexFormat))
+            for (uint32_t attribute = 0; attribute < detailVertexFormat.attributeCount; ++attribute)
+            {
+                const VkVertexInputAttributeDescription& input = detailVertexFormat.attributes[attribute];
+                if (input.location == 0 && input.format == VK_FORMAT_R32G32B32_SFLOAT)
+                    detailPositionOffset = input.offset;
+                if (input.location == 3 && input.format == VK_FORMAT_R32G32_SFLOAT)
+                    detailUvOffset = input.offset;
+            }
+        SEfResTexture* detailTexture = m_activeResources ?
+            m_activeResources->m_Textures[EFTT_DETAIL_OVERLAY] : nullptr;
+        if (finalMaterialPass && detailTexture && CV_r_detailtextures &&
+            !(m_RP.m_ObjFlags & (FOB_ZPASS | FOB_FOGPASS)) && m_RP.m_pRE && m_RP.m_pCurObject &&
+            finalVertexData && detailPositionOffset != 0xffffffffu &&
+            detailUvOffset != 0xffffffffu && m_TexMan && m_TexMan->m_Text_Fog)
+        {
+            detailTexture->m_TU.mfUpdate();
+            const int detailTextureId = detailTexture->m_TU.m_ITexPic ?
+                detailTexture->m_TU.m_ITexPic->GetTextureID() : 0;
+            const int detailFogTextureId = m_TexMan->m_Text_Fog->GetTextureID();
+            const float detailDistance = CV_r_detaildistance;
+            const float objectDistance = m_RP.m_pRE->mfMinDistanceToCamera(m_RP.m_pCurObject);
+            if (detailTextureId > 0 && detailFogTextureId > 0 &&
+                detailDistance > 0.0f && objectDistance <= detailDistance + 1.0f)
+            {
+                // EF_DrawDetailOverlayPasses explicitly disables scissor;
+                // direct STexPic::Set bindings retain each TMU's LOD bias.
+                SetScissor(0, 0, 0, 0);
+                float detailUScale = detailTexture->m_TexModificator.m_Tiling[0];
+                float detailVScale = detailTexture->m_TexModificator.m_Tiling[1];
+                if (detailUScale == 0.0f) detailUScale = CV_r_detailscale;
+                if (detailVScale == 0.0f) detailVScale = CV_r_detailscale;
+                const float* const finalVertices = static_cast<const float*>(finalVertexData);
+                float layerDistance = detailDistance;
+                const int detailLayerCount = clamp_tpl(CV_r_detailnumlayers, 1, 4);
+                for (int layerIndex = 0; layerIndex < detailLayerCount; ++layerIndex)
+                {
+                    if (objectDistance > layerDistance + 1.0f)
+                        break;
+                    SMFog detailVolume{};
+                    detailVolume.m_FogInfo.m_WaveFogGen.m_eWFType = eWF_None;
+                    detailVolume.m_fMaxDist = layerDistance;
+                    SMFog* savedFogVolume = m_RP.m_pFogVolume;
+                    m_RP.m_pFogVolume = &detailVolume;
+                    CryVR::VulkanStockLinearTexgen detailFogTexgen;
+                    BuildStockFogTexgen(detailFogTexgen, false);
+                    m_RP.m_pFogVolume = savedFogVolume;
+                    const float* fogPlane = detailFogTexgen.planes[0];
+                    std::vector<float> detailFogCoordinates(
+                        static_cast<size_t>(finalVertexCount) * 2u);
+                    for (uint32_t vertex = 0; vertex < finalVertexCount; ++vertex)
+                    {
+                        const float* position = reinterpret_cast<const float*>(
+                            reinterpret_cast<const uint8_t*>(finalVertices) +
+                            static_cast<size_t>(vertex) * detailVertexFormat.stride + detailPositionOffset);
+                        detailFogCoordinates[static_cast<size_t>(vertex) * 2u] =
+                            fogPlane[0] * position[0] + fogPlane[1] * position[1] +
+                            fogPlane[2] * position[2] + fogPlane[3];
+                        detailFogCoordinates[static_cast<size_t>(vertex) * 2u + 1u] = 0.49f;
+                    }
+                    float detailTextureMatrix[16]{};
+                    float detailFogMatrix[16]{};
+                    SetIdentityScreenMatrix(detailTextureMatrix);
+                    SetIdentityScreenMatrix(detailFogMatrix);
+                    detailTextureMatrix[0] = detailUScale;
+                    detailTextureMatrix[5] = detailVScale;
+                    uint32_t detailState = GS_BLSRC_DSTCOL | GS_BLDST_SRCCOL;
+                    if (m_RP.m_FlagsPerFlush & RBSI_WASDEPTHWRITE)
+                        detailState |= GS_DEPTHFUNC_EQUAL;
+                    EF_SetState(static_cast<int>(detailState));
+                    detailState = static_cast<uint32_t>(m_CurState);
+                    const uint32_t detailColorArg0 = static_cast<uint32_t>(
+                        eCA_Texture | (eCA_Constant << 3));
+                    const uint32_t detailColorArg1 = static_cast<uint32_t>(
+                        eCA_Constant | (eCA_Previous << 3) | (eCA_Texture << 6));
+                    m_frameRenderer->ResetStockLinearTexgen();
+                    const bool detailQueued = m_frameRenderer->QueueStockClientIndexedDraw(
+                        finalVertexData, finalVertexCount, indexData, drawIndexCount,
+                        finalVertexFormat, topology, detailState,
+                        ResolveStockCullMode(),
+                        detailTextureId, detailFogTextureId,
+                        // CGRCDetailAtten lerps the unscaled detail texel to
+                        // 0.5. Multiplying it by 0.5 here darkened every layer
+                        // before DST_COLOR/SRC_COLOR multiplied the scene.
+                        eCO_REPLACE, eCO_REPLACE,
+                        eCO_BLENDTEXTUREALPHA, eCO_REPLACE,
+                        detailColorArg0, DEF_TEXARG0, 0xff808080u,
+                        detailColorArg1, DEF_TEXARG0, 0xff808080u,
+                        static_cast<uint32_t>(m_CurStencilState), m_CurStencRef, m_CurStencMask,
+                        modelView, detailTextureMatrix, detailFogMatrix, nullptr, false,
+                        1.0f, (m_RP.m_FlagsPerFlush & RBSI_ALPHATEST) ? alphaTestRef : 0.0f,
+                        reinterpret_cast<const CryVR::VulkanBuffer*>(
+                            vertices->m_VS[VSF_TANGENTS].m_VulkanBufferHandle),
+                        0, nullptr, nullptr, colorWriteMaskOverride,
+                        m_stageLodBias[0], m_stageLodBias[1], nullptr, nullptr,
+                        m_activeHardwarePassType == eSHP_MAX && m_activePolygonOffset,
+                        m_activePolygonOffsetFactor, m_activePolygonOffsetUnits,
+                        clipPlane,
+                        TextureWrapModeForId(detailTextureId),
+                        TextureWrapModeForId(detailFogTextureId), -1, -1, nullptr,
+                        detailFogCoordinates.data(), true, false, false,
+                        (m_RP.m_pCurObject->m_ObjFlags & FOB_NEAREST) != 0,
+                        false, false, false, false);
+                    if (!detailQueued)
+                        m_frameRenderer->RequirePanelFallback();
+                    detailUScale *= 2.0f;
+                    detailVScale *= 2.0f;
+                    layerDistance *= 0.5f;
+                }
+                // EF_DrawDetailOverlayPasses ends with BindNULL(0).
+                // The queued draws own their samplers; later render elements
+                // must observe disabled targets rather than the material's
+                // bindings retained before this auxiliary pass.
+                for (int stage = 0; stage < 8; ++stage)
+                    m_stageTextureIds[stage] = 0;
+                if (m_TexMan) m_TexMan->m_nCurStages = 0;
+                m_RP.m_FlagsModificators &= ~(RBMF_TCM | RBMF_TCG);
+            }
+        }
+        if (finalMaterialPass && CV_r_VolumetricFog && m_RP.m_pFogVolume &&
+            !(m_RP.m_ObjFlags & FOB_ZPASS) && !(m_RP.m_FlagsPerFlush & RBSI_FOGVOLUME) &&
+            m_TexMan && m_TexMan->m_Text_Fog && m_TexMan->m_Text_Fog_Enter &&
+            m_RP.m_pShader && finalVertexData)
+        {
+            SMFog* volume = m_RP.m_pFogVolume;
+            const float waterLevel = iSystem->GetI3DEngine()->GetWaterLevel();
+            const bool vertexFog = (m_Features & RFT_HW_VS) && CV_r_Quality_BumpMapping != 0;
+            const bool drawCaustics = (vertexFog || (m_RP.m_pShader->m_Flags & EF_HASVSHADER)) &&
+                m_RP.m_pShader->m_eSort != eS_Water &&
+                fabs(volume->m_Dist - waterLevel) < 0.1f && SRendItem::m_RecurseLevel <= 1 &&
+                (!m_RP.m_pRE || m_RP.m_pRE->mfMinDistanceToCamera(m_RP.m_pCurObject) < 40.0f);
+            if (drawCaustics)
+            {
+                // Use the parsed OpenGL template's sequence, including its
+                // frame count and timer-pause semantics. Do not assume names
+                // or a fixed number of causq images in the installed assets.
+                SShader* caustics = m_cEF.m_ShaderFogCaust;
+                SShaderTexUnit* unit = nullptr;
+                if (caustics && caustics->m_HWTechniques.Num() &&
+                    caustics->m_HWTechniques[0]->m_Passes.Num() &&
+                    caustics->m_HWTechniques[0]->m_Passes[0].m_TUnits.Num())
+                    unit = &caustics->m_HWTechniques[0]->m_Passes[0].m_TUnits[0];
+                if (unit && (!unit->m_AnimInfo || unit->m_AnimInfo->m_NumAnimTexs > 0))
+                    unit->mfUpdate();
+                if (unit && unit->m_TexPic &&
+                    m_frameRenderer->HasLegacyTexture(unit->m_TexPic->GetTextureID()))
+                {
+                    float parameters[64]{};
+                    for (int row = 0; row < 4; ++row)
+                    {
+                        // TranspObjMatrix uses legacy Matrix44 columns;
+                        // translation is in its last row (TransformPointOLD).
+                        SParamComp_ObjMatrix matrix;
+                        matrix.m_Offs = 0x40000000 | row;
+                        matrix.mfGet4f(parameters + row * 4);
+                    }
+                    const Vec3d camera = GetCamera().GetPos();
+                    parameters[16] = camera.x; parameters[17] = camera.y; parameters[18] = camera.z;
+                    parameters[19] = 0.025f;
+                    parameters[20] = waterLevel;
+                    SParamComp_Time time;
+                    time.m_Scale = 0.06f; parameters[21] = time.mfGet();
+                    time.m_Scale = 0.12f; parameters[22] = time.mfGet();
+                    parameters[31] = -12.0f;
+                    float identity[16]; SetIdentityScreenMatrix(identity);
+                    float color[4] = { volume->m_Color.r, volume->m_Color.g, volume->m_Color.b, 1.0f };
+                    const float mask[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+                    float noLighting[19]{};
+                    uint32_t state = GS_BLSRC_ONE | GS_BLDST_ONE;
+                    if (m_RP.m_pShader->m_Flags2 & EF2_OPAQUE) state |= GS_DEPTHFUNC_EQUAL;
+                    EF_SetState(static_cast<int>(state));
+                    m_frameRenderer->ResetStockLinearTexgen();
+                    m_frameRenderer->SetStockShadowTransforms(nullptr, 0u);
+                    m_frameRenderer->SetStockFog(false, m_fogDensity, m_fogStart, m_fogEnd, m_fogColor, m_fogMode);
+                    if (CRenderer::CV_r_scissor && m_RP.m_pCurObject)
+                    {
+                        CCObject* object = m_RP.m_pCurObject;
+                        if (object->m_nScissorX2)
+                            SetScissor(object->m_nScissorX1, object->m_nScissorY1,
+                                object->m_nScissorX2 - object->m_nScissorX1,
+                                object->m_nScissorY2 - object->m_nScissorY1);
+                        else SetScissor(0, 0, 0, 0);
+                    }
+                    const bool queued = m_frameRenderer->QueueStockClientIndexedDraw(
+                        finalVertexData, finalVertexCount, indexData, drawIndexCount, finalVertexFormat, topology,
+                        static_cast<uint32_t>(m_CurState), ResolveStockCullMode(), unit->m_TexPic->GetTextureID(), 0,
+                        eCO_REPLACE, eCO_REPLACE, eCO_NOSET, eCO_NOSET,
+                        DEF_TEXARG0, DEF_TEXARG0, 0xffffffffu, DEF_TEXARG1, DEF_TEXARG1, 0xffffffffu,
+                        static_cast<uint32_t>(m_CurStencilState), m_CurStencRef, m_CurStencMask,
+                        modelView, identity, identity, noLighting, false, 1.0f,
+                        (m_RP.m_FlagsPerFlush & RBSI_ALPHATEST) ? alphaTestRef : 0.0f,
+                        nullptr, 0, color, mask, colorWriteMaskOverride, m_stageLodBias[0], 0.0f,
+                        nullptr, nullptr, false, -1.0f, -4.0f, clipPlane,
+                        TextureWrapModeForId(unit->m_TexPic->GetTextureID()), -1, -1, -1,
+                        nullptr, nullptr, false, false, false, (m_RP.m_ObjFlags & FOB_NEAREST) != 0,
+                        false, 0.0f, false, false, parameters);
+                    if (!queued) m_frameRenderer->RequirePanelFallback();
+                }
+                else m_frameRenderer->RequirePanelFallback();
+            }
+            const float originalDistance = volume->m_Dist;
+            if (m_RP.m_pShader->m_eSort == eS_Water) volume->m_Dist += 0.1f;
+            CryVR::VulkanStockLinearTexgen enterTexgen, fogTexgen;
+            BuildStockFogTexgen(enterTexgen, true);
+            BuildStockFogTexgen(fogTexgen, false);
+            volume->m_Dist = originalDistance;
+            m_frameRenderer->ResetStockLinearTexgen();
+            m_frameRenderer->SetStockLinearTexgen(0, enterTexgen);
+            m_frameRenderer->SetStockLinearTexgen(1, fogTexgen);
+            m_frameRenderer->SetStockShadowTransforms(nullptr, 0u);
+            float fogColor[4] = { volume->m_Color.r, volume->m_Color.g, volume->m_Color.b, 1.0f };
+            const float colorMask[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+            float noLighting[19]{};
+            uint32_t fogState = GS_BLSRC_SRCALPHA | GS_BLDST_ONEMINUSSRCALPHA;
+            if (m_RP.m_pShader->m_Flags2 & EF2_OPAQUE) fogState |= GS_DEPTHFUNC_EQUAL;
+            EF_SetState(static_cast<int>(fogState));
+            fogState = static_cast<uint32_t>(m_CurState);
+            // General fog passes reinstall the object's scissor. Detail
+            // disables it, and light passes may leave a light rectangle.
+            if (CRenderer::CV_r_scissor)
+            {
+                CCObject* object = m_RP.m_pCurObject;
+                if (object && object->m_nScissorX2)
+                    SetScissor(object->m_nScissorX1, object->m_nScissorY1,
+                        object->m_nScissorX2 - object->m_nScissorX1,
+                        object->m_nScissorY2 - object->m_nScissorY1);
+                else
+                    SetScissor(0, 0, 0, 0);
+            }
+            float identity[16];
+            SetIdentityScreenMatrix(identity);
+            // CGRCFog is explicitly NoFog. Ordinary scene fog must not be
+            // applied again to the independently blended volume overlay.
+            m_frameRenderer->SetStockFog(false, m_fogDensity, m_fogStart, m_fogEnd, m_fogColor, m_fogMode);
+            const uint32_t textureDiffuse = eCA_Texture | (eCA_Diffuse << 3);
+            const bool fogQueued = m_frameRenderer->QueueStockClientIndexedDraw(
+                finalVertexData, finalVertexCount, indexData, drawIndexCount,
+                finalVertexFormat, topology, fogState, ResolveStockCullMode(),
+                m_TexMan->m_Text_Fog_Enter->GetTextureID(), m_TexMan->m_Text_Fog->GetTextureID(),
+                eCO_MODULATE, eCO_REPLACE, eCO_MODULATE, eCO_MODULATE,
+                textureDiffuse, eCA_Texture, 0xffffffffu, DEF_TEXARG1, DEF_TEXARG1, 0xffffffffu,
+                static_cast<uint32_t>(m_CurStencilState), m_CurStencRef, m_CurStencMask,
+                modelView, identity, identity, noLighting, false, 1.0f,
+                (m_RP.m_FlagsPerFlush & RBSI_ALPHATEST) ? alphaTestRef : 0.0f,
+                nullptr, 0, fogColor, colorMask, colorWriteMaskOverride,
+                m_stageLodBias[0], m_stageLodBias[1], nullptr, nullptr,
+                false, -1.0f, -4.0f, clipPlane, 1, 1, -1, -1, nullptr, nullptr,
+                false, false, false, (m_RP.m_ObjFlags & FOB_NEAREST) != 0);
+            m_frameRenderer->ResetStockLinearTexgen();
+            UpdateVulkanFog();
+            if (!fogQueued || (m_RP.m_PersFlags & RBPF_HDR))
+                m_frameRenderer->RequirePanelFallback();
+        }
     }
 
 private:
+    bool BuildStockFogTexgen(CryVR::VulkanStockLinearTexgen& texgen, bool enter)
+    {
+        if (!m_RP.m_pFogVolume) return false;
+        texgen = {};
+        for (int component = 0; component < 2; ++component)
+        {
+            if (enter)
+            {
+                SParamComp_FogEnterMatrix parameter;
+                parameter.m_Offs = component;
+                parameter.mfGet4f(texgen.planes[component]);
+            }
+            else
+            {
+                SParamComp_FogMatrix parameter;
+                parameter.m_Offs = component;
+                parameter.mfGet4f(texgen.planes[component]);
+            }
+        }
+        texgen.componentMask = 3u;
+        texgen.enabled = true;
+        return true;
+    }
+
+    void InitializeStockFogTextures()
+    {
+        if (!m_frameRenderer || !m_TexMan) return;
+        const uint flags = FT_CLAMP | FT_NOMIPS | FT_NOREMOVE | FT_HASALPHA;
+        if (!m_TexMan->m_Text_Fog ||
+            !m_frameRenderer->HasLegacyTexture(m_TexMan->m_Text_Fog->GetTextureID()))
+        {
+            // CGLTexMan::GenerateFogMaps, including byte truncation and
+            // the forced opaque texture border.
+            float attenuation[256];
+            float value = 1.0f;
+            for (int index = 0; index < 256; ++index)
+            {
+                attenuation[index] = value;
+                value *= 0.982f;
+            }
+            attenuation[0] = attenuation[255] = 0.0f;
+            byte pixels[128][128][4];
+            for (int x = 0; x < 128; ++x)
+                for (int y = 0; y < 128; ++y)
+                {
+                    const int dx = x - 64, dy = y - 64;
+                    const float radiusSquared = static_cast<float>(dx * dx + dy * dy);
+                    const float inverseRadius = radiusSquared ?
+                        1.0f / cry_sqrtf(radiusSquared) : 1000000.0f;
+                    const int sample = clamp_tpl(static_cast<int>(
+                        inverseRadius * radiusSquared / 63.0f * 255.0f), 0, 255);
+                    int alpha = static_cast<int>((1.0f - attenuation[sample]) * 255.0f);
+                    if (!x || x == 127 || !y || y == 127) alpha = 255;
+                    pixels[y][x][0] = pixels[y][x][1] = pixels[y][x][2] = 255;
+                    pixels[y][x][3] = static_cast<byte>(alpha);
+                }
+            m_TexMan->m_Text_Fog = m_TexMan->CreateTexture("$Fog", 128, 128, 1,
+                flags, FT2_NODXT, &pixels[0][0][0], eTT_Base,
+                -1.0f, -1.0f, 0, m_TexMan->m_Text_Fog, 0, eTF_8888);
+        }
+        if (!m_TexMan->m_Text_Fog_Enter)
+            m_TexMan->m_Text_Fog_Enter = static_cast<STexPic*>(
+                EF_LoadTexture("Textures/FogEnter", flags, FT2_NODXT, eTT_Base));
+    }
+
+    bool IsGlobalOnlyColorPass(const SShaderPass& pass) const
+    {
+        if (!m_RP.m_pRE) return false;
+        switch (pass.m_eEvalRGB)
+        {
+        case eERGB_NoFill: case eERGB_FromClient: case eERGB_Identity:
+        case eERGB_Fixed: case eERGB_Object: case eERGB_OneMinusObject:
+        case eERGB_RE: case eERGB_OneMinusRE: case eERGB_World:
+        case eERGB_Wave: case eERGB_Noise: case eERGB_Comps:
+        case eERGB_StyleColor: case eERGB_StyleIntens:
+            break;
+        default: return false;
+        }
+        switch (pass.m_eEvalAlpha)
+        {
+        case eEALPHA_NoFill: case eEALPHA_FromClient: case eEALPHA_Identity: case eEALPHA_Fixed:
+        case eEALPHA_Object: case eEALPHA_OneMinusObject:
+        case eEALPHA_RE: case eEALPHA_OneMinusRE: case eEALPHA_World:
+        case eEALPHA_Wave: case eEALPHA_Noise: case eEALPHA_Comps:
+        case eEALPHA_Style:
+            return true;
+        default: return false;
+        }
+    }
+
     uint32_t CurrentPanelBlendState() const
     {
-        return static_cast<uint32_t>(m_CurState) & GS_BLEND_MASK;
+        return static_cast<uint32_t>(m_CurState) &
+            (GS_BLEND_MASK | GS_NOCOLMASK | GS_COLMASKONLYALPHA | GS_COLMASKONLYRGB);
     }
 
     bool CullGeometryForLightsEnabled()
@@ -4168,8 +9460,10 @@ private:
             color[3] = pass.m_FixedColor.bcolor[3] * invByte;
             break;
         case eERGB_Identity:
-            color[0] = color[1] = color[2] = 1.0f;
-            mask[0] = mask[1] = mask[2] = 1.0f;
+            // EF_Eval_RGBAGen initializes UCol to 0xffffffff and the
+            // identity branch installs the complete color, including alpha.
+            color[0] = color[1] = color[2] = color[3] = 1.0f;
+            mask[0] = mask[1] = mask[2] = mask[3] = 1.0f;
             break;
         case eERGB_Object:
             setObjectRgb(false);
@@ -4223,16 +9517,22 @@ private:
         case eERGB_StyleColor:
             if (CLightStyle* style = CLightStyle::mfGetStyle(pass.m_Style, m_RP.m_RealTime))
             {
-                color[0] = style->m_Color.r; color[1] = style->m_Color.g; color[2] = style->m_Color.b;
-                mask[0] = mask[1] = mask[2] = 1.0f;
+                UCol packed;
+                packed.dcolor = style->m_Color.GetTrue();
+                for (int channel = 0; channel < 4; ++channel)
+                    color[channel] = packed.bcolor[channel] * invByte;
+                mask[0] = mask[1] = mask[2] = mask[3] = 1.0f;
             }
             break;
         case eERGB_StyleIntens:
             if (CLightStyle* style = CLightStyle::mfGetStyle(pass.m_Style, m_RP.m_RealTime))
             {
                 for (int channel = 0; channel < 3; ++channel)
-                    color[channel] = pass.m_FixedColor.bcolor[channel] * invByte * style->m_fIntensity;
-                mask[0] = mask[1] = mask[2] = 1.0f;
+                    color[channel] = static_cast<byte>(
+                        static_cast<float>(pass.m_FixedColor.bcolor[channel]) * style->m_fIntensity) * invByte;
+                // GL scales only RGB of a copy of m_FixedColor.
+                color[3] = pass.m_FixedColor.bcolor[3] * invByte;
+                mask[0] = mask[1] = mask[2] = mask[3] = 1.0f;
             }
             break;
         default:
@@ -4240,6 +9540,13 @@ private:
             // color stream already provided by the stock mesh.
             break;
         }
+
+        // EF_Eval_RGBAGen starts its packed color at 0xffffffff and writes
+        // the whole value when a global RGB generator succeeds. Generators
+        // that write only RGB therefore supply alpha 255, not vertex alpha.
+        // A subsequent alpha generator may replace it below.
+        if (mask[0] > 0.5f && mask[1] > 0.5f && mask[2] > 0.5f)
+            mask[3] = 1.0f;
 
         switch (pass.m_eEvalAlpha)
         {
@@ -4305,13 +9612,19 @@ private:
         case eEALPHA_Style:
             if (CLightStyle* style = CLightStyle::mfGetStyle(pass.m_Style, m_RP.m_RealTime))
             {
-                color[3] = (pass.m_FixedColor.bcolor[3] * invByte) * style->m_fIntensity;
+                color[3] = static_cast<byte>(
+                    static_cast<float>(pass.m_FixedColor.bcolor[3]) * style->m_fIntensity) * invByte;
                 mask[3] = 1.0f;
             }
             break;
         default:
             break;
         }
+        // bSetCol in EF_Eval_RGBAGen installs the entire local UCol even
+        // when only an alpha generator wrote it. Unwritten RGB channels
+        // retain its initial white value rather than the mesh's vertex RGB.
+        if (mask[0] > 0.5f || mask[1] > 0.5f || mask[2] > 0.5f || mask[3] > 0.5f)
+            mask[0] = mask[1] = mask[2] = mask[3] = 1.0f;
         for (int channel = 0; channel < 4; ++channel)
             color[channel] = clamp_tpl(color[channel], 0.0f, 1.0f);
     }
@@ -4376,6 +9689,32 @@ private:
         m_RP.m_ObjFlags = FOB_TRANS_MASK;
     }
 
+    void UpdateStockNearestCamera(bool nearest)
+    {
+        if (nearest == bool(m_RP.m_Flags & RBF_NEAREST)) return;
+        if (nearest)
+        {
+            CCamera camera = GetCamera();
+            m_RP.m_PrevCamera = camera;
+            camera.SetZMin(0.01f);
+            camera.SetZMax(40.0f);
+            // fholger's VRRenderer::Hook_Renderer_SetCamera restores the
+            // world FOV for DRAW_NEAR. The XR eye projection must likewise
+            // preserve physical size and controller movement in metres.
+            camera.Update();
+            SetCamera(camera);
+            m_RP.m_Flags |= RBF_NEAREST;
+        }
+        else
+        {
+            SetCamera(m_RP.m_PrevCamera);
+            m_RP.m_Flags &= ~RBF_NEAREST;
+        }
+        if (m_frameRenderer)
+            m_frameRenderer->SetStockDepthRange(nearest ? 0.0f : m_RP.m_fMinDepthRange,
+                                               nearest ? 0.1f : m_RP.m_fMaxDepthRange);
+    }
+
     void UpdateLegacyObjectTransform(CCObject* object)
     {
         if (object && (object->m_ObjFlags & FOB_TRANS_MASK))
@@ -4390,19 +9729,130 @@ private:
     // Vulkan already has the normalized legacy camera matrix in SetCamera.
     // Render elements such as billboards and particles consume this state
     // during mfDraw/mfPrepare, so it must be current before walking item lists.
-    void PrepareStockFrameState(int recurseLevel)
+    int ProcessStockPreprocess(int list, int first, int last)
+    {
+        struct Operation
+        {
+            int id;
+            int object;
+            SShader* shader;
+            CRendElement* element;
+            SRenderShaderResources* resources;
+            int sourceIndex;
+        };
+        std::vector<Operation> operations;
+        int consumed = 0;
+        for (int index = first; index < last; ++index)
+        {
+            SRendItemPre& item = SRendItem::m_RendItems[list][index];
+            if ((item.SortVal.i.High >> 26) != eS_PreProcess) break;
+            ++consumed;
+            int object = -1, fog = 0;
+            SShader* shader = nullptr;
+            SShader* state = nullptr;
+            SRenderShaderResources* resources = nullptr;
+            SRendItem::mfGet(item.SortVal, &object, &shader, &state, &fog, &resources);
+            if (!shader) continue;
+            for (int id = 0; id < 32; ++id)
+            {
+                const uint32_t mask = uint32_t(1) << id;
+                if (mask >= FSPR_MAX || mask > shader->m_nPreprocess) break;
+                if (shader->m_nPreprocess & mask)
+                    operations.push_back(Operation{ id, object, shader, item.Item, resources, index });
+            }
+        }
+        // OpenGL returns zero for an empty operation list, not consumed.
+        if (operations.empty()) return 0;
+        std::stable_sort(operations.begin(), operations.end(),
+            [](const Operation& a, const Operation& b) { return a.id < b.id; });
+        if (m_collectingShadowCasters || CV_r_nopreprocess) return consumed;
+        CCObject* savedObject = m_RP.m_pCurObject;
+        for (const Operation& operation : operations)
+        {
+            CCObject* object = operation.object >= 0 && operation.object < m_RP.m_NumVisObjects ?
+                m_RP.m_VisObjects[operation.object] : nullptr;
+            if (operation.id == SPRID_SCANCM || operation.id == SPRID_SCANLCM)
+            {
+                // Match the source eligibility before accounting for the
+                // missing six-face environment target/render implementation.
+                if (m_RP.m_bDrawToTexture || !object ||
+                    IsEquivalent(object->GetTranslation(), Vec3d(0, 0, 0)))
+                    continue;
+                if (operation.id == SPRID_SCANLCM &&
+                    (!(object->m_ObjFlags & FOB_ENVLIGHTING) || !CV_r_envlighting))
+                    continue;
+                if (m_frameRenderer) m_frameRenderer->RequirePanelFallback();
+            }
+            else if (operation.id == SPRID_REFRACTED)
+            {
+                if (!m_RP.m_bDrawToTexture && object) object->m_ObjFlags |= FOB_REFRACTED;
+            }
+            else if (operation.id == SPRID_SHADOWMAPGEN)
+            {
+                m_RP.m_pCurObject = object;
+                if (!m_RP.m_bDrawToTexture && object && object->m_pShadowCasters &&
+                    operation.element && (operation.element->mfGetType() == eDATA_OcLeaf ||
+                    operation.element->mfGetType() == eDATA_ShadowMapGen))
+                {
+                    auto* casters = static_cast<list2<ShadowMapLightSourceInstance>*>(object->m_pShadowCasters);
+                    for (int index = 0; index < casters->Count(); ++index)
+                    {
+                        ShadowMapLightSourceInstance& caster = casters->GetAt(index);
+                        if (caster.m_pLS && caster.m_pLS->GetShadowMapFrustum())
+                            PrepareDepthMap(caster.m_pLS->GetShadowMapFrustum(), false);
+                        m_RP.m_pCurObject = object;
+                    }
+                }
+            }
+            else if (m_frameRenderer)
+            {
+                // Keep every unimplemented operation visible to the existing
+                // unsupported-work counter instead of silently dropping it.
+                m_frameRenderer->RequirePanelFallback();
+            }
+        }
+        m_RP.m_pCurObject = savedObject;
+        return consumed;
+    }
+
+    void ClearStockSceneBuffers(bool force, bool onlyDepth)
+    {
+        if (m_bWasCleared && !force) return;
+        EF_SetState(GS_DEPTHWRITE);
+        float rgba[4] = { m_vClearColor.x, m_vClearColor.y, m_vClearColor.z, 0.0f };
+        if (m_bHeatVision) rgba[0] = rgba[1] = rgba[2] = 0.0f;
+        else if (m_polygonMode == R_WIREFRAME_MODE)
+        {
+            rgba[0] = 0.25f; rgba[1] = 0.5f; rgba[2] = 1.0f;
+        }
+        if (m_frameRenderer && m_frameRenderer->QueueStockClear(!onlyDepth, true,
+                m_sbpp && m_cbpp > 16, rgba))
+            m_bWasCleared = true;
+        else if (m_frameRenderer)
+            m_frameRenderer->RequirePanelFallback();
+    }
+
+    void PrepareStockFrameState()
     {
         m_RP.m_RenderFrame++;
         m_RP.m_Flags = 0;
         m_RP.m_pPrevObject = nullptr;
         m_RP.m_FrameObject++;
+        // GL reads the camera modelview at this boundary. Object transforms
+        // belong to EF_ObjectChange and must not survive list preparation.
+        m_ViewMatrix = m_CameraMatrix;
         UpdateLegacyCameraInfo();
 
-        const int lightCount = m_RP.m_DLights[recurseLevel].Num();
+        // Light registration uses the current recursion level; render-item
+        // ranges use level - 1. These indices are intentionally different.
+        const int lightLevel = SRendItem::m_RecurseLevel;
+        const int lightLevelCount = sizeof(m_RP.m_DLights) / sizeof(m_RP.m_DLights[0]);
+        const int lightCount = lightLevel >= 0 && lightLevel < lightLevelCount ?
+            m_RP.m_DLights[lightLevel].Num() : 0;
         int lightIndex = 0;
         for (; lightIndex < lightCount; ++lightIndex)
         {
-            CDLight* light = m_RP.m_DLights[recurseLevel][lightIndex];
+            CDLight* light = m_RP.m_DLights[lightLevel][lightIndex];
             if (!light || (light->m_Flags & DLF_FAKE) || !(light->m_Flags & DLF_SUN))
                 continue;
             Vec3d direction = light->m_Origin - m_cam.GetPos();
@@ -4411,6 +9861,62 @@ private:
         }
         if (lightIndex == lightCount && IsEquivalent(m_RP.m_SunDir, Vec3d(0, 0, 0)))
             m_RP.m_SunDir = Vec3d(0, 0, 1);
+    }
+
+    void PrepareStockFlushState(CCObject* object, SShader* shader)
+    {
+        // EF_Start has already built the active light list and selected the
+        // technique. EF_Flush then filters only the dynamic-light mask; it
+        // does not rebuild that list or reselect the technique.
+        uint32_t mask = CV_r_hwlights && object ? object->m_DynLMMask : 0u;
+        const char* filter = CV_r_showlight ? CV_r_showlight->GetString() : nullptr;
+        if (filter && filter[0] != '0')
+        {
+            const int level = SRendItem::m_RecurseLevel;
+            const int levels = sizeof(m_RP.m_DLights) / sizeof(m_RP.m_DLights[0]);
+            if (level >= 0 && level < levels)
+            {
+                for (int index = 0; index < m_RP.m_DLights[level].Num() && index < 32; ++index)
+                {
+                    CDLight* light = m_RP.m_DLights[level][index];
+                    if (light && (!light->m_Name || !strstr(light->m_Name, filter)))
+                        mask &= ~(uint32_t(1) << index);
+                }
+            }
+        }
+        m_RP.m_DynLMask = mask;
+        // EF_Flush owns material clip planes. An existing capture plane is
+        // external state and must not be replaced by a material water plane.
+        if (shader && (shader->m_Flags3 & EF3_CLIPPLANE) &&
+            !(m_RP.m_PersFlags & RBPF_SETCLIPPLANE) && !m_RP.m_ClipPlaneEnabled)
+        {
+            const uint32_t mode = shader->m_Flags3 & EF3_CLIPPLANE;
+            if ((mode == EF3_CLIPPLANE_WATER_FRONT || mode == EF3_CLIPPLANE_WATER_BACK) &&
+                iSystem && iSystem->GetI3DEngine())
+            {
+                const bool back = (mode & EF3_CLIPPLANE_WATER_BACK) != 0;
+                const float height = iSystem->GetI3DEngine()->GetWaterLevel();
+                float plane[4] = { 0.0f, 0.0f, back ? -1.0f : 1.0f,
+                    back ? height : -height };
+                EF_SetClipPlane(true, plane, false);
+                m_RP.m_PersFlags |= RBPF_SETCLIPPLANE;
+            }
+        }
+        else if (shader && !(shader->m_Flags3 & EF3_CLIPPLANE) &&
+                 (m_RP.m_PersFlags & RBPF_SETCLIPPLANE))
+        {
+            EF_SetClipPlane(false, nullptr, false);
+            m_RP.m_PersFlags &= ~RBPF_SETCLIPPLANE;
+        }
+    }
+
+    int ResolveStockCullMode() const
+    {
+        if (m_RP.m_Flags & RBF_2D) return R_CULL_NONE;
+        int cull = m_activePass ? m_activeCull : m_currentCullMode;
+        if ((m_RP.m_PersFlags & RBPF_DRAWMIRROR) && cull != R_CULL_NONE)
+            cull = cull == R_CULL_BACK ? R_CULL_FRONT : R_CULL_BACK;
+        return cull;
     }
 
     static int MapStockCullMode(ECull cull)
@@ -4428,6 +9934,17 @@ private:
                         SRenderShaderResources* resources, uint32_t state, int cull,
                         bool hardwareTechniquePass = false)
     {
+        // Apply the exact EF_Flush selection before any material pass is queued.
+        if (shader)
+        {
+            const char* name = shader->m_Name.c_str();
+            if (m_RP.m_ExcludeShader &&
+                (!strcmp(m_RP.m_ExcludeShader, name) ||
+                 (m_RP.m_ExcludeShader[0] == '#' && strstr(name, m_RP.m_ExcludeShader))))
+                return;
+            if (m_RP.m_ShowOnlyShader && strcmp(m_RP.m_ShowOnlyShader, name))
+                return;
+        }
         if (m_auditFrameActive)
             CryLogAlways("Vulkan audit PASS_BEGIN frame=%d list=%d item=%d re=%p type=%d shader=%s pass=%p passType=%d hw=%d state=0x%x cull=%d opacity=%.3f texUnits=%d fog=%p object=%p objectFlags=0x%x",
                 GetFrameID(), m_auditCurrentList, m_auditCurrentItem, element,
@@ -4438,26 +9955,70 @@ private:
                 hardwareTechniquePass ? 1 : 0, state, cull, m_RP.m_fCurOpacity,
                 pass ? pass->m_TUnits.Num() : 0, m_RP.m_pFogVolume,
                 m_RP.m_pCurObject, m_RP.m_pCurObject ? m_RP.m_pCurObject->m_ObjFlags : 0);
+        // EF_FlushHW/EF_DrawGeneralPasses give the object's explicit state
+        // priority over the shader pass. Particle emitters use this to choose
+        // additive/color-based blending for RGB sprites without an alpha map.
+        // Losing it replaces their black background with an opaque square.
+        if (hardwareTechniquePass && m_RP.m_pCurObject &&
+            m_RP.m_pCurObject->m_RenderState &&
+            stricmp(static_cast<SShaderPassHW*>(pass)->m_StockFragmentProgram, "CGRCFog"))
+            state = m_RP.m_pCurObject->m_RenderState | (state & GS_STENCIL);
+        // EF_Flush applies resource overrides before state-shader overrides.
+        // A state shader can therefore select front culling even when the
+        // underlying material resource is two-sided.
+        if (resources && shader && !(shader->m_Flags2 & EF2_IGNORERESOURCESTATES) &&
+            (resources->m_ResFlags & MTLFLAG_2SIDED))
+        {
+            cull = R_CULL_NONE;
+            m_RP.m_FlagsPerFlush |= RBSI_NOCULL;
+        }
+        if (resources && shader && !(shader->m_Flags2 & EF2_IGNORERESOURCESTATES) &&
+            resources->m_AlphaRef)
+        {
+            // EF_SetResourcesState protects the material GL_GEQUAL test
+            // before pass state and render-element state are evaluated.
+            // Its actual threshold is carried separately to the fragment
+            // shader; pass alpha-test bits remain only the cached GL state.
+            m_RP.m_FlagsPerFlush |= RBSI_ALPHATEST;
+        }
         if (m_activeStateShaderState)
         {
             const SEfState& stateShader = *m_activeStateShaderState;
             if (stateShader.m_Flags & ESF_POLYLINE)
                 state |= GS_POLYLINE;
             if (stateShader.m_Flags & ESF_NOCULL)
+            {
                 cull = R_CULL_NONE;
+                m_RP.m_FlagsPerFlush |= RBSI_NOCULL;
+            }
             else if (stateShader.m_Flags & ESF_CULLFRONT)
+            {
                 cull = R_CULL_FRONT;
+                m_RP.m_FlagsPerFlush |= RBSI_NOCULL;
+            }
             if (stateShader.m_Flags & ESF_STATE)
             {
                 if (stateShader.m_State & GS_NODEPTHTEST)
+                {
                     state |= GS_NODEPTHTEST;
+                    // Install the override before protecting it: EF_SetState
+                    // otherwise preserves the previous cached depth state.
+                    m_CurState |= GS_NODEPTHTEST;
+                    m_RP.m_FlagsPerFlush |= RBSI_DEPTHTEST;
+                }
                 const uint32_t depthFuncMask = GS_DEPTHFUNC_EQUAL | GS_DEPTHFUNC_GREAT;
                 if (stateShader.m_State & depthFuncMask)
+                {
                     state = (state & ~depthFuncMask) | (stateShader.m_State & depthFuncMask);
+                    m_CurState = (m_CurState & ~depthFuncMask) |
+                        (stateShader.m_State & depthFuncMask);
+                    m_RP.m_FlagsPerFlush |= RBSI_DEPTHFUNC;
+                }
             }
         }
         EF_SetState(static_cast<int>(state));
         memset(m_stageStateOverrides, 0, sizeof(m_stageStateOverrides));
+        if (m_frameRenderer) m_frameRenderer->ResetStockLinearTexgen();
         CCObject* object = m_RP.m_pCurObject;
         if (object && CRenderer::CV_r_scissor && object->m_nScissorX2)
         {
@@ -4469,6 +10030,12 @@ private:
             SetScissor(0, 0, 0, 0);
 
         m_RP.m_RendPass++;
+        // EF_FlushHW installs the current light material before evaluating
+        // shader components. Reset it per draw so RGB/alpha generators cannot
+        // observe the material of a previous mesh or camera pass.
+        m_RP.m_pCurLightMaterial = resources ? resources->m_LMaterial :
+            (shader && (shader->m_Flags2 & EF2_USELIGHTMATERIAL) ?
+                &m_RP.m_DefLightMaterial : nullptr);
         if (element->mfGetType() == eDATA_ClearStencil)
         {
             // The NULL renderer's CREClearStencil implementation is empty.
@@ -4508,13 +10075,18 @@ private:
                 return;
             }
         }
-        // CGLRenderer::EF_SetResourcesState disables culling for two-sided
-        // materials unless the shader explicitly ignores resource states.
-        if (resources && shader && !(shader->m_Flags2 & EF2_IGNORERESOURCESTATES) &&
-            (resources->m_ResFlags & MTLFLAG_2SIDED))
-            cull = R_CULL_NONE;
         m_activePass = pass;
         m_activeResources = resources;
+        if (!hardwareTechniquePass && pass)
+        {
+            // SShaderPass::mfSetTextures ends with BindNULL(stageCount)
+            // before mfDraw. Direct TMU-binding elements must see that same
+            // boundary instead of textures retained from a previous pass.
+            const int stageCount = crymin(pass->m_TUnits.Num(), 8);
+            for (int stage = stageCount; stage < 8; ++stage)
+                m_stageTextureIds[stage] = 0;
+            if (m_TexMan) m_TexMan->m_nCurStages = stageCount;
+        }
         m_activeCull = cull;
         m_activeHardwarePassType = hardwareTechniquePass ?
             static_cast<SShaderPassHW*>(pass)->m_ePassType : eSHP_MAX;
@@ -4656,6 +10228,57 @@ private:
         SetScissor(0, 0, 0, 0);
     }
 
+    void CaptureStockLeafStatus(CRendElement* renderElement, SShader* shader,
+                               const char* status, uint32_t resolvedState = ~0u)
+    {
+#if defined(__ANDROID__) && defined(CRYVR_RENDER_PROBES)
+        if (!m_frameRenderer || m_frameRenderer->GetSceneDiagnostics().queuedDraws == 0 ||
+            !renderElement || renderElement->mfGetType() != eDATA_OcLeaf)
+            return;
+        CREOcLeaf* element = static_cast<CREOcLeaf*>(renderElement);
+        CLeafBuffer* leaf = element->m_pBuffer;
+        if (!leaf || !leaf->m_sSource) return;
+        const char* source = leaf->m_sSource;
+        SRenderShaderResources* resources = m_RP.m_pShaderResources;
+        SEfResTexture* diffuse = resources ? resources->m_Textures[EFTT_DIFFUSE] : nullptr;
+        const char* texture = diffuse ? diffuse->m_Name.c_str() : "?";
+        std::string textureLower = texture;
+        std::transform(textureLower.begin(), textureLower.end(), textureLower.begin(),
+                       [](unsigned char c) { return static_cast<char>(tolower(c)); });
+        // One bounded record per material/state; no continuous level-load log.
+        if (!strstr(source, "ceiling") && !strstr(source, "Ceiling") &&
+            !strstr(source, "moss") && !strstr(source, "Moss") &&
+            textureLower.find("concr") == std::string::npos &&
+            textureLower.find("rust_wall3") == std::string::npos &&
+            textureLower.find("shipwall") == std::string::npos &&
+            textureLower.find("support") == std::string::npos &&
+            textureLower.find("moss") == std::string::npos &&
+            !(shader && !stricmp(shader->GetName(), "templmuzzleflash_auto")))
+            return;
+        static std::vector<std::string> keys;
+        if (keys.size() >= 192) return;
+        char key[1024];
+        const CMatInfo* chunk = element->m_pChunk;
+        snprintf(key, sizeof(key), "%s|%s|%s|%s|%d+%d|%d|%x", source, texture,
+            shader ? shader->GetName() : "?", status,
+            chunk ? chunk->nFirstIndexId : -1, chunk ? chunk->nNumIndices : -1,
+            m_activeHardwarePassType, resolvedState == ~0u ? m_CurState : resolvedState);
+        if (std::find(keys.begin(), keys.end(), key) != keys.end()) return;
+        keys.push_back(key);
+        FILE* probe = fopen("/sdcard/FarCry/vulkan_surface_probe.txt",
+                            keys.size() == 1 ? "w" : "a");
+        if (!probe) return;
+        const auto& diagnostics = m_frameRenderer->GetSceneDiagnostics();
+        fprintf(probe, "%s rendPass=%d lm=%d queued=%u rejectInput=%u rejectVertex=%u rejectCombine=%u rejectState=%u pipelineFailed=%u error=%s\n",
+            key, m_RP.m_RendPass, m_RP.m_pCurObject ? m_RP.m_pCurObject->m_nLMId : 0,
+            diagnostics.queuedDraws, diagnostics.rejectedInput,
+            diagnostics.rejectedVertexFeature, diagnostics.rejectedCombine,
+            diagnostics.rejectedPipelineState, diagnostics.pipelineCreationFailed,
+            m_frameRenderer->GetLastError());
+        fclose(probe);
+#endif
+    }
+
     bool DrawHardwareTechniqueLeaf(CREOcLeaf* element, SShader* shader,
                                    SShaderPassHW* pass,
                                    SRenderShaderResources* resources)
@@ -4668,12 +10291,18 @@ private:
         if (shader->m_eSort == eS_TerrainLightPass || shader->m_eSort == eS_Terrain)
             updateFlags |= FHF_TERRAIN;
         if (!element->mfCheckUpdate(shader->m_VertexFormatId, updateFlags))
+        {
+            CaptureStockLeafStatus(element, shader, "update-rejected");
             return false;
+        }
 
         CLeafBuffer* leafBuffer = element->m_pBuffer->GetVertexContainer();
         if (!leafBuffer || !leafBuffer->m_pVertexBuffer ||
             !leafBuffer->m_Indices.m_VData)
+        {
+            CaptureStockLeafStatus(element, shader, "missing-buffer");
             return false;
+        }
         if (CullGeometryForLightsEnabled() && EF_IsOnlyLightPass(pass) &&
             m_RP.m_pCurLightIndices &&
             m_RP.m_pCurLightIndices != &m_RP.m_FakeLightIndices)
@@ -5667,15 +11296,18 @@ private:
                 material->shaderItem.m_pShaderResources->m_bNeedNormals)
                 updateFlags |= SHPF_NORMALS;
         }
-        if (vertexFormat < 0 || !leafElement->mfCheckUpdate(
-                vertexFormat, updateFlags | FHF_FORANIM))
+        if (vertexFormat < 0)
             return;
+        // EF_ObjectChange does not gate ProcessSkinning on this result:
+        // mfCheckUpdate can fail because indices are not ready yet, whereas
+        // skinning still needs to populate/update the animated vertex streams.
+        leafElement->mfCheckUpdate(vertexFormat, updateFlags | FHF_FORANIM);
 
         CLeafBuffer* leafBuffer = leafElement->m_pBuffer->GetVertexContainer();
-        if (!leafBuffer || !leafBuffer->m_pVertexBuffer)
+        if (!leafBuffer)
             return;
         bool forceUpdate = leafBuffer->m_UpdateFrame == GetFrameID();
-        if (leafBuffer->m_pVertexBuffer->m_bFenceSet)
+        if (leafBuffer->m_pVertexBuffer && leafBuffer->m_pVertexBuffer->m_bFenceSet)
             forceUpdate = true;
         object->m_pCharInstance->ProcessSkinning(
             Vec3(zero), object->m_Matrix, object->m_nTemplId, object->m_nLod, forceUpdate);
@@ -5761,6 +11393,36 @@ private:
     CryVR::VulkanFrameRenderer* m_frameRenderer = nullptr;
     CVulkanTexMan* m_vulkanTexMan = nullptr;
     SShaderPass* m_activePass = nullptr;
+    struct FailedBumpTextureLoad
+    {
+        std::string name;
+        std::string path;
+    };
+    std::unordered_map<const SEfResTexture*, FailedBumpTextureLoad> m_failedBumpTextureLoads;
+    struct StockGeneratedColors
+    {
+        int vertexFormat = -1;
+        std::vector<uint8_t> colors;
+    };
+    std::map<const CVertexBuffer*, StockGeneratedColors> m_stockGeneratedColors;
+    struct DrawScratch
+    {
+        std::vector<uint16_t> triangulatedQuads;
+        std::vector<byte> waterDeformedVertices;
+        std::vector<byte> waterColorVertices;
+        std::vector<struct_VERTEX_FORMAT_P3F_TEX2F> hardwareTexturedVertices;
+        std::vector<struct_VERTEX_FORMAT_P3F_COL4UB_TEX2F> terrainLowResTexturedVertices;
+        std::vector<struct_VERTEX_FORMAT_P3F_COL4UB_COL4UB_TEX2F> terrainFogLayeredTexturedVertices;
+        std::vector<struct_VERTEX_FORMAT_P3F_N_COL4UB_COL4UB_TEX2F> terrainTexturedVertices;
+        std::vector<struct_VERTEX_FORMAT_P3F_COL4UB_TEX2F> muzzleFlashVertices;
+        std::vector<uint8_t> generatedVertices;
+        std::vector<float> lightmapCoordinates;
+        std::vector<byte> separateUvVertices;
+        std::vector<byte> litVertices;
+    };
+    std::deque<DrawScratch> m_drawScratch;
+    size_t m_drawScratchDepth = 0;
+    int m_stockColorCacheFrame = -1;
     EShaderPassType m_activeHardwarePassType = eSHP_MAX;
     bool m_activePolygonOffset = false;
     float m_activePolygonOffsetFactor = -1.0f;
@@ -5792,6 +11454,7 @@ private:
     int m_fontTextureId = -1;
     bool m_fontRenderingState = false;
     bool m_frameOpen = false;
+    bool m_collectingShadowCasters = false;
     bool m_auditFrameActive = false;
     int m_auditCurrentList = -1;
     int m_auditCurrentItem = -1;
@@ -5803,11 +11466,15 @@ private:
     std::vector<std::array<float, 16>> m_screenMatrixStack;
     std::vector<ScreenMatrixState> m_screenMatrixModes;
     int m_currentTextureId = 0;
+    std::string m_lastTextureFilter;
+    int m_lastTextureAnisotropy = -1;
     std::map<int, int> m_textureWrapOverrides;
     bool m_forceCurrentTextureForClientDraw = false;
+    int m_flatLightmapNormalTextureId = 0;
     float m_screenSpaceWidth = 800.0f;
     float m_screenSpaceHeight = 600.0f;
     int m_stageTextureIds[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    float m_stageLodBias[8]{};
     int m_stageColorOps[8] = { eCO_MODULATE, eCO_MODULATE, eCO_MODULATE, eCO_MODULATE,
                                eCO_MODULATE, eCO_MODULATE, eCO_MODULATE, eCO_MODULATE };
     int m_stageAlphaOps[8] = { eCO_MODULATE, eCO_MODULATE, eCO_MODULATE, eCO_MODULATE,
@@ -5818,6 +11485,8 @@ private:
                                      DEF_TEXARG1, DEF_TEXARG1, DEF_TEXARG1, DEF_TEXARG1 };
     uint8_t m_stageStateOverrides[8] = {};
     bool m_fogEnabled = false;
+    FILE* m_sceneTrace = nullptr;
+    unsigned m_sceneTraceLines = 0;
     float m_fogDensity = 0.0f;
     float m_fogStart = 0.0f;
     float m_fogEnd = 1.0f;

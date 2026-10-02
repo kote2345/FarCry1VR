@@ -142,6 +142,11 @@ private:
   void mfCheckAffectedFiles(const char *ShadersPath, int nCheckFile, TArray<char *>& CheckNames, TArray<char *>& AffectedFiles);
 
 public:
+  STexPic *LoadVulkanResourceTexture(const char *name, const char *path, int flags,
+    int flags2, byte type, SShader *shader, SEfResTexture *resource, float amount)
+  {
+    return mfLoadResourceTexture(name, path, flags, flags2, type, shader, resource, amount);
+  }
   char *m_pCurScript;
   ShaderMacro m_Macros;
   TArray<SLocalMacros> m_LocalMacros;
@@ -216,12 +221,13 @@ public:
   TArray<SNameAlias> m_CustomAliasNames;
 
   static SShader *m_DefaultShader;
+  // Shared by the Vulkan backend, which links the NULL common implementation.
+  static SShader *m_ShaderFogCaust;
 
 #ifndef NULL_RENDERER
   static SShader *m_ShaderVFog;
   static SShader *m_ShaderVFogCaust;
   static SShader *m_ShaderFog;
-  static SShader *m_ShaderFogCaust;
   static SShader *m_ShaderFog_FP;
   static SShader *m_ShaderFogCaust_FP;
   static SShader *m_ShaderStateNoCull;

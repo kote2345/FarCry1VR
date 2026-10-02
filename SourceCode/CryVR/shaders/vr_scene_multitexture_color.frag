@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 layout(constant_id = 0) const int alphaTestMode = 0;
 layout(constant_id = 60) const uint stage0UsesTexCoord1 = 0u;
 layout(constant_id = 1) const int stage0ColorMode = 1;
@@ -7,10 +8,10 @@ layout(constant_id = 3) const int stage1ColorMode = 1;
 layout(constant_id = 4) const int stage1AlphaMode = 1;
 layout(constant_id = 5) const uint stage0ColorArg = 0x0a1u;
 layout(constant_id = 6) const uint stage0AlphaArg = 0x0a1u;
-layout(constant_id = 7) const uint stage0Constant = 0xffffffffu;
+#define stage0Constant textureStageTransforms.textureConstants[0][0]
 layout(constant_id = 8) const uint stage1ColorArg = 0x0a1u;
 layout(constant_id = 9) const uint stage1AlphaArg = 0x0a1u;
-layout(constant_id = 10) const uint stage1Constant = 0xffffffffu;
+#define stage1Constant textureStageTransforms.textureConstants[0][1]
 layout(constant_id = 59) const uint stage1UsesTexCoord1 = 1u;
 layout(constant_id = 11) const uint hasSecondaryColor = 0u;
 layout(set = 0, binding = 0) uniform sampler2D baseColorTexture;
@@ -20,6 +21,10 @@ layout(location = 1) in vec4 vertexColor;
 layout(location = 2) in vec2 texCoord1;
 layout(location = 3) in vec4 secondaryColor;
 layout(location = 9) in vec3 clipPosition;
+layout(location = 12) in vec3 objectPosition;
+layout(location = 13) in vec3 objectNormal;
+layout(location = 14) flat in uint hasMaterialLighting;
+layout(location = 15) in vec3 stockSeparateSpecular;
 layout(set = 0, binding = 1, std140) uniform TextureStageTransforms {
     vec4 uvRow0[8]; vec4 uvRow1[8]; vec4 uvRowQ[8];
     vec4 fogColor;
@@ -30,39 +35,63 @@ layout(set = 0, binding = 1, std140) uniform TextureStageTransforms {
     vec4 primaryColorMask;
     vec4 textureLodBias;
     vec4 clipPlane;
+    vec4 objectLightPositionRadius;
+    vec4 lightColorAmbient;
+    vec4 materialAmbient;
+    vec4 shadowRow0[8];
+    vec4 shadowRow1[8];
+    vec4 shadowRow2[8];
+    vec4 shadowRow3[8];
+    vec4 shadowMapStageMask[2];
+    vec4 terrainProjectionS[8];
+    vec4 terrainProjectionT[8];
+    vec4 linearPlanes[32];
+    vec4 linearMatrixRows[32];
+    vec4 linearControls[8];
+    vec4 fixedLights[32];
+    vec4 fixedLightInfo; mat4 fixedMatrices[2]; uvec4 textureConstants[2];
 } textureStageTransforms;
+#include "scene_lighting.glsl"
 layout(location = 0) out vec4 outColor;
 vec4 sampleBaseTexture(vec2 uv) {
-    float scale = exp2(clamp(textureStageTransforms.textureLodBias.x, -16.0, 16.0));
-    return textureGrad(baseColorTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+    float scale = textureStageTransforms.textureLodBias.x;
+    vec4 sampled = textureGrad(baseColorTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+    return compareStockShadowStage(0u, baseColorTexture, sampled, objectPosition);
 }
 vec4 sampleSecondaryTexture(vec2 uv) {
-    float scale = exp2(clamp(textureStageTransforms.textureLodBias.y, -16.0, 16.0));
-    return textureGrad(secondaryTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+    float scale = textureStageTransforms.textureLodBias.y;
+    vec4 sampled = textureGrad(secondaryTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
+    return compareStockShadowStage(1u, secondaryTexture, sampled, objectPosition);
 }
 vec4 applyMaterialOverrides(vec4 c) {
     if (textureStageTransforms.materialParams.z > 0.5) c.rgb *= textureStageTransforms.materialParams.x;
     else c.a *= textureStageTransforms.materialParams.x;
-    if (textureStageTransforms.materialParams.y > 0.0 && c.a < textureStageTransforms.materialParams.y) discard;
     return c;
 }
 float radialEyeDistance(float eyeZ) {
     vec2 viewportSize = max(vec2(textureStageTransforms.uvRowQ[0].w,
                                  textureStageTransforms.uvRowQ[1].w), vec2(1.0));
-    vec2 ndc = 2.0 * gl_FragCoord.xy / viewportSize - 1.0;
+    vec2 viewportOrigin = vec2(textureStageTransforms.linearControls[2].w,
+                               textureStageTransforms.linearControls[3].w);
+    vec2 ndc = 2.0 * (gl_FragCoord.xy - viewportOrigin) / viewportSize - 1.0;
     float tangentX = mix(textureStageTransforms.uvRow0[0].w,
                          textureStageTransforms.uvRow1[0].w, (ndc.x + 1.0) * 0.5);
     float tangentY = mix(textureStageTransforms.uvRow0[1].w,
                          textureStageTransforms.uvRow1[1].w, (ndc.y + 1.0) * 0.5);
     return eyeZ * sqrt(1.0 + tangentX * tangentX + tangentY * tangentY);
 }
+float sceneFogDepth() {
+    float depthMin = textureStageTransforms.linearControls[0].w;
+    float depthMax = textureStageTransforms.linearControls[1].w;
+    return (gl_FragCoord.z - depthMin) / max(depthMax - depthMin, 1.0e-7);
+}
 vec4 applySceneFog(vec4 c) {
     if (textureStageTransforms.fogModeDensityStart.x < 0.5) return c;
     float n=textureStageTransforms.fogEndDepthRange.y, f=textureStageTransforms.fogEndDepthRange.z;
-    float d=n*f/max(f-gl_FragCoord.z*(f-n),1.0e-7);
+    float d=n*f/max(f-sceneFogDepth()*(f-n),1.0e-7);
     d=radialEyeDistance(d);
     int m=int(textureStageTransforms.fogModeDensityStart.y+0.5); float a;
-    if(m==1) a=(d-textureStageTransforms.fogModeDensityStart.w)/max(textureStageTransforms.fogEndDepthRange.x-textureStageTransforms.fogModeDensityStart.w,1.0e-6);
+    if(m==1) a=(d-textureStageTransforms.fogModeDensityStart.w)/(textureStageTransforms.fogEndDepthRange.x-textureStageTransforms.fogModeDensityStart.w);
     else if(m==2){float x=textureStageTransforms.fogModeDensityStart.z*d;a=1.0-exp(-min(x*x,80.0));}
     else a=1.0-exp(-min(textureStageTransforms.fogModeDensityStart.z*d,80.0));
     c.rgb=mix(c.rgb,textureStageTransforms.fogColor.rgb,clamp(a,0.0,1.0));return c;
@@ -102,8 +131,8 @@ vec3 combineRgb(int mode, vec3 a, vec3 b, float blendFactor, vec3 third, float a
 }
 float combineAlpha(int mode, float a, float b, float third, float blendFactor) {
     if (mode == 0) return a;
-    if (mode == 2) return a * b * 2.0;
-    if (mode == 3) return a * b * 4.0;
+    // GL EF_SetColorOp scales RGB only; alpha 2X/4X remains MODULATE.
+    if (mode == 2 || mode == 3) return a * b;
     if (mode == 6 || mode == 7) return mix(b, a, blendFactor);
     if (mode == 4) return a + b;
     if (mode == 5) return a + b - 0.5;
@@ -114,11 +143,14 @@ float combineAlpha(int mode, float a, float b, float third, float blendFactor) {
     return a * b;
 }
 void main() {
-    if (dot(vec4(clipPosition, 1.0), textureStageTransforms.clipPlane) < 0.0) discard;
+    if (stockFragmentDiscardEnabled && dot(vec4(clipPosition, 1.0), textureStageTransforms.clipPlane) < 0.0) discard;
     vec4 generatedVertexColor = vertexColor;
-    if (textureStageTransforms.materialParams.w > 0.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
+    if (textureStageTransforms.materialParams.w > 0.5 && textureStageTransforms.materialParams.w < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
     vec4 primaryColor = mix(generatedVertexColor, textureStageTransforms.primaryColor, textureStageTransforms.primaryColorMask);
-    vec2 stage0TexCoord = stage0UsesTexCoord1 != 0u ? texCoord1 : texCoord0;
+    primaryColor.rgb *= evaluateStockLighting(objectPosition, objectNormal,
+        stockTerrainStageTexCoord(1u, texCoord1, objectPosition), hasMaterialLighting);
+    vec2 stage0TexCoord = stockTerrainStageTexCoord(0u,
+        stage0UsesTexCoord1 != 0u ? texCoord1 : texCoord0, objectPosition);
     vec4 base = sampleBaseTexture(stage0TexCoord);
     vec4 env0 = unpackUnorm4x8(stage0Constant);
     vec3 s0a = sourceRgb(stage0ColorArg & 7u, base, primaryColor, primaryColor, env0);
@@ -134,8 +166,26 @@ void main() {
                          combineAlpha(stage0AlphaMode, s0aa, s0ab, s0ac,
                                       stage0AlphaMode == 6 ? primaryColor.a : base.a));
     previous = clamp(previous, 0.0, 1.0);
-    vec2 stage1TexCoord = stage1UsesTexCoord1 != 0u ? texCoord1 : texCoord0;
+    vec2 stage1TexCoord = stockTerrainStageTexCoord(1u,
+        stage1UsesTexCoord1 != 0u ? texCoord1 : texCoord0, objectPosition);
     vec4 layer = sampleSecondaryTexture(stage1TexCoord);
+    if (stockTerrainShadowProgram()) {
+        // CGRCTerrainShadow: the first sampler is terrain albedo; the second
+        // is the projected LEQUAL shadow comparison. OpenGL writes
+        // (albedo * vertex-light * distance fade * Ambient) to RGB and
+        // (1 - visible) to alpha, then blends with SRC_ALPHA/ONE_MINUS_SRC_ALPHA.
+        vec3 objectColor = textureStageTransforms.terrainProjectionS[3].rgb;
+        float distanceFade = min(
+            length(objectPosition - textureStageTransforms.terrainProjectionS[2].xyz) *
+                textureStageTransforms.terrainProjectionS[3].w,
+            1.0);
+        objectColor = mix(objectColor, vec3(1.0), distanceFade);
+        vec3 vertexLighting = vertexColor.aaa * objectColor;
+        vec3 encodedColor = base.rgb * vertexLighting *
+                            textureStageTransforms.materialAmbient.rgb * 2.0;
+        outColor = vec4(encodedColor, 1.0 - layer.b);
+        return;
+    }
     vec4 env1 = unpackUnorm4x8(stage1Constant);
     vec3 s1a = sourceRgb(stage1ColorArg & 7u, layer, primaryColor, previous, env1);
     vec3 s1b = sourceRgb((stage1ColorArg >> 3) & 7u, layer, primaryColor, previous, env1);
@@ -150,12 +200,49 @@ void main() {
                       combineAlpha(stage1AlphaMode, s1aa, s1ab, s1ac,
                                    stage1AlphaMode == 6 ? primaryColor.a : layer.a));
     color = clamp(color, 0.0, 1.0);
-    color = applyMaterialOverrides(color);
-    if (textureStageTransforms.materialParams.y <= 0.0) {
-        if (alphaTestMode == 1 && !(color.a > 0.0)) discard;
-        if (alphaTestMode == 2 && !(color.a < 0.5)) discard;
-        if (alphaTestMode == 3 && !(color.a >= 0.5)) discard;
-        if (alphaTestMode == 4 && !(color.a >= 0.25)) discard;
+    if (stockTerrainAmbientMode() == 2)
+        color = vec4(base.rgb * layer.rgb * textureStageTransforms.materialAmbient.rgb * 2.0,
+                     base.a * layer.a);
+    else if (stockTerrainAmbientMode() == 3)
+        color = vec4(layer.rgb - vec3(0.5) +
+                     base.rgb * textureStageTransforms.materialAmbient.rgb * 2.0,
+                     base.a);
+    if (stockTerrainOnlyCount() == 2) {
+        vec3 detail0 = mix(vec3(0.5), base.rgb, vertexColor.b);
+        vec3 detail1 = mix(vec3(0.5), layer.rgb, secondaryColor.b);
+        color = vec4(detail0 * detail1 * 2.0, 1.0);
     }
-    outColor = applySceneFog(color);
+    if (textureStageTransforms.materialParams.w > 2.5 && stockTerrainOnlyCount() == 0) {
+        vec3 detail0 = mix(vec3(0.5), base.rgb, secondaryColor.r);
+        vec3 detail1 = mix(vec3(0.5), layer.rgb, secondaryColor.g);
+        outColor = vec4(detail0 * detail1 * 2.0, 1.0);
+        return;
+    }
+    if (textureStageTransforms.fogEndDepthRange.w > 0.5 && stockTerrainAmbientMode() == 0) {
+        // The stock ambient lightmap pass uses the base texture and adds the
+        // baked irradiance to material/object ambient. This pass commonly has
+        // exactly two texture stages, so it selects this shader rather than
+        // the four-stage variant.
+        color.rgb = base.rgb *
+            (textureStageTransforms.materialAmbient.rgb * primaryColor.rgb +
+             layer.rgb * textureStageTransforms.fogEndDepthRange.w);
+        color.a = previous.a;
+    }
+    else if (stockTerrainProgram() && stockTerrainLayerCount() == 0 &&
+             stockTerrainOnlyCount() == 0 && stockTerrainAmbientMode() == 0) {
+        color.rgb *= textureStageTransforms.materialAmbient.rgb;
+    }
+    if (stockTerrainLayerCount() > 0) {
+        color.rgb = base.rgb * primaryColor.rgb * 2.0 * stockTerrainDetail(layer.rgb, secondaryColor.r);
+        // CGRCTerrain_NLayers multiplies the base albedo by the shader's
+        // Ambient parameter before its HDR x2 encoding and detail layers.
+        color.rgb *= textureStageTransforms.materialAmbient.rgb;
+        color.a = base.a;
+    }
+    color = applyMaterialOverrides(color);
+    if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(color.a, textureStageTransforms.materialParams.y, alphaTestMode)) discard;
+    color.rgb += stockSeparateSpecular;
+    if (textureStageTransforms.materialAmbient.w > 1.5)
+        color.rgb = clamp(color.rgb, 0.0, 1.0);
+    outColor = stockTerrainProgram() ? color : applySceneFog(color);
 }
