@@ -4308,7 +4308,8 @@ public:
             }
         }
 
-        std::vector<const SDeform*> stockDeforms;
+        std::vector<const SDeform*>& stockDeforms = m_stockDeformScratch;
+        stockDeforms.clear();
         if (m_activePass && m_RP.m_pShader && m_RP.m_pShader->m_Deforms)
             for (int index = 0; index < m_RP.m_pShader->m_Deforms->Num(); ++index)
                 stockDeforms.push_back(&m_RP.m_pShader->m_Deforms->Get(index));
@@ -5510,9 +5511,17 @@ public:
                 materialLighting[4] = materialLighting[5] = materialLighting[6] = 0.0f;
         }
 
-        std::vector<std::array<float, 19>> lightPasses;
-        std::vector<std::array<int, 2>> lightPassSpecularOcclusion;
-        std::vector<bool> ambientOnlyLightPasses;
+        // DrawBuffer is called once for every material draw. Keep the
+        // translated-light scratch storage on the renderer so those draws do
+        // not allocate three fresh vectors each time. The storage is only
+        // consumed synchronously while this DrawBuffer call is active.
+        std::vector<std::array<float, 19>>& lightPasses = m_lightPassScratch;
+        std::vector<std::array<int, 2>>& lightPassSpecularOcclusion =
+            m_lightPassSpecularOcclusionScratch;
+        std::vector<bool>& ambientOnlyLightPasses = m_ambientOnlyLightPassScratch;
+        lightPasses.clear();
+        lightPassSpecularOcclusion.clear();
+        ambientOnlyLightPasses.clear();
         const auto appendLightPass = [&](const std::array<float, 19>& parameters,
                                          int occlusionTextureId = 0,
                                          int occlusionChannel = -1,
@@ -9084,8 +9093,8 @@ public:
                     BuildStockFogTexgen(detailFogTexgen, false);
                     m_RP.m_pFogVolume = savedFogVolume;
                     const float* fogPlane = detailFogTexgen.planes[0];
-                    std::vector<float> detailFogCoordinates(
-                        static_cast<size_t>(finalVertexCount) * 2u);
+                    std::vector<float>& detailFogCoordinates = m_detailFogCoordinatesScratch;
+                    detailFogCoordinates.resize(static_cast<size_t>(finalVertexCount) * 2u);
                     for (uint32_t vertex = 0; vertex < finalVertexCount; ++vertex)
                     {
                         const float* position = reinterpret_cast<const float*>(
@@ -11475,6 +11484,11 @@ private:
     float m_screenSpaceHeight = 600.0f;
     int m_stageTextureIds[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
     float m_stageLodBias[8]{};
+    std::vector<const SDeform*> m_stockDeformScratch;
+    std::vector<float> m_detailFogCoordinatesScratch;
+    std::vector<std::array<float, 19>> m_lightPassScratch;
+    std::vector<std::array<int, 2>> m_lightPassSpecularOcclusionScratch;
+    std::vector<bool> m_ambientOnlyLightPassScratch;
     int m_stageColorOps[8] = { eCO_MODULATE, eCO_MODULATE, eCO_MODULATE, eCO_MODULATE,
                                eCO_MODULATE, eCO_MODULATE, eCO_MODULATE, eCO_MODULATE };
     int m_stageAlphaOps[8] = { eCO_MODULATE, eCO_MODULATE, eCO_MODULATE, eCO_MODULATE,
