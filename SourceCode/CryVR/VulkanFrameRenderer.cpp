@@ -1846,6 +1846,8 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
     draw.polygonOffsetUnits = polygonOffsetUnits;
     if (clipPlane)
         std::memcpy(draw.clipPlane, clipPlane, sizeof(draw.clipPlane));
+    else
+        std::fill(draw.clipPlane, draw.clipPlane + 4, 0.0f);
     if (reflectionModelView && reflectionClipPlane)
     {
         std::memcpy(draw.reflectionModelView, reflectionModelView,
@@ -1971,6 +1973,16 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
             setStageUvTransform(stage + 4, textureStages4To7[stage]);
     if (materialLighting)
         std::memcpy(draw.materialLighting, materialLighting, sizeof(draw.materialLighting));
+    else
+    {
+        static const float defaultMaterialLighting[19] = {
+            -0.35f, 0.72f, 0.60f, 0.0f,
+            1.0f, 1.0f, 1.0f, 1.0f,
+            1.0f, 1.0f, 1.0f, 1.0f, 0.0f
+        };
+        std::memcpy(draw.materialLighting, defaultMaterialLighting,
+                    sizeof(draw.materialLighting));
+    }
     std::memcpy(draw.lightingConstants, draw.materialLighting, sizeof(draw.lightingConstants));
     draw.lightingConstants[11] = stockLightingMode;
     draw.textureConstants[0] = textureStage0Constant;
@@ -2019,8 +2031,12 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
     }
     if (primaryColor)
         std::memcpy(draw.primaryColor, primaryColor, sizeof(draw.primaryColor));
+    else
+        std::fill(draw.primaryColor, draw.primaryColor + 4, 1.0f);
     if (primaryColorMask)
         std::memcpy(draw.primaryColorMask, primaryColorMask, sizeof(draw.primaryColorMask));
+    else
+        std::fill(draw.primaryColorMask, draw.primaryColorMask + 4, 0.0f);
     draw.invertVertexRgb = invertVertexRgb;
     draw.waterEffect = waterEffect;
     draw.directionalLightmap = directionalLightmap && useSecondTexture &&
@@ -2418,8 +2434,11 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                 a.stage1AlphaArg != b.stage1AlphaArg || a.stage1Constant != b.stage1Constant ||
                 std::memcmp(a.textureConstants, b.textureConstants, sizeof(a.textureConstants)) != 0 ||
                 std::memcmp(a.modelView, b.modelView, sizeof(a.modelView)) != 0 ||
-                std::memcmp(a.reflectionModelView, b.reflectionModelView, sizeof(a.reflectionModelView)) != 0 ||
-                std::memcmp(a.reflectionClipPlane, b.reflectionClipPlane, sizeof(a.reflectionClipPlane)) != 0 ||
+                (a.hasWaterReflectionTransform &&
+                 (std::memcmp(a.reflectionModelView, b.reflectionModelView,
+                              sizeof(a.reflectionModelView)) != 0 ||
+                  std::memcmp(a.reflectionClipPlane, b.reflectionClipPlane,
+                              sizeof(a.reflectionClipPlane)) != 0)) ||
                 std::memcmp(a.textureMatrix0, b.textureMatrix0, sizeof(a.textureMatrix0)) != 0 ||
                 std::memcmp(a.textureMatrix1, b.textureMatrix1, sizeof(a.textureMatrix1)) != 0 ||
                 std::memcmp(a.textureTransformRows, b.textureTransformRows,
@@ -4118,7 +4137,8 @@ bool VulkanFrameRenderer::QueueStockClear(bool color, bool depth, bool stencil, 
 {
     if (!m_frameActive || !m_frame.shouldRender || !m_frame.viewsValid)
         return false;
-    StockDraw clear;
+    m_stockDraws.emplace_back();
+    StockDraw& clear = m_stockDraws.back();
     clear.shadowMapTextureId = m_stockShadowMapTextureId;
     clear.clearDepth = depth;
     clear.clearColor = color;
@@ -4128,7 +4148,6 @@ bool VulkanFrameRenderer::QueueStockClear(bool color, bool depth, bool stencil, 
     else std::memcpy(clear.clearRgba, m_stockClearColor, sizeof(m_stockClearColor));
     clear.scissorEnabled = m_stockScissorEnabled;
     clear.scissor = m_stockScissor;
-    m_stockDraws.push_back(clear);
     return true;
 }
 
@@ -4140,12 +4159,12 @@ bool VulkanFrameRenderer::QueueStockClearStencil()
                             m_depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT;
     if (!hasStencil)
         return true;
-    StockDraw clear;
+    m_stockDraws.emplace_back();
+    StockDraw& clear = m_stockDraws.back();
     clear.shadowMapTextureId = m_stockShadowMapTextureId;
     clear.clearStencil = true;
     clear.scissorEnabled = m_stockScissorEnabled;
     clear.scissor = m_stockScissor;
-    m_stockDraws.push_back(clear);
     return true;
 }
 
