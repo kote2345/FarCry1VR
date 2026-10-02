@@ -5765,6 +5765,31 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
         scissor.extent.height = m_swapchain.height;
         m_cmdSetViewport(commandBuffer, 0, 1, &viewport);
         m_cmdSetScissor(commandBuffer, 0, 1, &scissor);
+        VkViewport boundViewport = viewport;
+        VkRect2D boundScissor = scissor;
+        const auto sameViewport = [](const VkViewport& a, const VkViewport& b)
+        {
+            return a.x == b.x && a.y == b.y && a.width == b.width &&
+                a.height == b.height && a.minDepth == b.minDepth &&
+                a.maxDepth == b.maxDepth;
+        };
+        const auto sameScissor = [](const VkRect2D& a, const VkRect2D& b)
+        {
+            return a.offset.x == b.offset.x && a.offset.y == b.offset.y &&
+                a.extent.width == b.extent.width && a.extent.height == b.extent.height;
+        };
+        const auto setViewport = [&](const VkViewport& next)
+        {
+            if (sameViewport(boundViewport, next)) return;
+            m_cmdSetViewport(commandBuffer, 0, 1, &next);
+            boundViewport = next;
+        };
+        const auto setScissor = [&](const VkRect2D& next)
+        {
+            if (sameScissor(boundScissor, next)) return;
+            m_cmdSetScissor(commandBuffer, 0, 1, &next);
+            boundScissor = next;
+        };
         // Three degree of freedom camera: keep current head orientation,
         // but anchor translation to the initial head position. Rebuild each
         // eye around that anchor to preserve stereo separation (IPD).
@@ -5796,6 +5821,9 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
         float cachedNear = -1.0f, cachedFar = -1.0f;
         VkPipeline boundScenePipeline = VK_NULL_HANDLE;
         VkBuffer boundIndexBuffer = VK_NULL_HANDLE;
+        VkBuffer boundVertexBuffers[3]{};
+        VkDeviceSize boundVertexOffsets[3]{};
+        uint32_t boundVertexBindingCount = 0;
         VkDescriptorSet boundTextureSets[8]{};
         uint32_t boundTextureSetCount = 0;
         bool waterSnapshotTaken = false;
@@ -5887,10 +5915,10 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 continue;
             }
             const VkRect2D drawScissor = draw.scissorEnabled ? draw.scissor : scissor;
-            m_cmdSetScissor(commandBuffer, 0, 1, &drawScissor);
+            setScissor(drawScissor);
             if (!(draw.viewport.width > 0.0f) || !(draw.viewport.height > 0.0f))
                 continue;
-            m_cmdSetViewport(commandBuffer, 0, 1, &draw.viewport);
+            setViewport(draw.viewport);
             const int waterMode = static_cast<int>(draw.terrainProjectionRows[0][7][3] + 0.5f);
             const bool waterRefraction = draw.waterEffect && (waterMode == 2 || waterMode == 4);
             const bool waterReflection = draw.waterEffect && waterMode == 6 &&
@@ -5991,10 +6019,13 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 {
                     boundScenePipeline = VK_NULL_HANDLE;
                     boundIndexBuffer = VK_NULL_HANDLE;
+                    boundVertexBindingCount = 0;
                     boundTextureSetCount = 0;
                 }
                 m_cmdSetViewport(commandBuffer, 0, 1, &draw.viewport);
                 m_cmdSetScissor(commandBuffer, 0, 1, &drawScissor);
+                boundViewport = draw.viewport;
+                boundScissor = drawScissor;
                 target.waterCopyInitialized[viewIndex] = true;
                 waterSnapshotTaken = true;
             }
@@ -6328,18 +6359,35 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
             const VkDeviceSize offsets[3] = {
                 draw.vertexBufferOffset, 0, draw.lightmapTexCoordOffset
             };
+            VkBuffer vertexBuffers[3] = {};
+            uint32_t vertexBindingCount = 1;
             if (draw.tangentBuffer || draw.lightmapTexCoordBuffer)
             {
-                const VkBuffer vertexBuffers[3] = {
-                    draw.vertexBuffer,
-                    draw.tangentBuffer ? draw.tangentBuffer : draw.vertexBuffer,
-                    draw.lightmapTexCoordBuffer ? draw.lightmapTexCoordBuffer : draw.vertexBuffer
-                };
-                const uint32_t bindingCount = draw.lightmapTexCoordBuffer ? 3u : 2u;
-                m_cmdBindVertexBuffers(commandBuffer, 0, bindingCount, vertexBuffers, offsets);
+                vertexBuffers[0] = draw.vertexBuffer;
+                vertexBuffers[1] = draw.tangentBuffer ? draw.tangentBuffer : draw.vertexBuffer;
+                vertexBuffers[2] = draw.lightmapTexCoordBuffer ?
+                    draw.lightmapTexCoordBuffer : draw.vertexBuffer;
+                vertexBindingCount = draw.lightmapTexCoordBuffer ? 3u : 2u;
             }
             else
-                m_cmdBindVertexBuffers(commandBuffer, 0, 1, &draw.vertexBuffer, offsets);
+                vertexBuffers[0] = draw.vertexBuffer;
+            bool vertexBindingsUnchanged =
+                boundVertexBindingCount == vertexBindingCount;
+            for (uint32_t binding = 0; binding < vertexBindingCount; ++binding)
+                vertexBindingsUnchanged = vertexBindingsUnchanged &&
+                    boundVertexBuffers[binding] == vertexBuffers[binding] &&
+                    boundVertexOffsets[binding] == offsets[binding];
+            if (!vertexBindingsUnchanged)
+            {
+                m_cmdBindVertexBuffers(commandBuffer, 0, vertexBindingCount,
+                                       vertexBuffers, offsets);
+                for (uint32_t binding = 0; binding < vertexBindingCount; ++binding)
+                {
+                    boundVertexBuffers[binding] = vertexBuffers[binding];
+                    boundVertexOffsets[binding] = offsets[binding];
+                }
+                boundVertexBindingCount = vertexBindingCount;
+            }
             if (boundIndexBuffer != draw.indexBuffer)
             {
                 m_cmdBindIndexBuffer(commandBuffer, draw.indexBuffer, 0, VK_INDEX_TYPE_UINT16);
