@@ -1,3 +1,7 @@
+// Program modes/masks are invariant within a pipeline, unlike time, light
+// colors and texture matrices. Defaults retain the uniform-driven path.
+layout(constant_id = 67) const uint stockWaterProgram = 0u;
+layout(constant_id = 68) const uint stockTerrainLayerMask = 0xffffffffu;
 layout(set = 0, binding = 1, std140) uniform TextureStageTransforms {
     vec4 uvRow0[8]; vec4 uvRow1[8]; vec4 uvRowQ[8];
     vec4 fogColor;
@@ -22,5 +26,5 @@ layout(set = 0, binding = 1, std140) uniform TextureStageTransforms {
     vec4 linearMatrixRows[32];
     vec4 linearControls[8];
     vec4 fixedLights[32];
-    vec4 fixedLightInfo; mat4 fixedMatrices[2]; uvec4 textureConstants[2];
+    vec4 fixedLightInfo; mat4 fixedMatrices[2]; uvec4 textureConstants[2]; vec4 fogEye1Ray;
 } scene;

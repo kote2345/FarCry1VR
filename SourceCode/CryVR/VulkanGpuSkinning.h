@@ -32,7 +32,7 @@ public:
     void Complete(uint32_t slot);
 private:
     struct Mesh { VulkanBuffer input; uint32_t vertexCount, linksWordOffset, lastFrame, requiredBones; };
-    struct Pose { uint64_t meshKey; uint32_t paletteOffset, resultWordOffset; VkDescriptorSet descriptor; };
+    struct Pose { uint64_t meshKey; uint32_t paletteOffset, resultWordOffset, boneCount; VkDescriptorSet descriptor; };
     struct Patch { VkBuffer destination; uint32_t constants[8]; VkDescriptorSet descriptor; uint64_t shadowKey; };
     struct Binding { uint32_t pose, remapOffset, count; uint64_t shadowKey; uint32_t shadowFirst = 0; };
     struct ShadowMesh { VulkanBuffer input; uint32_t faces, edges, lastFrame; };

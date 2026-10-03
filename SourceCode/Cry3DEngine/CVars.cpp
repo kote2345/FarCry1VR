@@ -43,7 +43,7 @@ void CVars::Init()
 {
   // Ints
 	INIT_CVAR_CHEAT(e_allow_cvars_serialization,	1, "If set to zero - will not save cvars to cfg file");
-  INIT_CVAR_PUBL_(e_detail_objects,							1, "Activates drawing of detail objects");
+  INIT_CVAR_PUBL_(e_detail_objects,							1, "Activates drawing of terrain detail objects (grass)");
   INIT_CVAR_CHEAT(e_fog,												1, "Activates distance based fog");
   INIT_CVAR_PUBL_(e_motion_blur,								0, "Activates motion blur, values from 1 to 7 will change blur type");
   INIT_CVAR_SER_R(e_beach,											1, "Activates drawing of shore on the border of the ocean");
@@ -61,6 +61,7 @@ void CVars::Init()
   INIT_CVAR_CHEAT(e_entities_debug,							0, "Debug");
   INIT_CVAR_CHEAT(e_sky_box,										1, "Activates drawing of skybox and moving cloud layers");
   INIT_CVAR_CHEAT(e_terrain,										1, "Activates drawing of terain ground");
+  INIT_CVAR_PUBL_(e_terrain_grass,							1, "Activates drawing of grass vegetation placed on terrain");
   INIT_CVAR_CHEAT(e_terrain_debug,							0, "Debug");
   INIT_CVAR_SER_R(e_shadow_maps,								1, "Activates drawing of shadow maps");
   INIT_CVAR_SER_R(e_shadow_maps_from_static_objects,1, "Activates drawing of shadow maps from distributed objects");
@@ -74,6 +75,11 @@ void CVars::Init()
   INIT_CVAR_CHEAT(e_out_space,									0, "Debug");
   INIT_CVAR_CHEAT(e_sun,												1, "Activates sun light source");
   INIT_CVAR_CHEAT(e_terrain_merge_far_sectors,	1, "Render far heightmap sectors as one mesh");
+#if defined(ANDROID)
+  INIT_CVAR_CHEAT(e_terrain_merge_far_sectors_distance,	384, "Distance at which far terrain sectors merge; raise to restore detail");
+#else
+  INIT_CVAR_CHEAT(e_terrain_merge_far_sectors_distance,	512, "Distance at which far terrain sectors merge");
+#endif
   INIT_CVAR_CHEAT(e_terrain_texture_mipmaps,		0, "Debug");
   INIT_CVAR_CHEAT(e_timedemo_frames,						0, "Will quit appication in X number of frames, r_DisplayInfo must be also enabled");
   INIT_CVAR_CHEAT(e_timedemo_milliseconds,			0, "Will quit appication in X number of milliseconds");
@@ -159,6 +165,11 @@ void CVars::Init()
 	INIT_CVAR_PUBL_(e_shadow_maps_receiving,			1, "Allow shadow maps receiving by brushes, vegetation and entities");
 
   // Floats
+#if defined(__ANDROID__)
+  INIT_CVAR_PUBL_(e_vegetation_sprites_force, 0, "Diagnostic: force available vegetation sprites from one metre; 0 restores normal LOD switching");
+#else
+  INIT_CVAR_PUBL_(e_vegetation_sprites_force, 0, "Diagnostic: force available vegetation sprites from one metre; 0 restores normal LOD switching");
+#endif
   INIT_CVAR_PUBL_(e_vegetation_sprites_min_distance, 8.0f, "Sets minimal distance when distributed object can be replaced with sprite");
   INIT_CVAR_PUBL_(e_rain_amount,           0.0f, "Values between 0 and 1 controls density of the rain");
   INIT_CVAR_SER__(e_vegetation_sprites_distance_ratio, 1.0f, "Allows changing distance on what vegetation switch into sprite");

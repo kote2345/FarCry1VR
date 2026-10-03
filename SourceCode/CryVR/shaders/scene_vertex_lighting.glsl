@@ -33,7 +33,7 @@ vec3 evaluateStockVertexLighting(vec3 objectPosition, vec3 objectNormal,
             direction = normalize(direction);
             float nDotL = dot(normal, direction);
             primary += diffuse.rgb * max(nDotL, 0.0) * attenuation;
-            if (nDotL > 0.0)
+            if (nDotL > 0.0 && any(notEqual(specularColor.rgb, vec3(0.0))))
                 specular += specularColor.rgb * attenuation *
                     pow(max(dot(normal, normalize(direction + viewer)), 0.0),
                         clamp(specularColor.w, 0.0, 128.0));
@@ -58,16 +58,18 @@ vec3 evaluateStockVertexLighting(vec3 objectPosition, vec3 objectNormal,
     float normalDotLight = dot(normal, lightVector);
     vec3 diffuse = max(textureStageTransforms.lightColorAmbient.rgb, vec3(0.0)) *
                    max(normalDotLight, 0.0) * attenuation;
-    vec3 viewDirection = normalize(vec3(textureStageTransforms.uvRow0[5].w,
-                                        textureStageTransforms.uvRow1[5].w,
-                                        textureStageTransforms.uvRowQ[5].w));
-    vec3 halfVector = normalize(lightVector + viewDirection);
-    float shininess = clamp(textureStageTransforms.lightColorAmbient.w, 0.0, 128.0);
-    float specularFactor = normalDotLight > 0.0 ?
-        pow(max(dot(normal, halfVector), 0.0), shininess) : 0.0;
     vec3 specularColor = vec3(textureStageTransforms.uvRow0[4].w,
                               textureStageTransforms.uvRow1[4].w,
                               textureStageTransforms.uvRowQ[4].w);
-    separateSpecular = clamp(specularColor * specularFactor * attenuation, 0.0, 1.0);
+    if (normalDotLight > 0.0 && any(notEqual(specularColor, vec3(0.0))))
+    {
+        vec3 viewDirection = normalize(vec3(textureStageTransforms.uvRow0[5].w,
+                                            textureStageTransforms.uvRow1[5].w,
+                                            textureStageTransforms.uvRowQ[5].w));
+        vec3 halfVector = normalize(lightVector + viewDirection);
+        float shininess = clamp(textureStageTransforms.lightColorAmbient.w, 0.0, 128.0);
+        float specularFactor = pow(max(dot(normal, halfVector), 0.0), shininess);
+        separateSpecular = clamp(specularColor * specularFactor * attenuation, 0.0, 1.0);
+    }
     return clamp(ambient + diffuse, 0.0, 1.0);
 }

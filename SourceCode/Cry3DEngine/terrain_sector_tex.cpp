@@ -17,6 +17,7 @@
 #include "terrain_sector.h"
 #include "terrain.h"
 #include "ObjMan.h"
+#include "TerrainTextureStreamer.h"
 
 // set texture for sector
 void CSectorInfo::SetTextures(bool bMakeUncompressedForEditing)
@@ -59,14 +60,16 @@ void CSectorInfo::SetTextures(bool bMakeUncompressedForEditing)
 				return;
 			}
 
-			m_pTerrain->m_nUploadsInFrame++;
-
 			if(m_nTextureID != m_nLowLodTextureID)
 				GetLog()->Log("CSectorInfo::SetTextureAndLOD: m_nTextureID != m_nLowLodTextureID");
 		}
 
-    m_cTextureMML = m_cNewTextMML; 
-    m_nTextureID = MakeSectorTextureDDS( GetSecIndex(), m_cTextureMML, bMakeUncompressedForEditing );
+    const int newTexture = MakeSectorTextureDDS(GetSecIndex(), m_cNewTextMML, bMakeUncompressedForEditing);
+    // Pending reads must retain the old texture and LOD, including on failure.
+    if (!newTexture) return;
+    if (!m_bLockTexture) ++m_pTerrain->m_nUploadsInFrame;
+    m_cTextureMML = m_cNewTextMML;
+    m_nTextureID = newTexture;
   
     if(m_pTerrain->GetCVars()->e_terrain_log) 
       GetLog()->Log("tex loaded %d(%d)", GetSecIndex(), m_cTextureMML);
@@ -107,6 +110,15 @@ int CSectorInfo::MakeSectorTextureDDS( int sec_id, int nMipMapLevelToLoad, bool 
     GetLog()->Log("  SectorTextureDataSizeBytes = %d", m_pTerrain->m_nSectorTextureDataSizeBytes);
 
     m_pTerrain->m_ucpTmpTexBuffer = new uchar [m_pTerrain->m_nSectorTextureDataSizeBytes];
+#if defined(__ANDROID__)
+    // Do not bypass an archive override with a different loose copy.
+    if (!GetSystem()->GetIPak()->GetFileArchivePath(m_pTerrain->m_fpTerrainTextureFile))
+    {
+        char realPath[ICryPak::g_nMaxPath];
+        GetSystem()->GetIPak()->AdjustFileName(Get3DEngine()->GetLevelFilePath("terrain\\cover.ctc"), realPath, 0);
+        m_pTerrain->m_pTextureStreamer = new TerrainTextureStreamer(realPath);
+    }
+#endif
   }
 
   if(!m_pTerrain->m_fpTerrainTextureFile)
@@ -135,11 +147,26 @@ int CSectorInfo::MakeSectorTextureDDS( int sec_id, int nMipMapLevelToLoad, bool 
 
 	assert(m_pTerrain->m_nSectorTextureDataSizeBytes >= (GetCVars()->e_terrain_texture_mipmaps ? nDataSize : nTexSize*nTexSize/2));
 
+  // Detailed sector reads can finish on a later frame. The low-resolution
+  // fallback stays available; editing and archive-only data retain their path.
+  const unsigned bytesToRead = GetCVars()->e_terrain_texture_mipmaps ? nDataSize : nTexSize*nTexSize/2;
+  bool asyncReady = false;
+  if (!bMakeUncompressedForEditing && nMipMapLevelToLoad < MAX_TEX_MML_LEVEL + GetCVars()->e_terrain_texture_mip_offset &&
+      m_pTerrain->m_pTextureStreamer && m_pTerrain->m_pTextureStreamer->Available())
+  {
+      const int status = m_pTerrain->m_pTextureStreamer->Read(file_offset, bytesToRead, m_pTerrain->m_ucpTmpTexBuffer);
+      if (!status) return 0;
+      asyncReady = status > 0;
+  }
   // read texture
+  if (!asyncReady)
+  {
   GetSystem()->GetIPak()->FSeek( m_pTerrain->m_fpTerrainTextureFile, file_offset, SEEK_SET );
   INT_PTR readed = GetSystem()->GetIPak()->FRead(m_pTerrain->m_ucpTmpTexBuffer, 1,		//AMD Port
     GetCVars()->e_terrain_texture_mipmaps ? nDataSize : nTexSize*nTexSize/2, 
     m_pTerrain->m_fpTerrainTextureFile);
+    if (readed != bytesToRead) return 0;
+  }
 
   // no reason to use update texture instead create since size is always diferent
 /*  int nTexID = GetRenderer()->DownLoadToVideo Memory(m_pTerrain->m_ucpTmpTexBuffer,
@@ -148,6 +175,26 @@ int CSectorInfo::MakeSectorTextureDDS( int sec_id, int nMipMapLevelToLoad, bool 
     GetCVars()->e_terrain_texture_mipmaps ? FILTER_BILINEAR : FILTER_LINEAR);*/
 
   int nTexID = m_pTerrain->m_pTexturePool->MakeTexture(m_pTerrain->m_ucpTmpTexBuffer, nTexSize, this, bMakeUncompressedForEditing);
+
+  // Request nearby detail as soon as its low-resolution fallback is loaded,
+  // before the renderer starts requesting the detailed LOD. No upload here.
+  if (nTexID && !bMakeUncompressedForEditing && m_fDistance < 256.f &&
+      nMipMapLevelToLoad >= MAX_TEX_MML_LEVEL + GetCVars()->e_terrain_texture_mip_offset &&
+      m_pTerrain->m_pTextureStreamer && m_pTerrain->m_pTextureStreamer->Available())
+  {
+      int detailOffset = 4 + sec_id * m_pTerrain->m_nSectorTextureDataSizeBytes;
+      int detailSize = m_pTerrain->m_nSectorTextureDataSizeBytes;
+      int detailWidth = m_pTerrain->m_nSectorTextureReadedSize;
+      for (int mip = 0; mip < GetCVars()->e_terrain_texture_mip_offset; ++mip)
+      {
+          detailOffset += detailWidth * detailWidth / 2;
+          detailSize -= detailWidth * detailWidth / 2;
+          detailWidth /= 2;
+      }
+      if (detailWidth > 0 && detailSize > 0)
+          m_pTerrain->m_pTextureStreamer->Read(detailOffset,
+              GetCVars()->e_terrain_texture_mipmaps ? detailSize : detailWidth*detailWidth/2, nullptr);
+  }
 
   return (nTexID);
 }

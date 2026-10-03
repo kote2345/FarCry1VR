@@ -1,6 +1,9 @@
 #version 450
+#extension GL_EXT_multiview : require
 #extension GL_GOOGLE_include_directive : require
 #include "scene_water.glsl"
+#define STOCK_FOG_UNIFORMS scene
+#include "scene_fog.glsl"
 #include "scene_alpha_test.glsl"
 layout(constant_id=0) const int alphaTestMode=0;
 layout(set=0,binding=0) uniform sampler2D layerTexture;
@@ -14,7 +17,7 @@ layout(location=0) out vec4 outColor;
 void main() {
     if(stockFragmentDiscardEnabled && dot(vec4(clipPosition,1.0),scene.clipPlane)<0.0) discard;
     vec2 scale=vec2(scene.textureLodBias.x);
-    uint mask=uint(scene.terrainProjectionS[7].x+0.5);
+    uint mask=stockTerrainLayerMask != 0xffffffffu ? stockTerrainLayerMask : uint(scene.terrainProjectionS[7].x+0.5);
     vec2 uv=baseUv;
     if ((mask&0x1000u)!=0u) {
         float height=texture(bumpTexture,uv).a*2.0-1.0;
@@ -38,5 +41,8 @@ void main() {
     vec4 color=vec4(alphaBlend ? rgb :
         rgb*layerWeight+vec3(0.5)*(1.0-layerWeight),alpha);
     if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(color.a,scene.materialParams.y,alphaTestMode)) discard;
-    outColor=color;
+    // Terrain layer passes are blended separately from the terrain base pass;
+    // apply the same distance fog here or they repaint distant islands with
+    // their unfogged detail color after the base terrain has already faded.
+    outColor=applyStockSceneFog(color);
 }

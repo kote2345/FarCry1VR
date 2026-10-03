@@ -6,6 +6,11 @@
 #include "VulkanVertexFormat.h"
 
 #include <array>
+#include <condition_variable>
+#include <deque>
+#include <future>
+#include <mutex>
+#include <thread>
 
 namespace CryVR
 {
@@ -82,6 +87,16 @@ struct VulkanGraphicsPipelineDesc
     uint32_t stage3Constant = 0xffffffffu;
     bool stage3UsesTexCoord1 = true;
     bool directionalLightmap = false;
+    bool bakedLightmapFastPath = false;
+    uint32_t stockShaderDisabledFeatures = 0;
+    uint32_t stockWaterProgram = 0;
+    uint32_t stockTerrainLayerMask = 0xffffffffu;
+    uint32_t stockFogMode = 0;
+    float stockTerrainMarker = -1.0e30f;
+    float stockMaterialLightingMode = -1.0f;
+    float stockMaterialColorMode = -1.0f;
+    uint32_t stockMaterialNormalMode = 0xffffffffu;
+    bool stockZeroAlphaBlendNoOp = false;
     std::array<VulkanPipelineTextureStage, 4> stages4To7{};
     bool supportsWireframe = false;
     bool dynamicStencil = false;
@@ -95,14 +110,25 @@ struct VulkanGraphicsPipelineDesc
 class VulkanPipelineFactory
 {
 public:
+    struct CompileResult { VkPipeline pipeline = VK_NULL_HANDLE; VkResult result = VK_SUCCESS; };
+    ~VulkanPipelineFactory() { Shutdown(); }
+    std::shared_future<CompileResult> EnqueueGraphicsPipeline(const VulkanGraphicsPipelineDesc& desc);
+    void StopCompiler();
     bool Initialize(VulkanContext& context);
     void Shutdown();
     bool CreateGraphicsPipeline(const VulkanGraphicsPipelineDesc& desc, VkPipeline& pipeline);
     void DestroyPipeline(VkPipeline& pipeline);
-    const char* GetLastError() const { return m_lastError; }
-    VkResult GetLastResult() const { return m_lastResult; }
+    const char* GetLastError() const;
+    VkResult GetLastResult() const;
 
 private:
+    void CompileWorker();
+    std::thread m_compileThread;
+    std::mutex m_jobMutex;
+    mutable std::mutex m_compileMutex;
+    std::condition_variable m_jobReady;
+    std::deque<std::packaged_task<CompileResult()>> m_jobs;
+    bool m_compileStopping = false;
     void SetError(const char* message);
     VulkanContext* m_context = nullptr;
     PFN_vkCreateGraphicsPipelines m_createGraphicsPipelines = nullptr;

@@ -30,7 +30,7 @@ layout(set = 0, binding = 1, std140) uniform TextureStageTransforms {
     vec4 shadowMapStageMask[2];
     vec4 terrainProjectionS[8]; vec4 terrainProjectionT[8];
     vec4 linearPlanes[32]; vec4 linearMatrixRows[32]; vec4 linearControls[8];
-    vec4 fixedLights[32]; vec4 fixedLightInfo; mat4 fixedMatrices[2]; uvec4 textureConstants[2];
+    vec4 fixedLights[32]; vec4 fixedLightInfo; mat4 fixedMatrices[2]; uvec4 textureConstants[2]; vec4 fogEye1Ray;
 } textureStageTransforms;
 layout(push_constant) uniform SceneTransform {
     mat4 mvp;

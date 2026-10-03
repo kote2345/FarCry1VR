@@ -16,35 +16,29 @@ layout(set = 3, binding = 0) uniform sampler2D baseWaterTexture;
 layout(location=4) in vec2 baseUv;
 #endif
 #include "scene_water.glsl"
+#define STOCK_FOG_UNIFORMS scene
+#include "scene_fog.glsl"
 layout(location=0) in vec2 texCoord;
 layout(location=1) in vec4 vertexColor;
 layout(location=2) in vec2 reflectionUv;
 layout(location=3) in vec3 fresnelColor;
 layout(location=9) in vec3 clipPosition;
 layout(location=0) out vec4 outColor;
-float fogDistance(float eyeZ) {
-    vec2 size = max(vec2(scene.uvRowQ[0].w, scene.uvRowQ[1].w), vec2(1.0));
-    vec2 origin = vec2(scene.linearControls[2].w, scene.linearControls[3].w);
-    vec2 ndc = 2.0 * (gl_FragCoord.xy - origin) / size - 1.0;
-    float tx = mix(scene.uvRow0[0].w, scene.uvRow1[0].w, (ndc.x + 1.0) * 0.5);
-    float ty = mix(scene.uvRow0[1].w, scene.uvRow1[1].w, (ndc.y + 1.0) * 0.5);
-    return eyeZ * sqrt(1.0 + tx * tx + ty * ty);
-}
-
 void main() {
     if (stockFragmentDiscardEnabled && dot(vec4(clipPosition, 1.0), scene.clipPlane) < 0.0) discard;
-    int mode=int(scene.terrainProjectionS[7].w+0.5);
+    int mode=stockWaterProgram != 0u ? int(stockWaterProgram) : int(scene.terrainProjectionS[7].w+0.5);
     vec4 matrix=scene.terrainProjectionS[4];
     vec4 ambient=scene.terrainProjectionS[5];
     vec4 water=scene.terrainProjectionS[6];
     // DSDT is stored as signed bytes, mirrored to UNORM with a +128 bias.
     // GLTextures::BuildMips uploads signed DSDT bytes divided by 127.0f.
-    vec2 bump=clamp((texture(waterNormalTexture,texCoord).xy*255.0-128.0)/127.0,
+    vec4 normalTexel=texture(waterNormalTexture,texCoord);
+    vec2 bump=clamp((normalTexel.xy*255.0-128.0)/127.0,
         vec2(-1.0),vec2(1.0));
     vec2 offset=matrix.xy*bump.x+matrix.zw*bump.y;
     vec4 color;
     if(mode==9 || mode==10) {
-      vec4 foam=texture(waterNormalTexture,texCoord);
+      vec4 foam=normalTexel;
       color=foam*ambient*vertexColor;
     } else if(mode==2 || mode==4) {
       vec2 size=max(vec2(scene.uvRowQ[0].w,scene.uvRowQ[1].w),vec2(1.0));
@@ -84,27 +78,6 @@ void main() {
     }
     if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(color.a, scene.materialParams.y, alphaTestMode)) discard;
 
-    if (scene.fogModeDensityStart.x > 0.5) {
-        float nearPlane = scene.fogEndDepthRange.y;
-        float farPlane = scene.fogEndDepthRange.z;
-        float depth = (gl_FragCoord.z - scene.linearControls[0].w) /
-            max(scene.linearControls[1].w - scene.linearControls[0].w, 1.0e-7);
-        float denominator = farPlane - depth * (farPlane - nearPlane);
-        float eyeDistance = (nearPlane * farPlane) / max(denominator, 1.0e-7);
-        eyeDistance = fogDistance(eyeDistance);
-        int mode = int(scene.fogModeDensityStart.y + 0.5);
-        float amount;
-        if (mode == 1)
-            amount = (eyeDistance - scene.fogModeDensityStart.w) /
-                (scene.fogEndDepthRange.x - scene.fogModeDensityStart.w);
-        else if (mode == 2) {
-            float d = scene.fogModeDensityStart.z * eyeDistance;
-            amount = 1.0 - exp(-min(d * d, 80.0));
-        } else {
-            float d = scene.fogModeDensityStart.z * eyeDistance;
-            amount = 1.0 - exp(-min(d, 80.0));
-        }
-        color.rgb = mix(color.rgb, scene.fogColor.rgb, clamp(amount, 0.0, 1.0));
-    }
-    outColor = color;
+
+    outColor = applyStockSceneFog(color);
 }

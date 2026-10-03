@@ -50,6 +50,7 @@ struct CVars : public Cry3DEngineBase
     e_entities_debug,
     e_sky_box,
     e_terrain,
+    e_terrain_grass,
     e_terrain_debug,
     e_water_ocean,
     e_vegetation_debug,
@@ -62,6 +63,7 @@ struct CVars : public Cry3DEngineBase
     e_video_buffer_stats,
     e_sun,
     e_terrain_merge_far_sectors,
+    e_terrain_merge_far_sectors_distance,
     e_terrain_texture_mipmaps,
 		e_terrain_texture_mip_offset,
 		
@@ -122,6 +124,7 @@ struct CVars : public Cry3DEngineBase
 		e_overlay_geometry,
 		e_player,
 		e_vegetation_sprites_texres,
+        e_vegetation_sprites_force,
 		e_active_shadow_maps_receving,
 		e_shadow_maps_fade_from_light_bit,
 		e_capture_frames,

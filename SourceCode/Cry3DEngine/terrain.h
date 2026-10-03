@@ -17,6 +17,7 @@
 #define TERRAIN_H
 
 #include "../Cry3DEngine/Cry3DEngineBase.h"
+class TerrainTextureStreamer;
 
 // hightmap is stored in memory as ushort, this variable will convert it into meters
 const float TERRAIN_Z_RATIO = 1.f/256.f;
@@ -224,6 +225,7 @@ public:
   int      m_nSectorTextureDataSizeBytes;
   uchar *  m_ucpTmpTexBuffer;
   FILE  *  m_fpTerrainTextureFile;
+  TerrainTextureStreamer* m_pTextureStreamer;
 
   Array2d<CSectorInfo *> m_arrSecInfoTable;
 

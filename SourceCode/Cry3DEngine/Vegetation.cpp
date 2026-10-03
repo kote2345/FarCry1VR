@@ -93,6 +93,17 @@ bool CStatObjInst::DrawEntity(const struct SRendParams & _EntDrawParams)
   if(!pBody)
     return false;
 
+  // Terrain grass is stored as ordinary distributed vegetation in this game,
+  // not as CDetailGrass. Keep trees and other vegetation while allowing the
+  // terrain grass models to be disabled for profiling.
+  if(!GetCVars()->e_terrain_grass)
+  {
+    const char * fileName = pBody->GetFileName();
+    for(const char * part = fileName; part && *part; ++part)
+      if(!strnicmp(part, "grass", 5))
+        return false;
+  }
+
 //  Vec3d vBoxMin = pBody->m_vBoxMin*m_fScale+m_vPos;
   //Vec3d vBoxMax = pBody->m_vBoxMax*m_fScale+m_vPos;
 /*  assert(!_EntDrawParams.bAllInFrustum || cam.IsBoxVisible(vBoxMin,vBoxMax)); // test of bAllInFrustum flag
@@ -139,6 +150,8 @@ bool CStatObjInst::DrawEntity(const struct SRendParams & _EntDrawParams)
 
   if(near_far_dist < GetCVars()->e_vegetation_sprites_min_distance)
     near_far_dist = GetCVars()->e_vegetation_sprites_min_distance;
+  const bool forceSprites = GetCVars()->e_vegetation_sprites_force != 0;
+  if (forceSprites) near_far_dist = 1.0f;
 
 //  m_nStatObjNumPerFrame++;
 
@@ -204,7 +217,10 @@ bool CStatObjInst::DrawEntity(const struct SRendParams & _EntDrawParams)
        */
 
   // do we need only 3d version
-  bool bUse3DOnly(!m_pObjManager->m_lstStaticTypes[m_nObjectTypeID].bUseSprites || nDynMask);
+  // Keep the 3D LOD when sprite generation failed; an empty sprite queue
+  // must never make distant vegetation disappear.
+  bool bUse3DOnly(!pBody->IsSpritesCreated() ||
+      (!forceSprites && (!m_pObjManager->m_lstStaticTypes[m_nObjectTypeID].bUseSprites || nDynMask)));
 
   // detect intersection with fog volume, note: use only center
   // todo: do not calculate every frame and merge all if(!m_pObjManager->m_nRenderStackLevel) stuff

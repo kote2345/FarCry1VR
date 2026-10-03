@@ -26,7 +26,7 @@ void main() {
  vec4 pos=vec4(inPosition,1.0);
  gl_Position=stockStereoMvp()*pos;
  clipPosition=inPosition;
- int mode=int(scene.terrainProjectionS[7].w+0.5);
+ int mode=stockWaterProgram != 0u ? int(stockWaterProgram) : int(scene.terrainProjectionS[7].w+0.5);
  vec4 shift=scene.terrainProjectionS[2], detail=scene.terrainProjectionS[3];
  vec3 eye=normalize(scene.terrainProjectionS[7].xyz-inPosition);
  vec2 generated=vec2(dot(pos,scene.terrainProjectionS[0]),dot(pos,scene.terrainProjectionS[1]));

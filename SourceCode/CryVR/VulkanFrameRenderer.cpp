@@ -42,7 +42,7 @@ static_assert(sizeof(StockStereoTransform) == 288, "stereo shader storage layout
 // Keep descriptor ranges and per-draw dynamic offsets in sync with the full
 // shader block, including independent homogeneous texgen for eight TMUs.
 constexpr VkDeviceSize kSceneUniformBlockSize = sizeof(float) *
-    (8 * 3 * 4 + 32 + 12 + 4 * 8 * 4 + 2 * 4 + 2 * 8 * 4 + 8 * 36 + 8 * 16 + 4 + 32 + 8);
+    (8 * 3 * 4 + 32 + 12 + 4 * 8 * 4 + 2 * 4 + 2 * 8 * 4 + 8 * 36 + 8 * 16 + 4 + 32 + 8 + 4);
 
 float TextureLodGradientScale(float lodBias)
 {
@@ -445,9 +445,23 @@ bool VulkanFrameRenderer::Initialize(Runtime& runtime, VulkanContext& context)
             }
     m_format = static_cast<VkFormat>(selectedFormat);
 
-    // Reduce both dimensions by 25%, preserving the eye image aspect ratio.
-    const uint32_t width = runtime.GetRecommendedViewWidth() * 3 / 4;
-    const uint32_t height = runtime.GetRecommendedViewHeight() * 3 / 4;
+    // Restore the requested per-eye render target after the previous 25% reduction.
+    // Respect OpenXR's per-view limits because both eyes share one swapchain extent.
+    uint32_t maxWidth = runtime.GetMaximumViewWidth();
+    uint32_t maxHeight = runtime.GetMaximumViewHeight();
+    for (uint32_t eye = 1; eye < m_viewCount; ++eye)
+    {
+        maxWidth = std::min(maxWidth, runtime.GetMaximumViewWidth(eye));
+        maxHeight = std::min(maxHeight, runtime.GetMaximumViewHeight(eye));
+    }
+    constexpr uint32_t targetWidth = 1680;
+    constexpr uint32_t targetHeight = 1760;
+    const uint32_t width = std::min(targetWidth, maxWidth);
+    const uint32_t height = std::min(targetHeight, maxHeight);
+    CryLogAlways("OpenXR/Vulkan render extent: target=%ux%u selected=%ux%u recommended=%ux%u maximum=%ux%u views=%u",
+                 targetWidth, targetHeight, width, height,
+                 runtime.GetRecommendedViewWidth(), runtime.GetRecommendedViewHeight(),
+                 maxWidth, maxHeight, m_viewCount);
     if (width == 0 || height == 0 || !runtime.CreateVulkanSwapchain(selectedFormat, width, height, m_viewCount, m_swapchain))
     {
         SetError("OpenXR Vulkan swapchain creation failed");
@@ -805,12 +819,12 @@ bool VulkanFrameRenderer::CreateScenePipelines()
         return false;
     }
     const uint32_t* causticsCodes[] = { kVrCausticsVertexSpirv, kVrCausticsFragmentSpirv,
-        kVrPlantsVertexSpirv, kVrPlantsFragmentSpirv };
+        kVrPlantsVertexSpirv, kVrPlantsFragmentSpirv, kVrPlantsEarlyFragmentSpirv };
     const size_t causticsSizes[] = { sizeof(kVrCausticsVertexSpirv), sizeof(kVrCausticsFragmentSpirv),
-        sizeof(kVrPlantsVertexSpirv), sizeof(kVrPlantsFragmentSpirv) };
+        sizeof(kVrPlantsVertexSpirv), sizeof(kVrPlantsFragmentSpirv), sizeof(kVrPlantsEarlyFragmentSpirv) };
     VkShaderModule* causticsModules[] = { &m_causticsVertexShader, &m_causticsFragmentShader,
-        &m_plantsVertexShader, &m_plantsFragmentShader };
-    for (int i = 0; i < 4; ++i)
+        &m_plantsVertexShader, &m_plantsFragmentShader, &m_plantsEarlyFragmentShader };
+    for (int i = 0; i < 5; ++i)
     {
         shaderInfo.codeSize = causticsSizes[i];
         shaderInfo.pCode = causticsCodes[i];
@@ -1100,7 +1114,7 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         return false;
     }
     const uint32_t topologyIndex = static_cast<uint32_t>(primitiveMode);
-    const std::map<int, LegacyTexture>::const_iterator texture = m_legacyTextures.find(textureId);
+    const std::unordered_map<int, LegacyTexture>::const_iterator texture = m_legacyTextures.find(textureId);
     bool hasLinearTexgen = false;
     for (const auto& generator : m_stockLinearTexgen)
         hasLinearTexgen = hasLinearTexgen || generator.enabled;
@@ -1119,7 +1133,7 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
     const bool useTexture = textureExpected && texture != m_legacyTextures.end();
     if (textureExpected && !useTexture)
         ++m_sceneDiagnostics.textureFallbacks;
-    const std::map<int, LegacyTexture>::const_iterator texture1 = m_legacyTextures.find(textureId1);
+    const std::unordered_map<int, LegacyTexture>::const_iterator texture1 = m_legacyTextures.find(textureId1);
     const bool textureId1IsNormalMap = normalMapTextureId > 0 && textureId1 == normalMapTextureId;
     const bool secondTextureHasUvSet = useGeneratedNoUv || m_stockLinearTexgen[1].enabled || vertexFormat == 16 || terrainProjection ||
         (lightmapTexCoordBuffer && lightmapTexCoordBuffer->buffer && textureStage1UsesTexCoord1) ||
@@ -1282,7 +1296,7 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         }
         else
         {
-            const std::map<int, LegacyTexture>::const_iterator texture2 =
+            const std::unordered_map<int, LegacyTexture>::const_iterator texture2 =
                 m_legacyTextures.find(textureStage2->textureId);
             if (texture2 == m_legacyTextures.end())
             {
@@ -1323,7 +1337,7 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
             ++m_sceneDiagnostics.rejectedVertexFeature;
             return false;
         }
-        const std::map<int, LegacyTexture>::const_iterator texture3 =
+        const std::unordered_map<int, LegacyTexture>::const_iterator texture3 =
             m_legacyTextures.find(textureStage3->textureId);
         if (texture3 == m_legacyTextures.end() || !useTexture)
             ++m_sceneDiagnostics.textureFallbacks;
@@ -1403,9 +1417,13 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         useTextureStages4To7[2] || useTextureStages4To7[3];
     const bool hasTangentBasis = tangentBuffer && tangentBuffer->buffer &&
                                  (vertexFormat == 9 || vertexFormat == 10 || vertexFormat == 13);
-    const std::map<int, LegacyTexture>::const_iterator normalMap =
-        m_legacyTextures.find(normalMapTextureId);
-    const bool useNormalMap = hasTangentBasis && useTexture && normalMapTextureId > 0 &&
+    // Plant bark carries its tangent-space light vector in Color1. Its Cg
+    // program needs a normal-map sampler, but no separate tangent stream.
+    const bool plantBarkProgram = terrainProjection && stockLightingMode < 0.5f &&
+        terrainProjection[63] == -14.0f;
+    const std::unordered_map<int, LegacyTexture>::const_iterator normalMap =
+        normalMapTextureId > 0 ? m_legacyTextures.find(normalMapTextureId) : m_legacyTextures.end();
+    const bool useNormalMap = (hasTangentBasis || plantBarkProgram) && useTexture && normalMapTextureId > 0 &&
                               normalMap != m_legacyTextures.end() && !useSecondTexture &&
                               !useThirdTexture && !useFourthTexture;
     if (hasTangentBasis && normalMapTextureId > 0 && useFifthToEighthTexture)
@@ -1497,15 +1515,67 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
     }
     pipelineKey[61] = directionalLightmap && useSecondTexture &&
                       useThirdTexture && useFourthTexture ? 1u : 0u;
+    // Match scene_lighting.glsl. Only specialize structural feature absence;
+    // object colors, matrices, fog distances and lights remain draw uniforms.
+    uint32_t stockShaderDisabledFeatures = 0;
+    if (!programmableMaterial)
+    {
+        // Normal-bearing fixed-function meshes evaluate lighting in the
+        // vertex shader and emit hasMaterialLighting=0. Remove the unused
+        // fragment lighting machinery instead of branching on that varying.
+        if (stockLightingMode < 0.5f ||
+            (stockLightingMode > 1.5f && HasVulkanVertexNormal(vertexFormat) && !useNormalMap))
+            stockShaderDisabledFeatures |= 1u;
+        // Specular programs also use the terrain payload for CameraPos/LightPos.
+        if (!terrainProjection && stockLightingMode < 0.5f)
+            stockShaderDisabledFeatures |= 2u;
+        if (!hasLinearTexgen) stockShaderDisabledFeatures |= 4u;
+        if (!m_stockShadowStageMask) stockShaderDisabledFeatures |= 8u;
+        if (!m_stockFogEnabled) stockShaderDisabledFeatures |= 16u;
+        if (m_stockProjectorTextureId <= 0 ||
+            m_legacyTextures.find(m_stockProjectorTextureId) == m_legacyTextures.end())
+            stockShaderDisabledFeatures |= 32u;
+        if (directionalLightmap && (stockShaderDisabledFeatures & 2u) &&
+            !useFifthToEighthTexture)
+            stockShaderDisabledFeatures |= 64u;
+    }
+    if (m_stockFarSprites) stockShaderDisabledFeatures |= 128u;
+    pipelineKey[61] |= stockShaderDisabledFeatures << 1;
+    const uint32_t stockTerrainLayerMask = terrainLayerProgram ?
+        (static_cast<uint32_t>(terrainProjection[28] + 0.5f) & 0x903du) : 0xffffffffu;
+    if (terrainLayerProgram) pipelineKey[61] |= stockTerrainLayerMask << 8;
+    const uint32_t stockFogMode = m_stockFogEnabled ?
+        (m_stockFogMode == 1 ? 1u : m_stockFogMode == 2 ? 2u : 3u) : 4u;
+    pipelineKey[61] |= stockFogMode << 24;
     // Texture environment colors vary with every object/light/fade. They
     // are draw uniforms, not shader variants requiring driver compilation.
     pipelineKey[7] = pipelineKey[10] = pipelineKey[18] = pipelineKey[24] = 0;
+    // Lighting programs can repurpose T[7].w below for specular data.
+    // Specialize only the unchanged terrain/base-pass payload.
+    const float stockTerrainMarker = stockLightingMode < 0.5f ?
+        (terrainProjection ? terrainProjection[63] : 0.0f) : -1.0e30f;
+    std::memcpy(&pipelineKey[7], &stockTerrainMarker, sizeof(float));
+    std::memcpy(&pipelineKey[10], &stockLightingMode, sizeof(float));
+    const float stockMaterialColorMode = terrainProjection ?
+        (invertVertexRgb ? 3.0f : 2.0f) : (invertVertexRgb ? 1.0f : 0.0f);
+    std::memcpy(&pipelineKey[18], &stockMaterialColorMode, sizeof(float));
+    const uint32_t stockMaterialNormalMode = HasVulkanVertexNormal(vertexFormat) ?
+        (stockLightingMode > 1.5f ? 0u : 1u) : 2u;
+    pipelineKey[24] = stockMaterialNormalMode;
     for (uint32_t stage = 0; stage < 4; ++stage)
         pipelineKey[29 + stage * 7 + 4] = 0;
     pipelineKey[62] = waterEffect && terrainProjection ? static_cast<uint32_t>(terrainProjection[31]) : 0u;
     if (terrainLayerProgram) pipelineKey[62] = 11u;
     if (causticsProgram) pipelineKey[62] = 12u;
     if (plantsProgram) pipelineKey[62] = 13u;
+    // Only the ordinary two-sampler baked pass can omit terrain and the
+    // second combiner. Keep generated coordinates, lighting and alpha intact.
+    const bool bakedLightmapFastPath = bakedLightmap && lightmapEncodeScale > 0.5f &&
+        useTexture && useSecondTexture && !useThirdTexture && !useFourthTexture &&
+        !useFifthToEighthTexture && !directionalLightmap && !useNormalMap &&
+        !waterEffect && !terrainProjection && !terrainLayerProgram &&
+        !causticsProgram && !plantsProgram && stockLightingMode == 0.0f;
+    if (bakedLightmapFastPath) pipelineKey[62] |= 0x20000000u;
     const bool simpleDecalMode = m_stockDecalDraw && vertexFormat == 4 && useTexture &&
         !useSecondTexture && !useThirdTexture && !useFourthTexture &&
         !useFifthToEighthTexture && !useNormalMap &&
@@ -1513,13 +1583,30 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         !waterEffect && !terrainProjection && m_stockProjectorTextureId <= 0 &&
         stockLightingMode == 0.0f;
     if (simpleDecalMode) pipelineKey[62] |= 0x40000000u;
-    // Preserve discard for alpha tests and both regular/reflection clip
-    // planes. Other draws compile without fragment kills, allowing early Z.
-    const bool fragmentDiscardEnabled = alphaTestRef > 0.0f ||
-        static_cast<uint32_t>(decodedState.alphaTest) != 0u ||
-        (clipPlane && (clipPlane[0] != 0.0f || clipPlane[1] != 0.0f ||
-                       clipPlane[2] != 0.0f || clipPlane[3] != 0.0f)) ||
-        (reflectionModelView && reflectionClipPlane);
+    const bool regularClipEnabled = clipPlane &&
+        (clipPlane[0] != 0.0f || clipPlane[1] != 0.0f ||
+         clipPlane[2] != 0.0f || clipPlane[3] != 0.0f);
+    const bool reflectionClipEnabled = reflectionModelView && reflectionClipPlane;
+    // CGRCPlants often combines GL_GREATER,0 with SRC_ALPHA / ONE_MINUS_SRC_ALPHA
+    // and no depth writes. For alpha == 0, blending is exactly a no-op, so the
+    // discard is redundant. Omitting it lets the GPU reject occluded fragments
+    // in early depth testing without changing color, depth, or stencil results.
+    const bool plantZeroAlphaBlendNoOp = plantsProgram && alphaTestRef <= 0.0f &&
+        decodedState.alphaTest == LegacyAlphaTestGreaterZero && decodedState.blendEnable &&
+        decodedState.srcColorBlendFactor == VK_BLEND_FACTOR_SRC_ALPHA &&
+        decodedState.dstColorBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
+        decodedState.srcAlphaBlendFactor == VK_BLEND_FACTOR_SRC_ALPHA &&
+        decodedState.dstAlphaBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
+        decodedState.colorBlendOp == VK_BLEND_OP_ADD && decodedState.alphaBlendOp == VK_BLEND_OP_ADD &&
+        !decodedState.depthWriteEnable && !decodedState.stencilTestEnable &&
+        !regularClipEnabled && !reflectionClipEnabled;
+    if (plantZeroAlphaBlendNoOp) pipelineKey[61] |= 0x08000000u;
+    // Keep alpha discard everywhere it affects coverage. Clip planes always
+    // retain discard, including on otherwise eligible blended plant draws.
+    const bool alphaTestDiscardEnabled = (alphaTestRef > 0.0f ||
+        static_cast<uint32_t>(decodedState.alphaTest) != 0u) && !plantZeroAlphaBlendNoOp;
+    const bool fragmentDiscardEnabled = alphaTestDiscardEnabled ||
+        regularClipEnabled || reflectionClipEnabled;
     if (fragmentDiscardEnabled) pipelineKey[62] |= 0x80000000u;
     const bool stereoDraw = m_multiview && m_stockShadowMapTextureId <= 0;
     pipelineKey[63] = stereoDraw ? 1u : 0u;
@@ -1540,16 +1627,20 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         }
     }
     bool needsReflectionDescription = false;
+    VkPipeline cachedReflectionPipeline = VK_NULL_HANDLE;
     if (reflectionModelView && reflectionClipPlane && !waterEffect && (cullMode != 0 || stereoDraw))
     {
         auto reflectionKey = pipelineKey;
         reflectionKey[0] &= ~0x3u;
         reflectionKey[63] = 0;
-        needsReflectionDescription = m_scenePipelineCache.find(reflectionKey) == m_scenePipelineCache.end();
+        const auto cachedReflection = m_scenePipelineCache.find(reflectionKey);
+        if (cachedReflection != m_scenePipelineCache.end()) cachedReflectionPipeline = cachedReflection->second;
+        needsReflectionDescription = !cachedReflectionPipeline &&
+            m_pendingScenePipelines.find(reflectionKey) == m_pendingScenePipelines.end();
     }
     // Descriptions are only consumed by pipeline creation. Cached ordinary
     // and reflected variants do not need this per-draw reconstruction.
-    if (!pipeline || needsReflectionDescription)
+    if ((!pipeline && m_pendingScenePipelines.find(pipelineKey) == m_pendingScenePipelines.end()) || needsReflectionDescription)
     {
         const bool hasNormal = HasVulkanVertexNormal(vertexFormat);
         const bool hasColor = HasVulkanVertexColor(vertexFormat);
@@ -1557,6 +1648,7 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         desc.supportsDiscardSpecialization = true;
         desc.simpleDecalMode = simpleDecalMode;
         desc.fragmentDiscardEnabled = fragmentDiscardEnabled;
+        desc.stockZeroAlphaBlendNoOp = plantZeroAlphaBlendNoOp;
         desc.supportsStereoTransform = true;
         desc.multiview = stereoDraw;
         desc.renderPass = stereoDraw ? m_multiviewRenderPass : m_renderPass;
@@ -1597,6 +1689,11 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
                               useTexture ? m_sceneTextureColorFragmentShader :
                               hasNormal ? m_sceneLitFragmentShader :
                               (hasColor ? m_sceneColorFragmentShader : m_sceneFragmentShader);
+        if (plantBarkProgram && useNormalMap)
+        {
+            desc.vertexShader = hasColor ? m_sceneTextureLitColorVertexShader : m_sceneTextureLitVertexShader;
+            desc.fragmentShader = m_sceneTextureColorFragmentShader;
+        }
         if (terrainLayerProgram)
         {
             desc.vertexShader = m_terrainLayerVertexShader;
@@ -1606,7 +1703,10 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         if (plantsProgram)
         {
             desc.vertexShader = m_plantsVertexShader;
-            desc.fragmentShader = m_plantsFragmentShader;
+            // Fragment tests may run before the alpha discard only when
+            // neither depth nor stencil writes can survive that discard.
+            desc.fragmentShader = (!decodedState.depthWriteEnable && !decodedState.stencilTestEnable) ?
+                m_plantsEarlyFragmentShader : m_plantsFragmentShader;
         }
         if (causticsProgram)
         {
@@ -1664,6 +1764,16 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         desc.stage3UsesTexCoord1 = textureStage3 ? textureStage3->useTexCoord1 : true;
         desc.directionalLightmap = directionalLightmap && useSecondTexture &&
                                    useThirdTexture && useFourthTexture;
+        desc.bakedLightmapFastPath = bakedLightmapFastPath;
+        desc.stockShaderDisabledFeatures = stockShaderDisabledFeatures;
+        desc.stockWaterProgram = waterEffect && terrainProjection ?
+            static_cast<uint32_t>(terrainProjection[31]) : 0u;
+        desc.stockTerrainLayerMask = stockTerrainLayerMask;
+        desc.stockFogMode = stockFogMode;
+        desc.stockTerrainMarker = stockTerrainMarker;
+        desc.stockMaterialLightingMode = stockLightingMode;
+        desc.stockMaterialColorMode = stockMaterialColorMode;
+        desc.stockMaterialNormalMode = stockMaterialNormalMode;
         if (useFourthTexture)
         {
             desc.stage3ColorArg = stage3ColorArg;
@@ -1686,62 +1796,31 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
                 pipelineStage.lodBias = textureStages4To7[stageIndex].lodBias;
             }
         }
-        if (!pipeline)
-        {
-        if (!m_pipelineFactory.CreateGraphicsPipeline(desc, pipeline))
-        {
-            ++m_sceneDiagnostics.pipelineCreationFailed;
-            if (!m_scenePipelineErrorLogged)
-            {
-#if defined(__ANDROID__)
-                __android_log_print(ANDROID_LOG_ERROR, "CryVulkan",
-                    "scene pipeline failed: %s; vertexFormat=%u normalMap=%u textures=%u vertexColor=%u normal=%u",
-                    m_pipelineFactory.GetLastError(), static_cast<uint32_t>(vertexFormat),
-                    useNormalMap ? 1u : 0u,
-                    (useTexture ? 1u : 0u) + (useSecondTexture ? 1u : 0u) +
-                    (useThirdTexture ? 1u : 0u) + (useFourthTexture ? 1u : 0u) +
-                    (useFifthToEighthTexture ? 1u : 0u),
-                    hasColor ? 1u : 0u, hasNormal ? 1u : 0u);
-#endif
-                CryLogAlways("OpenXR/Vulkan: scene pipeline creation failed: %s; vertexFormat=%u normalMap=%u textures=%u vertexColor=%u normal=%u",
-                    m_pipelineFactory.GetLastError(), static_cast<uint32_t>(vertexFormat),
-                    useNormalMap ? 1u : 0u,
-                    (useTexture ? 1u : 0u) + (useSecondTexture ? 1u : 0u) +
-                    (useThirdTexture ? 1u : 0u) + (useFourthTexture ? 1u : 0u) +
-                    (useFifthToEighthTexture ? 1u : 0u),
-                    hasColor ? 1u : 0u, hasNormal ? 1u : 0u);
-                m_scenePipelineErrorLogged = true;
-            }
-            return false;
-        }
-        m_scenePipelineCache[pipelineKey] = pipeline;
-        m_lastScenePipelineKey = pipelineKey;
-        m_lastScenePipeline = pipeline;
-        m_lastScenePipelineValid = true;
-        }
+        if (!pipeline && m_pendingScenePipelines.find(pipelineKey) == m_pendingScenePipelines.end())
+            m_pendingScenePipelines.emplace(pipelineKey, m_pipelineFactory.EnqueueGraphicsPipeline(desc));
     }
     VkPipeline reflectionPipeline = pipeline;
-    if (reflectionModelView && reflectionClipPlane &&
-        !waterEffect && (cullMode != 0 || stereoDraw))
+    const bool separateReflectionPipeline = reflectionModelView && reflectionClipPlane &&
+        !waterEffect && (cullMode != 0 || stereoDraw);
+    if (separateReflectionPipeline)
     {
         std::array<uint32_t, 64> reflectionKey = pipelineKey;
         reflectionKey[0] &= ~0x3u;
         reflectionKey[63] = 0;
-        const auto cachedReflection = m_scenePipelineCache.find(reflectionKey);
-        if (cachedReflection != m_scenePipelineCache.end())
-            reflectionPipeline = cachedReflection->second;
+        if (cachedReflectionPipeline)
+            reflectionPipeline = cachedReflectionPipeline;
         else
         {
-            VulkanGraphicsPipelineDesc reflectionDesc = pipelineDesc;
-            reflectionDesc.cullMode = 0;
-            reflectionDesc.multiview = false;
-            reflectionDesc.renderPass = m_renderPass;
-            if (!m_pipelineFactory.CreateGraphicsPipeline(reflectionDesc, reflectionPipeline))
+            reflectionPipeline = VK_NULL_HANDLE;
+            if (m_pendingScenePipelines.find(reflectionKey) == m_pendingScenePipelines.end())
             {
-                ++m_sceneDiagnostics.pipelineCreationFailed;
-                return false;
+                VulkanGraphicsPipelineDesc reflectionDesc = pipelineDesc;
+                reflectionDesc.cullMode = 0;
+                reflectionDesc.multiview = false;
+                reflectionDesc.renderPass = m_renderPass;
+                m_pendingScenePipelines.emplace(reflectionKey,
+                    m_pipelineFactory.EnqueueGraphicsPipeline(reflectionDesc));
             }
-            m_scenePipelineCache[reflectionKey] = reflectionPipeline;
         }
     }
     const VkDeviceSize transformOffset = static_cast<VkDeviceSize>(m_stockDraws.size()) *
@@ -1757,6 +1836,10 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
     m_stockProfilePlants = false;
     draw.decalDraw = m_stockDecalDraw;
     m_stockDecalDraw = false;
+    draw.terrainDraw = m_stockTerrainDraw;
+    draw.waterDraw = m_stockWaterDraw;
+    draw.characterDraw = m_stockCharacterDraw;
+    m_stockTerrainDraw = m_stockWaterDraw = m_stockCharacterDraw = false;
     draw.simpleDecalMode = simpleDecalMode;
     draw.fixedLightCount = m_stockFixedLightCount;
     if (hasLinearTexgen || m_stockFixedLightCount || m_stockShadowStageMask)
@@ -1806,6 +1889,7 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
                     primitiveMode == 1 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP :
                                          VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
     draw.pipelineKey = pipelineKey;
+    draw.separateReflectionPipeline = separateReflectionPipeline;
     draw.pipeline = pipeline;
     draw.reflectionPipeline = reflectionPipeline;
     if (m_stockViewportSet)
@@ -1950,6 +2034,10 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         draw.textureMatrix0[i] = textureMatrix0[i];
         draw.textureMatrix1[i] = textureMatrix1[i];
     }
+    // StockDraw storage is reused without value initialization. Clear the
+    // complete shader payload before installing this draw's matrices/light;
+    // inactive stages must not retain another material's UV/projector basis.
+    std::memset(draw.textureTransformRows, 0, sizeof(draw.textureTransformRows));
     for (uint32_t stage = 0; stage < 8; ++stage)
     {
         draw.textureTransformRows[0][stage][0] = 1.0f;
@@ -2074,6 +2162,9 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         useThirdTexture && textureStage2 ? textureStage2->lodBias : 0.0f);
     draw.textureLodBias[3] = TextureLodGradientScale(
         useFourthTexture && textureStage3 ? textureStage3->lodBias : 0.0f);
+    // This payload is uploaded for every draw, so keep its inactive slots
+    // deterministic without value-initializing the much larger StockDraw.
+    std::memset(draw.terrainProjectionRows, 0, sizeof(draw.terrainProjectionRows));
     if (terrainProjection)
         std::memcpy(draw.terrainProjectionRows, terrainProjection,
                     sizeof(draw.terrainProjectionRows));
@@ -2089,6 +2180,17 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         }
         draw.terrainProjectionRows[0][7][3] = draw.materialLighting[15];
         draw.terrainProjectionRows[1][7][3] = draw.materialLighting[14];
+    }
+    if (!terrainProjection && draw.materialLighting[3] < 0.0f && m_stockSpecularProgramFlags)
+    {
+        draw.terrainProjectionRows[0][6][0] = float(m_stockSpecularProgramFlags);
+        draw.terrainProjectionRows[0][6][1] = -draw.materialLighting[3];
+        draw.terrainProjectionRows[0][6][3] = 1.0f;
+        if (m_stockSpecularGlossTexture > 0 && HasLegacyTexture(m_stockSpecularGlossTexture))
+        {
+            draw.specularGlossTextureId = m_stockSpecularGlossTexture;
+            draw.terrainProjectionRows[0][6][0] += 16.0f;
+        }
     }
     const float fogConstants[32] = {
         draw.fogColor[0], draw.fogColor[1], draw.fogColor[2], 1.0f,
@@ -2189,7 +2291,11 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                                                         const float* reflectionModelView,
                                                         const float* reflectionClipPlane,
                                                         const VulkanWaterReflectionUpdate* reflectionUpdate,
-                                                        const void* gpuSkinIdentity)
+                                                        const void* gpuSkinIdentity,
+                                                        uint32_t validatedMinimumVertex,
+                                                        uint32_t validatedMaximumVertex,
+                                                        uint64_t immutableGeometryRevision,
+                                                        const void* cpuTangents)
 {
     static uint32_t clientDrawAuditCount = 0;
     const auto auditFailure = [&](const char* reason) -> bool
@@ -2221,10 +2327,30 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
     // loop, so reuse the first contribution's GPU copies as one unit.
     if (!gpuSkinIdentity) gpuSkinIdentity = m_stockGpuSkinIdentity;
     const bool gpuSkinned = m_gpuSkinning.HasPose(gpuSkinIdentity);
-    const VulkanBuffer* effectiveTangents = gpuSkinned && (vertexFormat == 9 || vertexFormat == 10 || vertexFormat == 13) ?
+    const bool uploadCpuTangents = !gpuSkinned && cpuTangents &&
+        (vertexFormat == 9 || vertexFormat == 10 || vertexFormat == 13);
+    const VulkanBuffer* effectiveTangents = (gpuSkinned || uploadCpuTangents) && (vertexFormat == 9 || vertexFormat == 10 || vertexFormat == 13) ?
         &m_dynamicVertexBuffer : tangentBuffer;
+    const bool cacheImmutableGeometry = immutableGeometryRevision && sourceIndices &&
+        !gpuSkinned && !lightmapTexCoords && !m_stockDecalDraw;
+    const std::array<uint64_t, 8> geometryKey{{reinterpret_cast<uint64_t>(vertices),
+        reinterpret_cast<uint64_t>(sourceIndices), uint64_t(vertexCount) << 32 | indexCount,
+        uint64_t(uint32_t(vertexFormat)) << 32 | uint32_t(primitiveMode), immutableGeometryRevision,
+        reinterpret_cast<uint64_t>(gpuSkinIdentity),
+        effectiveTangents ? reinterpret_cast<uint64_t>(effectiveTangents->buffer) : 0,
+        reinterpret_cast<uint64_t>(cpuTangents)}};
+    if (cacheImmutableGeometry)
+    {
+        const auto found = m_frameGeometryUploads.find(geometryKey);
+        if (found != m_frameGeometryUploads.end())
+        {
+            m_reusableClientGeometry = found->second;
+            reusePreviousClientGeometry = true;
+        }
+    }
     if (reusePreviousClientGeometry && sourceIndices && m_reusableClientGeometry.valid &&
         m_reusableClientGeometry.skinIdentity == gpuSkinIdentity &&
+        m_reusableClientGeometry.sourceTangents == cpuTangents &&
         vertices == m_reusableClientGeometry.sourceVertices &&
         sourceIndices == m_reusableClientGeometry.sourceIndices &&
         lightmapTexCoords == m_reusableClientGeometry.sourceLightmapTexCoords &&
@@ -2245,7 +2371,7 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                                   stencilState, stencilRef, stencilMask,
                                   modelView, textureMatrix0, textureMatrix1,
                                   m_reusableClientGeometry.vertexOffset, materialLighting,
-                                  globalOpacity, alphaTestRef, gpuSkinned ? &m_reusableClientGeometry.vertexBuffer : tangentBuffer, normalMapTextureId,
+                                  globalOpacity, alphaTestRef, (gpuSkinned || uploadCpuTangents) ? &m_reusableClientGeometry.vertexBuffer : tangentBuffer, normalMapTextureId,
                                   primaryColor, primaryColorMask, colorWriteMaskOverride,
                                   textureStage0LodBias, textureStage1LodBias, textureStage2, textureStage3,
                                   polygonOffset, polygonOffsetFactor, polygonOffsetUnits, clipPlane,
@@ -2264,8 +2390,19 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                                   lightmapEncodeScale,
                                   reflectionModelView, reflectionClipPlane))
         {
-            if (gpuSkinned && !m_stockDraws.empty())
+            if ((gpuSkinned || uploadCpuTangents) && !m_stockDraws.empty())
                 m_stockDraws.back().tangentBufferOffset = m_reusableClientGeometry.tangentBufferOffset;
+            if (terrainProjection && terrainProjection[31] == -13.0f && !m_stockDraws.empty() &&
+                m_reusableClientGeometry.vertexBuffer.mappedData &&
+                m_reusableClientGeometry.indexBuffer.mappedData)
+            {
+                StockDraw& plants = m_stockDraws.back();
+                plants.plantsVertexData = static_cast<const uint8_t*>(m_reusableClientGeometry.vertexBuffer.mappedData) +
+                    m_reusableClientGeometry.vertexBufferOffset;
+                plants.plantsIndexData = static_cast<const uint8_t*>(m_reusableClientGeometry.indexBuffer.mappedData) +
+                    VkDeviceSize(m_reusableClientGeometry.firstIndex) * sizeof(uint16_t);
+                plants.plantsVertexBytes = m_reusableClientGeometry.vertexBytes;
+            }
             if (reflectionUpdate && !m_stockDraws.empty())
             {
                 m_stockDraws.back().waterReflectionUpdate = *reflectionUpdate;
@@ -2293,21 +2430,29 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
     // triangles instead of reporting an error, so reject the draw before it
     // reaches vkCmdDrawIndexed and include enough data to identify its source.
     static uint32_t outOfRangeIndexAuditCount = 0;
-    uint32_t minimumVertex = vertexCount, maximumVertex = 0;
-    for (uint32_t index = 0; index < indexCount; ++index)
+    uint32_t minimumVertex = validatedMinimumVertex;
+    uint32_t maximumVertex = validatedMaximumVertex;
+    const bool hasValidatedVertexRange = minimumVertex <= maximumVertex &&
+        maximumVertex < vertexCount;
+    if (!hasValidatedVertexRange)
     {
-        if (indices[index] < vertexCount)
+        minimumVertex = vertexCount;
+        maximumVertex = 0;
+        for (uint32_t index = 0; index < indexCount; ++index)
         {
-            if (indices[index] < minimumVertex) minimumVertex = indices[index];
-            if (indices[index] > maximumVertex) maximumVertex = indices[index];
-            continue;
+            if (indices[index] < vertexCount)
+            {
+                if (indices[index] < minimumVertex) minimumVertex = indices[index];
+                if (indices[index] > maximumVertex) maximumVertex = indices[index];
+                continue;
+            }
+            if (outOfRangeIndexAuditCount < 32)
+                CryLogAlways("OpenXR/Vulkan audit: client index out of range draw=%u indexOffset=%u value=%u vertexCount=%u format=%d primitive=%d",
+                    outOfRangeIndexAuditCount, index, indices[index], vertexCount,
+                    vertexFormat, primitiveMode);
+            ++outOfRangeIndexAuditCount;
+            return auditFailure("index exceeds uploaded vertex count");
         }
-        if (outOfRangeIndexAuditCount < 32)
-            CryLogAlways("OpenXR/Vulkan audit: client index out of range draw=%u indexOffset=%u value=%u vertexCount=%u format=%d primitive=%d",
-                outOfRangeIndexAuditCount, index, indices[index], vertexCount,
-                vertexFormat, primitiveMode);
-        ++outOfRangeIndexAuditCount;
-        return auditFailure("index exceeds uploaded vertex count");
     }
     VulkanVertexFormat format{};
     if (!GetVulkanVertexFormat(static_cast<uint32_t>(vertexFormat), format))
@@ -2332,7 +2477,7 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
         (m_dynamicVertexUsed + vertexBytes + 7u) & ~static_cast<VkDeviceSize>(7u) : 0;
     VkDeviceSize dynamicVertexEnd = lightmapTexCoords ?
         lightmapOffset + lightmapBytes : m_dynamicVertexUsed + vertexBytes;
-    const VkDeviceSize tangentOffset = gpuSkinned && separateTangents ?
+    const VkDeviceSize tangentOffset = (gpuSkinned || uploadCpuTangents) && separateTangents ?
         (dynamicVertexEnd + 3u) & ~VkDeviceSize(3u) : VK_WHOLE_SIZE;
     if (tangentOffset != VK_WHOLE_SIZE)
         dynamicVertexEnd = tangentOffset + VkDeviceSize(uploadVertexCount) * 36;
@@ -2356,6 +2501,11 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
         return auditFailure("lightmap coordinate upload failed");
     if (!m_resources->UploadBuffer(m_dynamicIndexBuffer, indices, indexBytes, m_dynamicIndexUsed))
         return auditFailure("index upload failed");
+    // SPipTangents is three float3 vectors, matching the Vulkan tangent
+    // stream. Upload once with the geometry and reuse it for later lights.
+    if (uploadCpuTangents && !m_resources->UploadBuffer(m_dynamicVertexBuffer,
+            cpuTangents, VkDeviceSize(uploadVertexCount) * 36, tangentOffset))
+        return auditFailure("tangent upload failed");
     const uint32_t firstIndex = static_cast<uint32_t>(m_dynamicIndexUsed / sizeof(uint16_t));
     if (gpuSkinned) {
         uint32_t normalOffset = UINT32_MAX;
@@ -2446,11 +2596,13 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                 b.lightmapTexCoordBuffer || a.auxiliaryIndex != UINT32_MAX ||
                 b.auxiliaryIndex != UINT32_MAX || a.pipeline != b.pipeline ||
                 a.reflectionPipeline != b.reflectionPipeline || a.pipelineKey != b.pipelineKey ||
+                a.separateReflectionPipeline != b.separateReflectionPipeline ||
                 a.textureId != b.textureId || a.textureId1 != b.textureId1 ||
                 a.projectorCookieTextureId != b.projectorCookieTextureId ||
                 a.projectorCookieEnabled != b.projectorCookieEnabled ||
                 a.normalMapTextureId != b.normalMapTextureId ||
                 a.specularOcclusionTextureId != b.specularOcclusionTextureId ||
+                a.specularGlossTextureId != b.specularGlossTextureId ||
                 a.specularOcclusionChannel != b.specularOcclusionChannel ||
                 a.useSecondTexture != b.useSecondTexture ||
                 a.useThirdTexture != b.useThirdTexture || a.useFourthTexture != b.useFourthTexture ||
@@ -2525,7 +2677,6 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
             const int64_t vertexDelta = static_cast<int64_t>(
                 (current.vertexBufferOffset - previous.vertexBufferOffset) / format.stride) +
                 current.vertexOffset - previous.vertexOffset;
-            std::vector<uint16_t> mergedIndices(indexCount);
             bool validIndices = true;
             for (uint32_t i = 0; i < indexCount; ++i)
             {
@@ -2535,11 +2686,14 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                     validIndices = false;
                     break;
                 }
-                mergedIndices[i] = static_cast<uint16_t>(adjusted);
             }
-            if (validIndices && m_resources->UploadBuffer(m_dynamicIndexBuffer,
-                    mergedIndices.data(), indexBytes, m_dynamicIndexUsed))
+            if (validIndices && m_dynamicIndexBuffer.mappedData)
             {
+                uint16_t* mergedIndices = reinterpret_cast<uint16_t*>(
+                    static_cast<uint8_t*>(m_dynamicIndexBuffer.mappedData) + m_dynamicIndexUsed);
+                for (uint32_t i = 0; i < indexCount; ++i)
+                    mergedIndices[i] = static_cast<uint16_t>(
+                        static_cast<int64_t>(indices[i]) + vertexDelta);
                 previous.indexCount += current.indexCount;
                 previous.decalVertexEndOffset = current.decalVertexEndOffset;
                 m_stockDraws.pop_back();
@@ -2563,6 +2717,7 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
         m_reusableClientGeometry.valid = true;
         m_reusableClientGeometry.sourceVertices = vertices;
         m_reusableClientGeometry.skinIdentity = gpuSkinIdentity;
+        m_reusableClientGeometry.sourceTangents = cpuTangents;
         m_reusableClientGeometry.tangentBufferOffset = tangentOffset == VK_WHOLE_SIZE ? 0 : tangentOffset;
         m_reusableClientGeometry.sourceIndices = sourceIndices;
         m_reusableClientGeometry.sourceLightmapTexCoords = lightmapTexCoords;
@@ -2576,6 +2731,9 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
         m_reusableClientGeometry.vertexOffset = uploadBaseVertex;
         m_reusableClientGeometry.vertexBufferOffset = vertexBufferOffset;
         m_reusableClientGeometry.lightmapTexCoordOffset = lightmapOffset;
+        m_reusableClientGeometry.vertexBytes = vertexBytes;
+        if (cacheImmutableGeometry && m_frameGeometryUploads.size() < 4096)
+            m_frameGeometryUploads.emplace(geometryKey, m_reusableClientGeometry);
     }
     return true;
 }
@@ -2616,6 +2774,23 @@ bool VulkanFrameRenderer::EnsureDynamicBufferCapacity(VulkanBuffer& buffer,
     return true;
 }
 
+bool VulkanFrameRenderer::InitializeTextureTransformDescriptor(VkDescriptorSet set)
+{
+    // This set has just been allocated and cannot be in flight. Initialize
+    // only its UBO binding; changing existing sets requires the global guard.
+    if (!set || !m_context || !m_textureTransformBuffer.buffer) return false;
+    VkDescriptorBufferInfo buffer{m_textureTransformBuffer.buffer, 0, kSceneUniformBlockSize};
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set;
+    write.dstBinding = 1;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    write.pBufferInfo = &buffer;
+    WriteDescriptorSets(1, &write);
+    return true;
+}
+
 bool VulkanFrameRenderer::UpdateTextureTransformDescriptors()
 {
     if (!CompletePendingSubmission()) return false;
@@ -2641,7 +2816,7 @@ bool VulkanFrameRenderer::UpdateTextureTransformDescriptors()
         writes.push_back(write);
     };
     appendWrite(m_descriptorSet);
-    for (std::map<int, LegacyTexture>::const_iterator it = m_legacyTextures.begin();
+    for (std::unordered_map<int, LegacyTexture>::const_iterator it = m_legacyTextures.begin();
          it != m_legacyTextures.end(); ++it)
     {
         appendWrite(it->second.descriptorSet);
@@ -2928,6 +3103,55 @@ bool VulkanFrameRenderer::RegisterLegacyRgbaTexture(int textureId, uint32_t widt
     if (!m_initialized || !m_resources || textureId <= 0 || !width || !height || !rgbaPixels ||
         width > 16384 || height > 16384)
         return false;
+    // Retain a small rolling CPU window of recently uploaded, modest-sized
+    // textures. StatObj::MakeSprite runs after its source material upload and
+    // needs those decoded texels to bake the legacy 24-angle impostors.
+    // The bounded cache avoids pinning the game's full texture set in RAM.
+    if (!dynamicTexture && width && height)
+    {
+        std::unordered_map<int, SpriteSourceTexture>::iterator old =
+            m_spriteSourceTextures.find(textureId);
+        if (old != m_spriteSourceTextures.end())
+        {
+            m_spriteSourceBytes -= old->second.pixels.size();
+            m_spriteSourceTextures.erase(old);
+        }
+        SpriteSourceTexture source;
+        // Trees often use 512/1024+ textures. Keep a bounded baking copy
+        // instead of silently excluding those models from the sprite path.
+        source.width = std::min(width, 512u);
+        source.height = std::min(height, 512u);
+        source.serial = ++m_spriteSourceSerial;
+        const size_t retainedBytes = size_t(source.width) * source.height * 4;
+        source.pixels.resize(retainedBytes);
+        if (source.width == width && source.height == height)
+            std::memcpy(source.pixels.data(), rgbaPixels, retainedBytes);
+        else
+            for (uint32_t y = 0; y < source.height; ++y)
+                for (uint32_t x = 0; x < source.width; ++x)
+                {
+                    const uint32_t sx = uint32_t((uint64_t(x) * 2 + 1) * width / (uint64_t(source.width) * 2));
+                    const uint32_t sy = uint32_t((uint64_t(y) * 2 + 1) * height / (uint64_t(source.height) * 2));
+                    std::memcpy(source.pixels.data() + (size_t(y) * source.width + x) * 4,
+                        rgbaPixels + (size_t(sy) * width + sx) * 4, 4);
+                }
+        m_spriteSourceBytes += retainedBytes;
+        m_spriteSourceTextures[textureId] = std::move(source);
+        m_spriteSourceOrder.push_back(std::make_pair(textureId, m_spriteSourceSerial));
+        const size_t sourceBudget = 16u * 1024u * 1024u;
+        while (m_spriteSourceBytes > sourceBudget && !m_spriteSourceOrder.empty())
+        {
+            const std::pair<int, uint64_t> oldest = m_spriteSourceOrder.front();
+            m_spriteSourceOrder.pop_front();
+            std::unordered_map<int, SpriteSourceTexture>::iterator candidate =
+                m_spriteSourceTextures.find(oldest.first);
+            if (candidate == m_spriteSourceTextures.end() ||
+                candidate->second.serial != oldest.second)
+                continue;
+            m_spriteSourceBytes -= candidate->second.pixels.size();
+            m_spriteSourceTextures.erase(candidate);
+        }
+    }
     uint32_t fullMipCount = 1;
     for (uint32_t mipWidth = width, mipHeight = height;
          mipWidth > 1 || mipHeight > 1;
@@ -2973,7 +3197,7 @@ bool VulkanFrameRenderer::RegisterLegacyRgbaTexture(int textureId, uint32_t widt
             filterMode == VulkanFilterNearestNoMips) ? 0.0f : maxLod;
         return m_createSampler(m_context->GetDevice(), &samplerInfo, nullptr, &sampler) == VK_SUCCESS;
     };
-    std::map<int, LegacyTexture>::iterator existing = m_legacyTextures.find(textureId);
+    std::unordered_map<int, LegacyTexture>::iterator existing = m_legacyTextures.find(textureId);
     if (existing != m_legacyTextures.end())
     {
         if (existing->second.texture.width != width || existing->second.texture.height != height ||
@@ -3095,9 +3319,37 @@ bool VulkanFrameRenderer::RegisterLegacyRgbaTexture(int textureId, uint32_t widt
     }
     WriteDescriptorSets(2, writes);
     mirror.bytes = bytes;
-    m_legacyTextures[textureId] = mirror;
+    const VkDescriptorSet newDescriptorSet = mirror.descriptorSet;
+    m_legacyTextures[textureId] = std::move(mirror);
     m_legacyTextureBytes += bytes;
-    return UpdateTextureTransformDescriptors();
+    return InitializeTextureTransformDescriptor(newDescriptorSet);
+}
+
+bool VulkanFrameRenderer::CopyRecentSpriteSourceTexture(int textureId, uint32_t& width,
+                                                         uint32_t& height,
+                                                         std::vector<uint8_t>& rgbaPixels)
+{
+    const auto found =
+        m_spriteSourceTextures.find(textureId);
+    if (found == m_spriteSourceTextures.end() || found->second.pixels.empty())
+        return false;
+    width = found->second.width;
+    height = found->second.height;
+    rgbaPixels = found->second.pixels;
+    // Twenty-four output images must not evict the trunk/leaves being baked.
+    found->second.serial = ++m_spriteSourceSerial;
+    m_spriteSourceOrder.emplace_back(textureId, found->second.serial);
+    if (m_spriteSourceOrder.size() > 4096)
+    {
+        std::vector<std::pair<int, uint64_t>> live;
+        live.reserve(m_spriteSourceTextures.size());
+        for (const auto& entry : m_spriteSourceTextures)
+            live.emplace_back(entry.first, entry.second.serial);
+        std::sort(live.begin(), live.end(), [](const std::pair<int, uint64_t>& a,
+                                             const std::pair<int, uint64_t>& b) { return a.second < b.second; });
+        m_spriteSourceOrder.assign(live.begin(), live.end());
+    }
+    return true;
 }
 
 bool VulkanFrameRenderer::RegisterLegacyRgbaCubeTexture(int textureId, uint32_t width,
@@ -3149,7 +3401,7 @@ bool VulkanFrameRenderer::RegisterLegacyDepthTexture(int textureId, uint32_t wid
 
     std::map<int, ShadowMapTarget>::iterator existingTarget =
         m_shadowMapTargets.find(textureId);
-    std::map<int, LegacyTexture>::iterator existingTexture =
+    std::unordered_map<int, LegacyTexture>::iterator existingTexture =
         m_legacyTextures.find(textureId);
     if (existingTarget != m_shadowMapTargets.end() &&
         existingTarget->second.width == width && existingTarget->second.height == height &&
@@ -3259,12 +3511,12 @@ bool VulkanFrameRenderer::RegisterLegacyDepthTexture(int textureId, uint32_t wid
     m_shadowMapTargets[textureId] = std::move(target);
     // Receiver shaders read the scene UBO from set 0 even when its image is
     // a depth map. Initialize binding 1 on this descriptor as on RGBA images.
-    return UpdateTextureTransformDescriptors();
+    return InitializeTextureTransformDescriptor(m_legacyTextures[textureId].descriptorSet);
 }
 
 VkDescriptorSet VulkanFrameRenderer::GetLegacyTextureDescriptorSet(int textureId, int wrapMode)
 {
-    std::map<int, LegacyTexture>::iterator found = m_legacyTextures.find(textureId);
+    std::unordered_map<int, LegacyTexture>::iterator found = m_legacyTextures.find(textureId);
     if (found == m_legacyTextures.end())
         return VK_NULL_HANDLE;
     LegacyTexture& texture = found->second;
@@ -3333,7 +3585,7 @@ VkDescriptorSet VulkanFrameRenderer::GetLegacyTextureDescriptorSet(int textureId
         writes[i].pImageInfo = &image;
     }
     WriteDescriptorSets(2, writes);
-    if (!UpdateTextureTransformDescriptors())
+    if (!InitializeTextureTransformDescriptor(texture.wrapDescriptorSets[wrapMode]))
         return VK_NULL_HANDLE;
     return texture.wrapDescriptorSets[wrapMode];
 }
@@ -3459,7 +3711,7 @@ bool VulkanFrameRenderer::RegisterLegacyRgbaTextureRegion(int textureId, uint32_
 {
     if (!rgbaPixels || width == 0 || height == 0)
         return false;
-    std::map<int, LegacyTexture>::iterator found = m_legacyTextures.find(textureId);
+    std::unordered_map<int, LegacyTexture>::iterator found = m_legacyTextures.find(textureId);
     if (found == m_legacyTextures.end())
         return false;
     LegacyTexture& texture = found->second;
@@ -3494,7 +3746,7 @@ void VulkanFrameRenderer::ReleaseProjectorTextureDescriptorSets()
 
 void VulkanFrameRenderer::ReleaseLegacyTexture(int textureId)
 {
-    std::map<int, LegacyTexture>::iterator found = m_legacyTextures.find(textureId);
+    std::unordered_map<int, LegacyTexture>::iterator found = m_legacyTextures.find(textureId);
     if (found == m_legacyTextures.end()) return;
 
     // This callback can run while a frame is in flight. Move the full resource
@@ -4328,7 +4580,7 @@ bool VulkanFrameRenderer::CompletePendingSubmission()
                 {
                     if (m_gpuAbPairs == 0 && m_pendingAbMode == 1)
                         fprintf(file, "frame,pair,group,mode,queued,skipped,simple_decals,draw_hash,setup_ms,scene_ms,output_ms\n");
-                    const char* groups[] = { "blended_plants", "alpha_test", "terrain", "water", "decals" };
+                    const char* groups[] = { "blended_plants", "alpha_test", "terrain", "water", "decals", "opaque", "opaque_character", "opaque_lightmap", "opaque_bump", "opaque_other" };
                     fprintf(file, "%u,%u,%s,%s,%zu,%u,%u,%llu,%.6f,%.6f,%.6f\n", m_pendingFrameNumber,
                         m_gpuAbPairs, groups[m_pendingAbGroup], m_pendingAbMode == 1 ? "baseline" : "omit",
                         m_pendingDrawCount, m_pendingAbSkipped, m_pendingSimpleDecalDraws,
@@ -4336,7 +4588,7 @@ bool VulkanFrameRenderer::CompletePendingSubmission()
                         frameElapsed[0], frameElapsed[1], frameElapsed[2]);
                     fclose(file);
                 }
-                if (m_pendingAbMode == 2 && ++m_gpuAbPairs >= 10) m_gpuAbArmed = false;
+                if (m_pendingAbMode == 2 && ++m_gpuAbPairs >= 20) m_gpuAbArmed = false;
             }
             if (!m_pendingAbMode && ++samples == 120 && reports < 128)
             {
@@ -4529,6 +4781,7 @@ bool VulkanFrameRenderer::BeginFrame()
     m_stockScissorEnabled = false;
     m_stockScissor = VkRect2D{};
     m_reusableClientGeometry.valid = false;
+    m_frameGeometryUploads.clear();
     m_untranslatedDrawCount = 0;
     m_sceneDiagnostics = VulkanSceneDiagnostics{};
     m_dynamicVertexUsed = 0;
@@ -4703,20 +4956,68 @@ XrView VulkanFrameRenderer::GetSceneCameraView(uint32_t eye) const
 bool VulkanFrameRenderer::PrepareSceneUniforms()
 {
     if (m_stockDraws.empty()) return true;
+    // Opaque instances of the same plant mesh can be drawn near to far.
+    // Earlier depth coverage rejects hidden foliage before texture/fog work.
+    // Keep blending, multipass boundaries, queries and reflection draws ordered.
+    const auto sortablePlant = [](const StockDraw& draw) {
+        if ((draw.pipelineKey[62] & 0x7fffffffu) != 13u || draw.clearDepth ||
+            draw.clearColor || draw.clearStencil || draw.stencilState ||
+            draw.nearestObject || draw.hasWaterReflectionTransform ||
+            draw.hasWaterReflectionUpdate || draw.shadowMapTextureId > 0 ||
+            draw.visibilityQueryIndex != UINT32_MAX ||
+            draw.visibilityCoverageQueryIndex != UINT32_MAX || draw.scissorEnabled)
+            return false;
+        const uint64_t packed = uint64_t(draw.pipelineKey[0]) |
+            (uint64_t(draw.pipelineKey[1]) << 32);
+        VulkanPipelineState state{};
+        return DecodeLegacyPipelineState(uint32_t(packed >> 24), 0, false, 0, state) &&
+            state.depthTestEnable && state.depthWriteEnable && !state.blendEnable &&
+            (state.depthCompareOp == VK_COMPARE_OP_LESS ||
+             state.depthCompareOp == VK_COMPARE_OP_LESS_OR_EQUAL) &&
+            std::isfinite(draw.modelView[14]);
+    };
+    for (size_t first = 0; first < m_stockDraws.size();)
+    {
+        if (!sortablePlant(m_stockDraws[first])) { ++first; continue; }
+        const StockDraw& base = m_stockDraws[first];
+        size_t end = first + 1;
+        for (; end < m_stockDraws.size(); ++end)
+        {
+            const StockDraw& next = m_stockDraws[end];
+            if (!sortablePlant(next) || next.pipelineKey != base.pipelineKey ||
+                next.textureId != base.textureId || next.vertexBuffer != base.vertexBuffer ||
+                next.vertexBufferOffset != base.vertexBufferOffset ||
+                next.indexBuffer != base.indexBuffer || next.firstIndex != base.firstIndex ||
+                next.indexCount != base.indexCount || next.vertexOffset != base.vertexOffset)
+                break;
+        }
+        if (end - first > 1)
+            std::stable_sort(m_stockDraws.begin()+first, m_stockDraws.begin()+end,
+                [](const StockDraw& a, const StockDraw& b) {
+                    return std::fabs(a.modelView[14]) < std::fabs(b.modelView[14]);
+                });
+        first = end;
+    }
+    size_t uniformBlockCount = 0;
+    for (const StockDraw& draw : m_stockDraws)
+        uniformBlockCount += draw.hasWaterReflectionTransform ? 4u : (m_multiview ? 1u : 2u);
     // Two disjoint ranges keep descriptors stable while the previous frame
     // reads its uniforms. Only allocation growth needs to drain that frame.
-    if (m_stockDraws.size() > m_uniformDrawCapacity)
+    if (m_stockDraws.size() > m_uniformDrawCapacity || uniformBlockCount > m_uniformBlockCapacity)
     {
         if (!CompletePendingSubmission()) return false;
         size_t capacity = m_uniformDrawCapacity ? m_uniformDrawCapacity : 512;
         while (capacity < m_stockDraws.size()) capacity *= 2;
         m_uniformDrawCapacity = capacity;
+        size_t blockCapacity = m_uniformBlockCapacity ? m_uniformBlockCapacity : 512;
+        while (blockCapacity < uniformBlockCount) blockCapacity *= 2;
+        m_uniformBlockCapacity = blockCapacity;
     }
     m_stereoDrawBase = static_cast<uint32_t>(m_uniformFrameSlot * m_uniformDrawCapacity);
-    const VkDeviceSize frameUniformBase = static_cast<VkDeviceSize>(m_stereoDrawBase) *
-                                         m_textureTransformStride * 4;
-    const VkDeviceSize requiredSize = static_cast<VkDeviceSize>(m_uniformDrawCapacity) *
-                                      m_textureTransformStride * 8;
+    const VkDeviceSize frameUniformBase = static_cast<VkDeviceSize>(m_uniformFrameSlot) *
+                                         m_uniformBlockCapacity * m_textureTransformStride;
+    const VkDeviceSize requiredSize = static_cast<VkDeviceSize>(m_uniformBlockCapacity) *
+                                      m_textureTransformStride * 2;
     if (requiredSize > std::numeric_limits<uint32_t>::max()) return false;
     const VkBuffer previousStereo = m_stereoTransformBuffer.buffer;
     if (!EnsureDynamicBufferCapacity(m_stereoTransformBuffer, m_previousStereoTransformBuffers,
@@ -4733,8 +5034,13 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
     BindStereoDescriptor(m_descriptorSet);
     if (previousBuffer != m_textureTransformBuffer.buffer && !UpdateTextureTransformDescriptors())
         return false;
+    VkDeviceSize nextUniformOffset = frameUniformBase;
     for (StockDraw& draw : m_stockDraws)
-        draw.textureTransformOffset += static_cast<uint32_t>(frameUniformBase);
+    {
+        draw.textureTransformOffset = static_cast<uint32_t>(nextUniformOffset);
+        nextUniformOffset += m_textureTransformStride *
+            (draw.hasWaterReflectionTransform ? 4u : (m_multiview ? 1u : 2u));
+    }
     // Already mapped coherent allocations: writes stay inside the free range.
     const uint8_t zero = 0;
     if (!m_textureTransformBuffer.mappedData &&
@@ -4754,6 +5060,7 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
         float fixedLightInfo[4];
         float fixedMatrices[2][16];
         uint32_t textureConstants[8];
+        float fogEye1Ray[4];
     };
     static_assert(sizeof(SceneUniformBlock) == kSceneUniformBlockSize,
                   "scene UBO descriptor range must cover all shader fields");
@@ -4761,7 +5068,13 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
     {
         std::memcpy(block.textureConstants, source.textureConstants, sizeof(block.textureConstants));
         block.fixedLightInfo[0] = static_cast<float>(source.fixedLightCount);
-        block.fixedLightInfo[1] = block.fixedLightInfo[2] = block.fixedLightInfo[3] = 0.0f;
+        // The vertex light evaluator uses only fixedLightInfo.x. Its remaining
+        // components carry depth reconstruction coefficients shared by fog.
+        const float depthScale = (source.farPlane - source.nearPlane) /
+            std::max(source.viewport.maxDepth - source.viewport.minDepth, 1.0e-7f);
+        block.fixedLightInfo[1] = source.nearPlane * source.farPlane;
+        block.fixedLightInfo[2] = source.farPlane + source.viewport.minDepth * depthScale;
+        block.fixedLightInfo[3] = depthScale;
         // Unused control padding carries the effective viewport depth range
         // for fog reconstruction, including nearest-object draws.
         block.linearControls[0][3] = source.viewport.minDepth;
@@ -4823,6 +5136,7 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
     const auto prepareRange = [&](size_t first, size_t last)
     {
         float cachedNear = -1.0f, cachedFar = -1.0f;
+        bool cachedNearest = false;
         float eyeProjection[2][16]{}, eyeView[2][16]{};
         for (size_t index = first; index < last; ++index)
         {
@@ -4831,46 +5145,62 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
             if (!draw.indexCount || !draw.vertexBuffer) continue;
             if (m_multiview)
             {
-                std::memcpy(stereoTransforms[index].plantsAmbient, draw.terrainProjectionRows[0][6], 16);
-                std::memcpy(stereoTransforms[index].plantsBend, draw.terrainProjectionRows[1][6], 16);
-                if (cachedNear != draw.nearPlane || cachedFar != draw.farPlane)
+                if ((draw.pipelineKey[62] & 0x7fffffffu) == 13u)
+                {
+                    std::memcpy(stereoTransforms[index].plantsAmbient, draw.terrainProjectionRows[0][6], 16);
+                    std::memcpy(stereoTransforms[index].plantsBend, draw.terrainProjectionRows[1][6], 16);
+                }
+                if (cachedNear != draw.nearPlane || cachedFar != draw.farPlane || cachedNearest != draw.nearestObject)
                 {
                     const float identity[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
                     for (uint32_t eye = 0; eye < 2; ++eye)
                         BuildOpenXrEyeMvp(stereoViews[eye], m_referenceHeadPose, identity,
                             draw.nearPlane, draw.farPlane, eyeProjection[eye], eyeView[eye], draw.nearestObject);
-                    cachedNear = draw.nearPlane; cachedFar = draw.farPlane;
+                    cachedNear = draw.nearPlane; cachedFar = draw.farPlane; cachedNearest = draw.nearestObject;
                 }
                 for (uint32_t eye = 0; eye < 2; ++eye)
                 {
-                    float unusedModelView[16];
                     ApplyOpenXrEyeMatrices(eyeView[eye], eyeProjection[eye], draw.modelView,
-                        stereoTransforms[index].mvp[eye], unusedModelView);
-                    std::memcpy(stereoTransforms[index].reflectionMvp[eye],
-                                stereoTransforms[index].mvp[eye], 64);
+                        stereoTransforms[index].mvp[eye], nullptr);
+                    if (draw.waterEffect)
+                        std::memcpy(stereoTransforms[index].reflectionMvp[eye],
+                                    stereoTransforms[index].mvp[eye], 64);
                 }
             }
             const VkDeviceSize transformOffset = draw.textureTransformOffset;
             const uint32_t uniformEyeCount = m_multiview && !draw.hasWaterReflectionTransform ? 1u : 2u;
             const bool singleSharedEyeBlock = uniformEyeCount == 1u;
             SceneUniformBlock eyeBlockStorage;
-            SceneUniformBlock* eyeBlock = &eyeBlockStorage;
+            SceneUniformBlock* eyeBlock;
             if (singleSharedEyeBlock)
             {
                 // Multiview's ordinary draws use the same scene block for
-                // both eyes. Construct it in its final mapped location to
-                // avoid building a large temporary and copying it again.
-                eyeBlock = ::new (destination + transformOffset) SceneUniformBlock{};
+                // both eyes. Start its lifetime in the final mapped location
+                // without clearing fields whose shader reads are gated below.
+                eyeBlock = ::new (destination + transformOffset) SceneUniformBlock;
             }
             else
-                std::memset(&eyeBlockStorage, 0, sizeof(eyeBlockStorage));
+                eyeBlock = &eyeBlockStorage;
+            // Shadow rows are read only when their stage mask is set;
+            // linear planes/matrices only when linearControls[stage].x is set.
+            // Fixed light arrays are read only when fixedLightInfo.x is nonzero.
+            // Clear these small control arrays, then fill only the active data.
+            std::memset(eyeBlock->shadowMapStageMask, 0, sizeof(eyeBlock->shadowMapStageMask));
+            std::memset(eyeBlock->linearControls, 0, sizeof(eyeBlock->linearControls));
             std::memcpy(eyeBlock->rows, draw.textureTransformRows, sizeof(eyeBlock->rows));
             std::memcpy(eyeBlock->fog, draw.fogConstants, sizeof(eyeBlock->fog));
+            if (draw.fogMode == 1)
+            {
+                const float range = draw.fogEnd - draw.fogStart;
+                eyeBlock->fog[6] = range != 0.0f ? 1.0f / range :
+                    std::copysign(std::numeric_limits<float>::infinity(), range);
+            }
             std::memcpy(eyeBlock->lighting, draw.lightingConstants, sizeof(eyeBlock->lighting));
             fillShadowTransforms(*eyeBlock, draw);
             fillLinearTexgen(*eyeBlock, draw);
             std::memcpy(eyeBlock->terrainProjection, draw.terrainProjectionRows,
                         sizeof(eyeBlock->terrainProjection));
+            std::memset(eyeBlock->fogEye1Ray, 0, sizeof(eyeBlock->fogEye1Ray));
             for (uint32_t eye = 0; eye < uniformEyeCount; ++eye)
             {
                 // Restore the ordinary clip plane after writing the reflected block.
@@ -4885,6 +5215,30 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
                 }
                 eyeRows[2][0][3] = draw.viewport.width;
                 eyeRows[2][1][3] = draw.viewport.height;
+                // Exactly the same radial ray as the previous per-fragment
+                // viewport normalization and tangent interpolation.
+                const float xSlope = (eyeRows[1][0][3] - eyeRows[0][0][3]) /
+                    std::max(draw.viewport.width, 1.0f);
+                const float ySlope = (eyeRows[1][1][3] - eyeRows[0][1][3]) /
+                    std::max(draw.viewport.height, 1.0f);
+                eyeBlock->linearControls[4][3] = xSlope;
+                eyeBlock->linearControls[5][3] = eyeRows[0][0][3] - draw.viewport.x * xSlope;
+                eyeBlock->linearControls[6][3] = ySlope;
+                eyeBlock->linearControls[7][3] = eyeRows[0][1][3] - draw.viewport.y * ySlope;
+                if (m_multiview)
+                {
+                    const bool rightEyeFov = radialFog && m_frame.viewCount > 1;
+                    const float left = rightEyeFov ? eyeTangents[1][0] : eyeRows[0][0][3];
+                    const float right = rightEyeFov ? eyeTangents[1][1] : eyeRows[1][0][3];
+                    const float up = rightEyeFov ? eyeTangents[1][2] : eyeRows[0][1][3];
+                    const float down = rightEyeFov ? eyeTangents[1][3] : eyeRows[1][1][3];
+                    const float rightXSlope = (right - left) / std::max(draw.viewport.width, 1.0f);
+                    const float rightYSlope = (down - up) / std::max(draw.viewport.height, 1.0f);
+                    eyeBlock->fogEye1Ray[0] = rightXSlope;
+                    eyeBlock->fogEye1Ray[1] = left - draw.viewport.x * rightXSlope;
+                    eyeBlock->fogEye1Ray[2] = rightYSlope;
+                    eyeBlock->fogEye1Ray[3] = up - draw.viewport.y * rightYSlope;
+                }
                 if (!m_multiview || eye == 0)
                 {
                     if (!singleSharedEyeBlock)
@@ -5064,6 +5418,11 @@ bool VulkanFrameRenderer::RecordShadowMapDraws(VkCommandBuffer commandBuffer,
             draw.useTextureStages4To7[1] || draw.useTextureStages4To7[2] ||
             draw.useTextureStages4To7[3])
             textureSetCount = 8;
+        if (draw.specularGlossTextureId > 0)
+        {
+            textureSets[6] = GetLegacyTextureDescriptorSet(draw.specularGlossTextureId, -1);
+            if (!textureSets[6]) { ++m_sceneDiagnostics.missingTextureAtRecord; continue; }
+        }
         if (draw.specularOcclusionTextureId > 0 &&
             draw.specularOcclusionChannel >= 0 && draw.specularOcclusionChannel < 4)
         {
@@ -5266,6 +5625,11 @@ bool VulkanFrameRenderer::RecordWaterReflectionDraws(VkCommandBuffer commandBuff
             if (!textureSets[stage + 4]) missingTexture = true;
             textureSetCount = stage + 5;
         }
+        if (draw.specularGlossTextureId > 0)
+        {
+            textureSets[6] = GetLegacyTextureDescriptorSet(draw.specularGlossTextureId, -1);
+            if (!textureSets[6]) missingTexture = true;
+        }
         if (draw.specularOcclusionTextureId > 0 && draw.specularOcclusionChannel >= 0 &&
             draw.specularOcclusionChannel < 4)
         {
@@ -5381,7 +5745,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 m_gpuAbBaselineReady = false;
             }
         }
-        if (m_gpuAbArmed && m_gpuAbPairs < 10 && m_stockDraws.size() >= 256)
+        if (m_gpuAbArmed && m_gpuAbPairs < 20 && m_stockDraws.size() >= 256)
         {
             if (m_frameBeginSuccesses % 120 == 119)
             {
@@ -5446,7 +5810,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
     }
     if (viewIndex == 0)
     {
-        for (std::map<int, LegacyTexture>::const_iterator it = m_legacyTextures.begin();
+        for (std::unordered_map<int, LegacyTexture>::const_iterator it = m_legacyTextures.begin();
              it != m_legacyTextures.end(); ++it)
         {
             if (it->second.uploadPending &&
@@ -5871,6 +6235,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
         cameraView.pose.position.z = m_referenceHeadPose.position.z + eyeOffsetZ;
         float cachedEyeView[16]{}, cachedEyeProjection[16]{};
         float cachedNear = -1.0f, cachedFar = -1.0f;
+        bool cachedNearest = false;
         VkPipeline boundScenePipeline = VK_NULL_HANDLE;
         VkBuffer boundIndexBuffer = VK_NULL_HANDLE;
         VkBuffer boundVertexBuffers[3]{};
@@ -5878,18 +6243,26 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
         uint32_t boundVertexBindingCount = 0;
         VkDescriptorSet boundTextureSets[8]{};
         uint32_t boundTextureSetCount = 0;
+        bool boundStencilValid = false;
+        uint32_t boundStencilMask = 0, boundStencilRef = 0;
         bool waterSnapshotTaken = false;
         uint32_t plantsDraws = 0, plantsCalls = 0, plantsMaxInstances = 0;
-        const auto canInstancePlants = [](const StockDraw& a, const StockDraw& b)
+        uint32_t plantsBatchFailures[5]{};
+        const auto canInstancePlants = [&](const StockDraw& a, const StockDraw& b)
         {
             if ((a.pipelineKey[62] & 0x7fffffffu) != 13u ||
-                (b.pipelineKey[62] & 0x7fffffffu) != 13u ||
-                !a.plantsVertexData || !b.plantsVertexData ||
-                !a.plantsIndexData || !b.plantsIndexData ||
+                (b.pipelineKey[62] & 0x7fffffffu) != 13u)
+            { ++plantsBatchFailures[0]; return false; }
+            if (!a.plantsVertexData || !b.plantsVertexData ||
+                !a.plantsIndexData || !b.plantsIndexData)
+            { ++plantsBatchFailures[1]; return false; }
+            if (a.pipeline != b.pipeline)
+            { ++plantsBatchFailures[2]; return false; }
+            if (
                 b.clearColor || b.clearDepth || b.clearStencil || b.shadowMapTextureId ||
                 a.visibilityQueryIndex != UINT32_MAX || b.visibilityQueryIndex != UINT32_MAX ||
                 a.visibilityCoverageQueryIndex != UINT32_MAX || b.visibilityCoverageQueryIndex != UINT32_MAX ||
-                a.pipeline != b.pipeline || a.indexCount != b.indexCount ||
+                a.indexCount != b.indexCount ||
                 a.vertexOffset != b.vertexOffset || a.plantsVertexBytes != b.plantsVertexBytes ||
                 a.textureId != b.textureId || a.textureWrapMode[0] != b.textureWrapMode[0] ||
                 a.stencilRef != b.stencilRef || a.stencilMask != b.stencilMask ||
@@ -5898,13 +6271,16 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 std::memcmp(&a.viewport, &b.viewport, sizeof(a.viewport)) ||
                 (a.scissorEnabled && std::memcmp(&a.scissor, &b.scissor, sizeof(a.scissor))) ||
                 std::memcmp(a.fogConstants, b.fogConstants, sizeof(float) * 12) ||
-                std::memcmp(a.clipPlane, b.clipPlane, sizeof(a.clipPlane))) return false;
+                std::memcmp(a.clipPlane, b.clipPlane, sizeof(a.clipPlane)))
+            { ++plantsBatchFailures[3]; return false; }
             // Pointer identity alone is unsafe for scratch/generated vertices.
             // Compare uploaded bytes; color weights and UVs must match exactly.
-            return !std::memcmp(a.plantsVertexData, b.plantsVertexData,
+            const bool identical = !std::memcmp(a.plantsVertexData, b.plantsVertexData,
                                 static_cast<size_t>(a.plantsVertexBytes)) &&
                    !std::memcmp(a.plantsIndexData, b.plantsIndexData,
                                 static_cast<size_t>(a.indexCount) * sizeof(uint16_t));
+            if (!identical) ++plantsBatchFailures[4];
+            return identical;
         };
         // OpenGL consumes draws in submission order. Preserve that order here:
         // moving water across other passes changes blend destinations and captures.
@@ -5918,16 +6294,33 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 const uint64_t key = draw.pipelineKey[0] | (uint64_t(draw.pipelineKey[1]) << 32);
                 const uint32_t state = static_cast<uint32_t>(key >> 24);
                 const float terrain = draw.terrainProjectionRows[1][7][3];
-                const bool isTerrain = (draw.pipelineKey[62] & 0x7fffffffu) == 11u ||
+                const bool isTerrain = draw.terrainDraw || (draw.pipelineKey[62] & 0x7fffffffu) == 11u ||
                     (terrain > 99.5f && terrain < 104.5f) ||
                     (terrain > 200.5f && terrain < 204.5f) ||
                     (terrain > 300.5f && terrain < 304.5f) ||
                     (terrain > 399.5f && terrain < 412.5f);
-                const uint32_t group = m_gpuAbPairs % 5;
+                const uint32_t group = m_gpuAbPairs % 10;
+                const bool opaqueDraw = !draw.profilePlants && !draw.terrainDraw &&
+                    !draw.waterDraw && !draw.decalDraw && draw.alphaTestRef <= 0.0f &&
+                    !(state & 0xf0000000u);
+                const bool characterOpaque = opaqueDraw && draw.characterDraw;
+                const bool lightmappedOpaque = opaqueDraw && !draw.characterDraw &&
+                    (draw.bakedLightmap || draw.directionalLightmap);
+                const bool bumpOpaque = opaqueDraw && !draw.characterDraw &&
+                    !draw.bakedLightmap && !draw.directionalLightmap &&
+                    (draw.useNormalMap || draw.specularOcclusionTextureId > 0);
                 const bool omit = group == 0 ? draw.profilePlants && (state & 0xffu) && !(state & 0x100u) :
                     group == 1 ? (draw.alphaTestRef > 0.0f || (state & 0xf0000000u)) :
                     group == 2 ? isTerrain :
-                    group == 3 ? draw.waterEffect : draw.decalDraw;
+                    group == 3 ? (draw.waterDraw || draw.waterEffect) :
+                    group == 4 ? draw.decalDraw :
+                    group == 5 ? opaqueDraw :
+                    group == 6 ? characterOpaque :
+                    group == 7 ? lightmappedOpaque :
+                    group == 8 ? bumpOpaque :
+                    opaqueDraw && !draw.characterDraw && !draw.bakedLightmap &&
+                        !draw.directionalLightmap && !draw.useNormalMap &&
+                        draw.specularOcclusionTextureId <= 0;
                 if (omit) { ++m_recordedAbSkipped; continue; }
             }
             if (draw.clearColor || draw.clearDepth || draw.clearStencil)
@@ -6073,6 +6466,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                     boundIndexBuffer = VK_NULL_HANDLE;
                     boundVertexBindingCount = 0;
                     boundTextureSetCount = 0;
+                    boundStencilValid = false;
                 }
                 m_cmdSetViewport(commandBuffer, 0, 1, &draw.viewport);
                 m_cmdSetScissor(commandBuffer, 0, 1, &drawScissor);
@@ -6089,12 +6483,6 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 textureSet = m_descriptorSet;
             if (draw.textureId)
             {
-                std::map<int, LegacyTexture>::const_iterator texture = m_legacyTextures.find(draw.textureId);
-                if (texture == m_legacyTextures.end())
-                {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    continue;
-                }
                 textureSets[0] = GetLegacyTextureDescriptorSet(
                     draw.textureId, draw.textureWrapMode[0]);
                 if (!textureSets[0])
@@ -6111,12 +6499,6 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
             if (draw.useSecondTexture || draw.useNormalMap)
             {
                 const int secondaryTextureId = draw.useNormalMap ? draw.normalMapTextureId : draw.textureId1;
-                std::map<int, LegacyTexture>::const_iterator texture = m_legacyTextures.find(secondaryTextureId);
-                if (texture == m_legacyTextures.end())
-                {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    continue;
-                }
                 textureSets[1] = GetLegacyTextureDescriptorSet(
                     secondaryTextureId, draw.textureWrapMode[1]);
                 if (!textureSets[1])
@@ -6148,13 +6530,6 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
             }
             if (draw.useThirdTexture)
             {
-                std::map<int, LegacyTexture>::const_iterator texture =
-                    m_legacyTextures.find(draw.textureStage2.textureId);
-                if (texture == m_legacyTextures.end())
-                {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    continue;
-                }
                 textureSets[2] = GetLegacyTextureDescriptorSet(
                     draw.textureStage2.textureId, draw.textureWrapMode[2]);
                 if (!textureSets[2])
@@ -6165,13 +6540,6 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
             }
             if (draw.useFourthTexture)
             {
-                std::map<int, LegacyTexture>::const_iterator texture =
-                    m_legacyTextures.find(draw.textureStage3.textureId);
-                if (texture == m_legacyTextures.end())
-                {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    continue;
-                }
                 textureSets[3] = GetLegacyTextureDescriptorSet(
                     draw.textureStage3.textureId, draw.textureWrapMode[3]);
                 if (!textureSets[3])
@@ -6194,7 +6562,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 if (!draw.useTextureStages4To7[stageIndex])
                     continue;
                 const StockDrawTextureStage& stage = draw.textureStages4To7[stageIndex];
-                std::map<int, LegacyTexture>::const_iterator texture = m_legacyTextures.find(stage.textureId);
+                std::unordered_map<int, LegacyTexture>::const_iterator texture = m_legacyTextures.find(stage.textureId);
                 if (texture == m_legacyTextures.end())
                 {
                     ++m_sceneDiagnostics.missingTextureAtRecord;
@@ -6226,6 +6594,11 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 textureSetCount = 8;
             if (missingExtraTexture)
                 continue;
+            if (draw.specularGlossTextureId > 0)
+            {
+                textureSets[6] = GetLegacyTextureDescriptorSet(draw.specularGlossTextureId, -1);
+                if (!textureSets[6]) { ++m_sceneDiagnostics.missingTextureAtRecord; continue; }
+            }
             if (draw.specularOcclusionTextureId > 0 &&
                 draw.specularOcclusionChannel >= 0 && draw.specularOcclusionChannel < 4)
             {
@@ -6238,7 +6611,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 }
             }
             textureSetCount = 8;
-            float pushConstants[32];
+            float pushConstants[32]{};
             float* mvp = pushConstants;
             float* eyeModelView = pushConstants + 16;
             if (!pipeline || pipeline != draw.pipeline)
@@ -6256,7 +6629,13 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 }
                 continue;
             }
-            if (cachedNear != draw.nearPlane || cachedFar != draw.farPlane)
+            const bool auditEyeTransform = m_diagnosticLogging && i == 0 &&
+                (m_eyeTransformAuditFrame <= 4 || m_eyeTransformAuditFrame % 120u == 0u);
+            // Multiview MVPs have already been prepared in the stereo buffer.
+            // Retain the CPU model-view for untextured normal variants and audit.
+            const bool needsCpuEyeTransform = !m_multiview || auditEyeTransform ||
+                (!draw.textureId && HasVulkanVertexNormal(draw.vertexFormat));
+            if (needsCpuEyeTransform && (cachedNear != draw.nearPlane || cachedFar != draw.farPlane || cachedNearest != draw.nearestObject))
             {
                 const float identity[16] = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
                 if (!BuildOpenXrEyeMvp(cameraView, m_referenceHeadPose, identity,
@@ -6268,11 +6647,12 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 }
                 cachedNear = draw.nearPlane;
                 cachedFar = draw.farPlane;
+                cachedNearest = draw.nearestObject;
             }
-            ApplyOpenXrEyeMatrices(cachedEyeView, cachedEyeProjection,
-                                  draw.modelView, mvp, eyeModelView);
-            if (m_diagnosticLogging && i == 0 && (m_eyeTransformAuditFrame <= 4 ||
-                           (m_eyeTransformAuditFrame % 120u) == 0u))
+            if (needsCpuEyeTransform)
+                ApplyOpenXrEyeMatrices(cachedEyeView, cachedEyeProjection,
+                                      draw.modelView, mvp, eyeModelView);
+            if (auditEyeTransform)
                 CryLogAlways("OpenXR/Vulkan MVP audit frame=%u eye=%u near=%.6f far=%.6f nearest=%u mvpC0=(%.6f,%.6f,%.6f,%.6f) mvpC1=(%.6f,%.6f,%.6f,%.6f) mvpC2=(%.6f,%.6f,%.6f,%.6f) mvpC3=(%.6f,%.6f,%.6f,%.6f)",
                     m_eyeTransformAuditFrame, viewIndex, draw.nearPlane, draw.farPlane,
                     draw.nearestObject ? 1u : 0u,
@@ -6367,16 +6747,22 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
             {
                 m_cmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
                 boundScenePipeline = pipeline;
+                boundStencilValid = false;
             }
-            if (draw.stencilState)
+            if (draw.stencilState && (!boundStencilValid ||
+                boundStencilMask != draw.stencilMask || boundStencilRef != draw.stencilRef))
             {
                 m_cmdSetStencilCompareMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, draw.stencilMask);
                 m_cmdSetStencilWriteMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, 0xffffffffu);
                 m_cmdSetStencilReference(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, draw.stencilRef);
+                boundStencilMask = draw.stencilMask;
+                boundStencilRef = draw.stencilRef;
+                boundStencilValid = true;
             }
             if (textureSetCount)
             {
-                BindStereoDescriptor(textureSets[0]);
+                if (boundTextureSetCount == 0 || boundTextureSets[0] != textureSets[0])
+                    BindStereoDescriptor(textureSets[0]);
                 uint32_t transformOffsets[8]{};
                 transformOffsets[0] = draw.textureTransformOffset +
                     static_cast<uint32_t>(viewIndex * m_textureTransformStride);
@@ -6560,9 +6946,11 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                                      plantsCensusStarted ? "ab" : "wb"))
             {
                 if (!plantsCensusStarted)
-                    fprintf(census, "frame,source_draws,submitted_calls,max_instances\n");
-                fprintf(census, "%u,%u,%u,%u\n", m_frameBeginSuccesses,
-                        plantsDraws, plantsCalls, plantsMaxInstances);
+                    fprintf(census, "frame,source_draws,submitted_calls,max_instances,next_nonplant,missing_geometry,pipeline_mismatch,state_or_layout_mismatch,geometry_mismatch\n");
+                fprintf(census, "%u,%u,%u,%u,%u,%u,%u,%u,%u\n", m_frameBeginSuccesses,
+                    plantsDraws, plantsCalls, plantsMaxInstances,
+                    plantsBatchFailures[0], plantsBatchFailures[1], plantsBatchFailures[2],
+                    plantsBatchFailures[3], plantsBatchFailures[4]);
                 fclose(census);
                 plantsCensusStarted = true;
             }
@@ -6629,7 +7017,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 const PanelImage& image = m_panelImages[i];
                 m_cmdSetScissor(commandBuffer, 0, 1,
                     image.scissorEnabled ? &image.scissor : &uiScissor);
-                std::map<int, LegacyTexture>::const_iterator texture = m_legacyTextures.find(image.textureId);
+                std::unordered_map<int, LegacyTexture>::const_iterator texture = m_legacyTextures.find(image.textureId);
                 if (texture == m_legacyTextures.end() || !texture->second.descriptorSet)
                     continue;
                 if (image.indexedGeometry)
@@ -6768,12 +7156,52 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
     return m_endCommandBuffer(commandBuffer) == VK_SUCCESS;
 }
 
+bool VulkanFrameRenderer::ResolveScenePipelines()
+{
+    if (m_pendingScenePipelines.empty()) return true;
+    bool success = true;
+    for (auto& entry : m_pendingScenePipelines)
+    {
+        const auto result = entry.second.get();
+        if (result.pipeline)
+            m_scenePipelineCache[entry.first] = result.pipeline;
+        else
+        {
+            ++m_sceneDiagnostics.pipelineCreationFailed;
+            success = false;
+        }
+    }
+    m_pendingScenePipelines.clear();
+    for (auto& draw : m_stockDraws)
+    {
+        if (!draw.pipeline)
+        {
+            auto found = m_scenePipelineCache.find(draw.pipelineKey);
+            if (found != m_scenePipelineCache.end()) draw.pipeline = found->second;
+        }
+        if (!draw.reflectionPipeline)
+        {
+            if (!draw.separateReflectionPipeline) draw.reflectionPipeline = draw.pipeline;
+            else
+            {
+                auto reflectionKey = draw.pipelineKey;
+                reflectionKey[0] &= ~0x3u;
+                reflectionKey[63] = 0;
+                auto found = m_scenePipelineCache.find(reflectionKey);
+                if (found != m_scenePipelineCache.end()) draw.reflectionPipeline = found->second;
+            }
+        }
+    }
+    m_lastScenePipelineValid = false;
+    return success;
+}
+
 bool VulkanFrameRenderer::EndFrame()
 {
     const double cpuEndStartMs = FrameClockMs();
     const double cpuCaptureMs = m_cpuCaptureStartMs > 0.0 ?
         cpuEndStartMs - m_cpuCaptureStartMs : 0.0;
-    double cpuRecordMs = 0.0, gpuWaitMs = 0.0, uniformPrepareMs = 0.0;
+    double cpuRecordMs = 0.0, gpuWaitMs = 0.0, uniformPrepareMs = 0.0, pipelineWaitMs = 0.0;
     ++m_frameEndCalls;
     static uint32_t frameLifecycleEndAuditCount = 0;
     const uint32_t auditCall = frameLifecycleEndAuditCount++;
@@ -6805,7 +7233,7 @@ bool VulkanFrameRenderer::EndFrame()
             result = false;
         }
         uniformPrepareMs = FrameClockMs() - cpuRecordStartMs;
-        for (std::map<int, LegacyTexture>::iterator it = m_legacyTextures.begin();
+        for (std::unordered_map<int, LegacyTexture>::iterator it = m_legacyTextures.begin();
              it != m_legacyTextures.end(); ++it)
         {
             if (!it->second.uploadPending)
@@ -6816,6 +7244,13 @@ bool VulkanFrameRenderer::EndFrame()
                     it->second.texture.width, it->second.texture.height, it->second.texture))
                 result = false;
         }
+        const double pipelineWaitStartMs = FrameClockMs();
+        if (result && !ResolveScenePipelines())
+        {
+            SetError("background scene pipeline compilation failed");
+            result = false;
+        }
+        pipelineWaitMs = FrameClockMs() - pipelineWaitStartMs;
         const uint32_t renderViewCount = m_frame.viewCount < m_viewCount ? m_frame.viewCount : m_viewCount;
         VkCommandBuffer frameCommands[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
         uint32_t commandCount = 0;
@@ -6874,7 +7309,7 @@ bool VulkanFrameRenderer::EndFrame()
                 m_pendingDrawCount = m_stockDraws.size();
                 m_pendingAbMode = m_recordedAbMode;
                 m_pendingAbSkipped = m_recordedAbSkipped;
-                m_pendingAbGroup = m_gpuAbPairs % 5;
+                m_pendingAbGroup = m_gpuAbPairs % 10;
                 m_pendingAbHash = m_recordedAbHash;
                 m_pendingSimpleDecalDraws = 0;
                 m_pendingGpuProfiles.swap(m_recordedGpuProfiles);
@@ -6903,7 +7338,7 @@ bool VulkanFrameRenderer::EndFrame()
                 m_pendingReadBuffers.insert(m_stereoTransformBuffer.buffer);
             }
             if (queueSubmitted && firstViewRecorded)
-                for (std::map<int, LegacyTexture>::iterator it = m_legacyTextures.begin();
+                for (std::unordered_map<int, LegacyTexture>::iterator it = m_legacyTextures.begin();
                      it != m_legacyTextures.end(); ++it)
                     it->second.uploadPending = false;
             if (!queueSubmitted)
@@ -6981,14 +7416,14 @@ bool VulkanFrameRenderer::EndFrame()
     if (result && m_frame.shouldRender && m_cpuCaptureStartMs > 0.0)
     {
         static unsigned samples = 0, reports = 0;
-        static double sums[7] = {}, maxima[7] = {};
+        static double sums[8] = {}, maxima[8] = {};
         static uint64_t decalDrawSum = 0, decalMergedSum = 0;
-        const double phases[7] = {m_cpuBeginDurationMs, cpuCaptureMs,
+        const double phases[8] = {m_cpuBeginDurationMs, cpuCaptureMs,
             cpuRecordMs, gpuWaitMs, FrameClockMs() - cpuEndStartMs,
-            m_cpuUpdateDurationMs, uniformPrepareMs};
+            m_cpuUpdateDurationMs, uniformPrepareMs, pipelineWaitMs};
         if (reports < 128)
         {
-            for (unsigned i = 0; i < 7; ++i)
+            for (unsigned i = 0; i < 8; ++i)
             {
                 sums[i] += phases[i];
                 if (phases[i] > maxima[i]) maxima[i] = phases[i];
@@ -7000,9 +7435,9 @@ bool VulkanFrameRenderer::EndFrame()
                 FILE* file = fopen("/sdcard/FarCry/vulkan_frame_timings.csv", reports ? "ab" : "wb");
                 if (file)
                 {
-                    if (!reports) fprintf(file, "frame,draws,begin_avg,begin_max,capture_avg,capture_max,record_avg,record_max,gpu_wait_avg,gpu_wait_max,end_avg,end_max,update_gap_avg,update_gap_max,uniform_avg,uniform_max,multiview,scene_draw_calls,decal_draws_avg,decal_merged_avg\n");
+                    if (!reports) fprintf(file, "frame,draws,begin_avg,begin_max,capture_avg,capture_max,record_avg,record_max,gpu_wait_avg,gpu_wait_max,end_avg,end_max,update_gap_avg,update_gap_max,uniform_avg,uniform_max,pipeline_wait_avg,pipeline_wait_max,multiview,scene_draw_calls,decal_draws_avg,decal_merged_avg\n");
                     fprintf(file, "%u,%zu", m_frameBeginSuccesses, m_stockDraws.size());
-                    for (unsigned i = 0; i < 7; ++i)
+                    for (unsigned i = 0; i < 8; ++i)
                         fprintf(file, ",%.3f,%.3f", sums[i] / samples, maxima[i]);
                     fprintf(file, ",%u,%u,%.2f,%.2f\n", m_multiview ? 1u : 0u,
                         m_sceneDiagnostics.recordedEyeDraws,
@@ -7012,7 +7447,7 @@ bool VulkanFrameRenderer::EndFrame()
                 }
                 ++reports;
                 samples = 0;
-                for (unsigned i = 0; i < 7; ++i) sums[i] = maxima[i] = 0.0;
+                for (unsigned i = 0; i < 8; ++i) sums[i] = maxima[i] = 0.0;
                 decalDrawSum = decalMergedSum = 0;
             }
         }
@@ -7039,6 +7474,9 @@ bool VulkanFrameRenderer::EndFrame()
 void VulkanFrameRenderer::Shutdown()
 {
     m_uniformWorker.Stop();
+    // Drain compilation before destroying any referenced modules or layouts.
+    m_pipelineFactory.StopCompiler();
+    ResolveScenePipelines();
     CompletePendingSubmission();
     if (m_resources)
     {
@@ -7123,12 +7561,12 @@ void VulkanFrameRenderer::Shutdown()
              it != m_panelPipelineCache.end(); ++it)
             if (it->second && m_destroyPipeline)
                 m_destroyPipeline(m_context->GetDevice(), it->second, nullptr);
-    for (std::map<std::array<uint32_t, 64>, VkPipeline>::iterator it = m_scenePipelineCache.begin();
+    for (auto it = m_scenePipelineCache.begin();
              it != m_scenePipelineCache.end(); ++it)
             if (it->second && m_destroyPipeline)
                 m_destroyPipeline(m_context->GetDevice(), it->second, nullptr);
         if (m_resources)
-            for (std::map<int, LegacyTexture>::iterator it = m_legacyTextures.begin();
+            for (std::unordered_map<int, LegacyTexture>::iterator it = m_legacyTextures.begin();
              it != m_legacyTextures.end(); ++it)
             {
                 ReleaseLegacyTextureWrapVariants(it->second);
@@ -7187,6 +7625,7 @@ void VulkanFrameRenderer::Shutdown()
             if (m_causticsFragmentShader) m_destroyShaderModule(m_context->GetDevice(), m_causticsFragmentShader, nullptr);
             if (m_plantsVertexShader) m_destroyShaderModule(m_context->GetDevice(), m_plantsVertexShader, nullptr);
             if (m_plantsFragmentShader) m_destroyShaderModule(m_context->GetDevice(), m_plantsFragmentShader, nullptr);
+            if (m_plantsEarlyFragmentShader) m_destroyShaderModule(m_context->GetDevice(), m_plantsEarlyFragmentShader, nullptr);
             if (m_waterColorVertexShader) m_destroyShaderModule(m_context->GetDevice(), m_waterColorVertexShader, nullptr);
             if (m_beachVertexShader) m_destroyShaderModule(m_context->GetDevice(), m_beachVertexShader, nullptr);
             if (m_seaFragmentShader) m_destroyShaderModule(m_context->GetDevice(), m_seaFragmentShader, nullptr);
@@ -7266,6 +7705,7 @@ void VulkanFrameRenderer::Shutdown()
     m_gpuProfileReports = 0;
     m_gpuProfileArmed = false;
     m_gpuAbArmed = m_gpuAbBaselineReady = m_stockProfilePlants = m_stockDecalDraw = false;
+    m_stockTerrainDraw = m_stockWaterDraw = m_stockCharacterDraw = false;
     m_gpuAbPairs = m_recordedAbMode = m_pendingAbMode = 0;
     m_recordedGpuProfiles.clear();
     m_pendingGpuProfiles.clear();
@@ -7313,7 +7753,7 @@ void VulkanFrameRenderer::Shutdown()
     m_waterVertexShader = m_waterColorVertexShader = m_oceanVertexShader = VK_NULL_HANDLE;
     m_terrainLayerVertexShader = m_terrainLayerFragmentShader = VK_NULL_HANDLE;
     m_causticsVertexShader = m_causticsFragmentShader = VK_NULL_HANDLE;
-    m_plantsVertexShader = m_plantsFragmentShader = VK_NULL_HANDLE;
+    m_plantsVertexShader = m_plantsFragmentShader = m_plantsEarlyFragmentShader = VK_NULL_HANDLE;
     m_beachVertexShader = m_seaFragmentShader = VK_NULL_HANDLE;
     m_sceneMultiTextureColorVertexShader = VK_NULL_HANDLE;
     m_sceneMultiTextureLitColorVertexShader = VK_NULL_HANDLE;
@@ -7340,6 +7780,7 @@ void VulkanFrameRenderer::Shutdown()
     m_descriptorSet = VK_NULL_HANDLE;
     m_textureTransformStride = 0;
     m_uniformDrawCapacity = 0;
+    m_uniformBlockCapacity = 0;
     m_uniformFrameSlot = 0;
     m_pendingUniformFrameSlot = 0;
     m_stereoDrawBase = 0;

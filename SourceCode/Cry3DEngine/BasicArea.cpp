@@ -177,9 +177,9 @@ void CBasicArea::DrawEntities( int nFogVolumeID, int nDLightMask,
 					continue;
 
 				// early sphere test agains left and right camera planes
-				if( bNotAllInFrustum && 
-						PlaneR.DistFromPlane(inf.m_vWSCenter) > inf.m_fWSRadius ||
-						PlaneR.DistFromPlane(inf.m_vWSCenter) > inf.m_fWSRadius )
+				if( bNotAllInFrustum &&
+						(PlaneR.DistFromPlane(inf.m_vWSCenter) > inf.m_fWSRadius ||
+						 PlaneL.DistFromPlane(inf.m_vWSCenter) > inf.m_fWSRadius) )
 					continue;
 
 				// get view distance
@@ -232,8 +232,8 @@ void CBasicArea::DrawEntities( int nFogVolumeID, int nDLightMask,
 
 				// early sphere test agains left and right camera planes
 				if( bNotAllInFrustum &&
-						PlaneR.DistFromPlane(inf.m_vWSCenter) > inf.m_fWSRadius+TERRAIN_SECTORS_MAX_OVERLAPPING ||
-						PlaneR.DistFromPlane(inf.m_vWSCenter) > inf.m_fWSRadius+TERRAIN_SECTORS_MAX_OVERLAPPING )
+						(PlaneR.DistFromPlane(inf.m_vWSCenter) > inf.m_fWSRadius+TERRAIN_SECTORS_MAX_OVERLAPPING ||
+						 PlaneL.DistFromPlane(inf.m_vWSCenter) > inf.m_fWSRadius+TERRAIN_SECTORS_MAX_OVERLAPPING) )
 					continue;
 
 				// get view distance
@@ -417,12 +417,20 @@ void CBasicArea::PreloadResources(Vec3d vPrevPortalPos, float fPrevPortalDistanc
 {
 	FUNCTION_PROFILER( GetSystem(),PROFILE_3DENGINE );
 	int nFrameId = GetFrameID();
-	for(int nStatic=0; nStatic<2; nStatic++)
-	for( int i=0; i<m_lstEntities[nStatic].Count() && GetCurTimeSec()<(m_fPreloadStartTime+0.010f); i++ )
-	{
-		if((nFrameId%8) == (i%8))
-			m_lstEntities[nStatic].GetAt(i)->PreloadInstanceResources(vPrevPortalPos, fPrevPortalDistance, 1.f);	
-	}
+    for (int nStatic=0; nStatic<2; ++nStatic)
+    {
+        const int count = m_lstEntities[nStatic].Count();
+        if (!count) { m_nPreloadCursor[nStatic] = 0; continue; }
+        // Resume after the last visited object, so a deadline cannot make
+        // large areas repeatedly scan only the beginning of their lists.
+        for (int visited=0; visited<count && GetTimer()->GetAsyncCurTime()<m_dPreloadDeadline; ++visited)
+        {
+            const int i = m_nPreloadCursor[nStatic] % count;
+            m_nPreloadCursor[nStatic] = (i + 1) % count;
+            if ((nFrameId%8) == (i%8))
+                m_lstEntities[nStatic].GetAt(i)->PreloadInstanceResources(vPrevPortalPos, fPrevPortalDistance, 1.f);
+        }
+    }
 }
 
 void CBasicArea::UnregisterDynamicEntities()

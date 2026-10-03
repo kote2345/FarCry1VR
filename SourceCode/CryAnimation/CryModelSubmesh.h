@@ -173,6 +173,8 @@ protected:
 
 	CryModel * m_pMesh;
 	CLeafBuffer * m_pLeafBuffers[g_nMaxGeomLodLevels];
+    CVertexBuffer* m_gpuAttributeBuffers[g_nMaxGeomLodLevels] = {};
+    int m_gpuAttributeFormats[g_nMaxGeomLodLevels] = {};
 
 	typedef std::vector<CryModEffMorph> MorphEffectorArray;
 	MorphEffectorArray m_arrMorphEffectors;

@@ -236,16 +236,15 @@ void CTerrain::RefineSector(int x1, int x2, int y1, int y2, bool bAllIN)
       }
     }
   }
-  else
-  {
-    CSectorInfo * info = m_arrSecInfoTable[x1/CTerrain::GetSectorSize()][y1/CTerrain::GetSectorSize()];  
+	else
+	{
+		CSectorInfo * info = m_arrSecInfoTable[x1/CTerrain::GetSectorSize()][y1/CTerrain::GetSectorSize()];
 
 		// test higher bbox to include all flying dynamic stuff and reflected in water terrain
-		if(!m_pViewCamera->IsAABBVisible_hierarchical( 
-			AABB(
+		const AABB sectorCullBox(
 			Vec3d((float)x1-TERRAIN_SECTORS_MAX_OVERLAPPING,(float)y1-TERRAIN_SECTORS_MAX_OVERLAPPING,0),
-			Vec3d((float)x2+TERRAIN_SECTORS_MAX_OVERLAPPING,(float)y2+TERRAIN_SECTORS_MAX_OVERLAPPING,512.f)), 
-			&info->m_bAllStaticsInFrustum))
+			Vec3d((float)x2+TERRAIN_SECTORS_MAX_OVERLAPPING,(float)y2+TERRAIN_SECTORS_MAX_OVERLAPPING,512.f));
+		if(!m_pViewCamera->IsAABBVisible_hierarchical(sectorCullBox, &info->m_bAllStaticsInFrustum))
 			return;
 
 		// debug: render this sector only
@@ -263,8 +262,16 @@ void CTerrain::RefineSector(int x1, int x2, int y1, int y2, bool bAllIN)
 		info->RenderEntities(m_pObjManager, !info->m_bAllStaticsInFrustum, "", DYNAMIC_ENTITIES);
 
 		// test exact bbox of sector, it includes all static geometry
-		if(!m_pViewCamera->IsAABBVisible_hierarchical( AABB(info->m_vBoxMin,info->m_vBoxMax), &info->m_bAllStaticsInFrustum))
-			return;
+		// The first test used a larger conservative box. If it was wholly inside
+		// the frustum and the exact bounds are contained by that box, visibility
+		// is already proven; avoid repeating the six-plane plus camera-space test.
+		const bool exactBoundsContained =
+			info->m_vBoxMin.x >= sectorCullBox.min.x && info->m_vBoxMin.y >= sectorCullBox.min.y &&
+			info->m_vBoxMin.z >= sectorCullBox.min.z && info->m_vBoxMax.x <= sectorCullBox.max.x &&
+			info->m_vBoxMax.y <= sectorCullBox.max.y && info->m_vBoxMax.z <= sectorCullBox.max.z;
+		if(!info->m_bAllStaticsInFrustum || !exactBoundsContained)
+			if(!m_pViewCamera->IsAABBVisible_hierarchical(AABB(info->m_vBoxMin,info->m_vBoxMax), &info->m_bAllStaticsInFrustum))
+				return;
 
 		// test ground visibility
     if(info->m_bAllStaticsInFrustum)
@@ -710,6 +717,10 @@ void CTerrain::MoveAllEntitiesIntoList(list2<IEntityRender*> * plstVisAreasEntit
 bool CTerrain::PreloadResources()
 {
 	FUNCTION_PROFILER( GetSystem(),PROFILE_3DENGINE );
+    // Indoor preloads share this deadline. Do not start another synchronous
+    // sector texture load after those areas have consumed the frame budget.
+    if (GetTimer()->GetAsyncCurTime() >= m_dPreloadDeadline)
+        return false;
 
 	static int nCurTexPreloadX=0, nCurTexPreloadY=0;
 

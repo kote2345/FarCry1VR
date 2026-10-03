@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_multiview : require
 #extension GL_GOOGLE_include_directive : require
 layout(constant_id = 0) const int alphaTestMode = 0;
 layout(constant_id = 60) const uint stage0UsesTexCoord1 = 0u;
@@ -96,10 +97,12 @@ layout(set = 0, binding = 1, std140) uniform TextureStageTransforms {
     vec4 linearMatrixRows[32];
     vec4 linearControls[8];
     vec4 fixedLights[32];
-    vec4 fixedLightInfo; mat4 fixedMatrices[2]; uvec4 textureConstants[2];
+    vec4 fixedLightInfo; mat4 fixedMatrices[2]; uvec4 textureConstants[2]; vec4 fogEye1Ray;
 } textureStageTransforms;
 #define VR_SCENE_SPECULAR_OCCLUSION_ALIAS
 #include "scene_lighting.glsl"
+#include "scene_fog.glsl"
+vec4 applySceneFog(vec4 color) { return applyStockSceneFog(color); }
 layout(location = 0) in vec2 texCoord0;
 layout(location = 1) in vec4 vertexColor;
 layout(location = 2) in vec2 texCoord1;
@@ -112,43 +115,35 @@ layout(location = 15) in vec3 stockSeparateSpecular;
 layout(location = 0) out vec4 outColor;
 vec4 sampleBaseTexture(vec2 uv) {
     float scale = textureStageTransforms.textureLodBias.x;
-    vec4 sampled = textureGrad(baseColorTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
-    return compareStockShadowStage(0u, baseColorTexture, sampled, objectPosition);
+    return sampleStockTextureStage(0u, baseColorTexture, uv, scale, objectPosition);
 }
 vec4 sampleSecondaryTexture(vec2 uv) {
     float scale = textureStageTransforms.textureLodBias.y;
-    vec4 sampled = textureGrad(secondaryTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
-    return compareStockShadowStage(1u, secondaryTexture, sampled, objectPosition);
+    return sampleStockTextureStage(1u, secondaryTexture, uv, scale, objectPosition);
 }
 vec4 sampleTertiaryTexture(vec2 uv) {
     float scale = textureStageTransforms.textureLodBias.z;
-    vec4 sampled = textureGrad(tertiaryTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
-    return compareStockShadowStage(2u, tertiaryTexture, sampled, objectPosition);
+    return sampleStockTextureStage(2u, tertiaryTexture, uv, scale, objectPosition);
 }
 vec4 sampleFourthTexture(vec2 uv) {
     float scale = textureStageTransforms.textureLodBias.w;
-    vec4 sampled = textureGrad(fourthTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
-    return compareStockShadowStage(3u, fourthTexture, sampled, objectPosition);
+    return sampleStockTextureStage(3u, fourthTexture, uv, scale, objectPosition);
 }
 vec4 sampleFifthTexture(vec2 uv) {
     float scale = exp2(clamp(stage4LodBias, -16.0, 16.0));
-    vec4 sampled = textureGrad(fifthTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
-    return compareStockShadowStage(4u, fifthTexture, sampled, objectPosition);
+    return sampleStockTextureStage(4u, fifthTexture, uv, scale, objectPosition);
 }
 vec4 sampleSixthTexture(vec2 uv) {
     float scale = exp2(clamp(stage5LodBias, -16.0, 16.0));
-    vec4 sampled = textureGrad(sixthTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
-    return compareStockShadowStage(5u, sixthTexture, sampled, objectPosition);
+    return sampleStockTextureStage(5u, sixthTexture, uv, scale, objectPosition);
 }
 vec4 sampleSeventhTexture(vec2 uv) {
     float scale = exp2(clamp(stage6LodBias, -16.0, 16.0));
-    vec4 sampled = textureGrad(seventhTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
-    return compareStockShadowStage(6u, seventhTexture, sampled, objectPosition);
+    return sampleStockTextureStage(6u, seventhTexture, uv, scale, objectPosition);
 }
 vec4 sampleEighthTexture(vec2 uv) {
     float scale = exp2(clamp(stage7LodBias, -16.0, 16.0));
-    vec4 sampled = textureGrad(eighthTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
-    return compareStockShadowStage(7u, eighthTexture, sampled, objectPosition);
+    return sampleStockTextureStage(7u, eighthTexture, uv, scale, objectPosition);
 }
 vec2 transformStageUv(uint stage, vec2 uv) {
     return stockTerrainStageTexCoord(stage, uv, objectPosition);
@@ -157,34 +152,6 @@ vec4 applyMaterialOverrides(vec4 c) {
     if (textureStageTransforms.materialParams.z > 0.5) c.rgb *= textureStageTransforms.materialParams.x;
     else c.a *= textureStageTransforms.materialParams.x;
     return c;
-}
-float radialEyeDistance(float eyeZ) {
-    vec2 viewportSize = max(vec2(textureStageTransforms.uvRowQ[0].w,
-                                 textureStageTransforms.uvRowQ[1].w), vec2(1.0));
-    vec2 viewportOrigin = vec2(textureStageTransforms.linearControls[2].w,
-                               textureStageTransforms.linearControls[3].w);
-    vec2 ndc = 2.0 * (gl_FragCoord.xy - viewportOrigin) / viewportSize - 1.0;
-    float tangentX = mix(textureStageTransforms.uvRow0[0].w,
-                         textureStageTransforms.uvRow1[0].w, (ndc.x + 1.0) * 0.5);
-    float tangentY = mix(textureStageTransforms.uvRow0[1].w,
-                         textureStageTransforms.uvRow1[1].w, (ndc.y + 1.0) * 0.5);
-    return eyeZ * sqrt(1.0 + tangentX * tangentX + tangentY * tangentY);
-}
-float sceneFogDepth() {
-    float depthMin = textureStageTransforms.linearControls[0].w;
-    float depthMax = textureStageTransforms.linearControls[1].w;
-    return (gl_FragCoord.z - depthMin) / max(depthMax - depthMin, 1.0e-7);
-}
-vec4 applySceneFog(vec4 c) {
-    if (textureStageTransforms.fogModeDensityStart.x < 0.5) return c;
-    float n=textureStageTransforms.fogEndDepthRange.y, f=textureStageTransforms.fogEndDepthRange.z;
-    float d=n*f/max(f-sceneFogDepth()*(f-n),1.0e-7);
-    d=radialEyeDistance(d);
-    int m=int(textureStageTransforms.fogModeDensityStart.y+0.5); float a;
-    if(m==1) a=(d-textureStageTransforms.fogModeDensityStart.w)/(textureStageTransforms.fogEndDepthRange.x-textureStageTransforms.fogModeDensityStart.w);
-    else if(m==2){float x=textureStageTransforms.fogModeDensityStart.z*d;a=1.0-exp(-min(x*x,80.0));}
-    else a=1.0-exp(-min(textureStageTransforms.fogModeDensityStart.z*d,80.0));
-    c.rgb=mix(c.rgb,textureStageTransforms.fogColor.rgb,clamp(a,0.0,1.0));return c;
 }
 vec3 sourceRgb(uint selector, vec4 texel, vec4 primary, vec4 previous, vec4 constantColor) {
     if (selector == 0u) return constantColor.rgb;
@@ -249,11 +216,19 @@ vec4 combineTextureStage(int colorMode, int alphaMode, uint colorArg, uint alpha
                       combineAlpha(alphaMode, alphaA, alphaB, alphaC, blendFactor)), 0.0, 1.0);
 }
 void main() {
+    if (stockTerrainMarker() > -15.5 && stockTerrainMarker() < -14.5) {
+        vec2 uv = stockTerrainStageTexCoord(0u, texCoord0, objectPosition);
+        vec4 albedo = sampleBaseTexture(uv);
+        float coverage = stockReceiverShadowCoverage(1u, secondaryTexture, objectPosition) + stockReceiverShadowCoverage(2u, tertiaryTexture, objectPosition) + stockReceiverShadowCoverage(3u, fourthTexture, objectPosition);
+        outColor = applySceneFog(stockReceiverShadowColor(albedo, coverage));
+        return;
+    }
     if (stockFragmentDiscardEnabled && dot(vec4(clipPosition, 1.0), textureStageTransforms.clipPlane) < 0.0) discard;
     vec4 generatedVertexColor = vertexColor;
     if (textureStageTransforms.materialParams.w > 0.5 && textureStageTransforms.materialParams.w < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
     vec4 primaryColor = mix(generatedVertexColor, textureStageTransforms.primaryColor, textureStageTransforms.primaryColorMask);
-    primaryColor.rgb *= evaluateStockLighting(objectPosition, objectNormal,
+    if (!stockFeatureDisabled(STOCK_NO_FRAGMENT_LIGHTING))
+        primaryColor.rgb *= evaluateStockLighting(objectPosition, objectNormal,
         stockTerrainStageTexCoord(1u, texCoord1, objectPosition), hasMaterialLighting);
     vec2 stage0TexCoord = stockTerrainStageTexCoord(0u,
         stage0UsesTexCoord1 != 0u ? texCoord1 : texCoord0, objectPosition);
@@ -275,6 +250,28 @@ void main() {
     vec2 stage1TexCoord = stockTerrainStageTexCoord(1u,
         stage1UsesTexCoord1 != 0u ? texCoord1 : texCoord0, objectPosition);
     vec4 layer = sampleSecondaryTexture(stage1TexCoord);
+    if (stockFeatureDisabled(STOCK_DIRECTIONAL_LIGHTMAP_FAST)) {
+        // CGRCAmbientTempl TEMP_DOT3LM replaces all intermediate RGB
+        // combiners. Retain stage 0's alpha and the original four samples.
+        vec4 irradiance = sampleTertiaryTexture(transformStageUv(2u,
+            stage2UsesTexCoord1 != 0u ? texCoord1 : texCoord0));
+        vec4 direction = sampleFourthTexture(transformStageUv(3u,
+            stage3UsesTexCoord1 != 0u ? texCoord1 : texCoord0));
+        float ndotl = clamp(dot(direction.rgb * 2.0 - 1.0, layer.rgb * 2.0 - 1.0), 0.0, 1.0);
+        float intensity = ndotl * irradiance.a + (1.0 - irradiance.a);
+        vec3 bakedDiffuse = textureStageTransforms.fogEndDepthRange.w > 0.5 ?
+            irradiance.rgb * direction.a * intensity * textureStageTransforms.fogEndDepthRange.w : vec3(0.0);
+        vec4 result = vec4(base.rgb * (textureStageTransforms.materialAmbient.rgb *
+            primaryColor.rgb + bakedDiffuse), previous.a);
+        result = applyMaterialOverrides(result);
+        if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(result.a,
+            textureStageTransforms.materialParams.y, alphaTestMode)) discard;
+        result.rgb += stockSeparateSpecular;
+        if (textureStageTransforms.materialAmbient.w > 1.5)
+            result.rgb = clamp(result.rgb, 0.0, 1.0);
+        outColor = applySceneFog(result);
+        return;
+    }
     vec4 env1 = unpackUnorm4x8(stage1Constant);
     vec3 s1a = sourceRgb(stage1ColorArg & 7u, layer, primaryColor, previous, env1);
     vec3 s1b = sourceRgb((stage1ColorArg >> 3) & 7u, layer, primaryColor, previous, env1);
@@ -362,15 +359,18 @@ void main() {
         }
         vec3 volumeColor = textureStageTransforms.terrainProjectionS[7].rgb;
         float alpha = base.a * textureStageTransforms.terrainProjectionS[7].w;
-        outColor = vec4(mix(terrainColor, volumeColor, clamp(fog.a, 0.0, 1.0)), alpha);
+        outColor = applySceneFog(vec4(mix(terrainColor, volumeColor, clamp(fog.a, 0.0, 1.0)), alpha));
         return;
     }
-    if (textureStageTransforms.materialParams.w > 2.5 && stockTerrainOnlyCount() == 0) {
+    if (!stockFeatureDisabled(STOCK_NO_TERRAIN) && textureStageTransforms.materialParams.w > 2.5 && stockTerrainOnlyCount() == 0) {
         vec3 detail0 = mix(vec3(0.5), base.rgb, secondaryColor.r);
         vec3 detail1 = mix(vec3(0.5), layer.rgb, secondaryColor.g);
         vec3 detail2 = mix(vec3(0.5), tertiary.rgb, secondaryColor.b);
         vec3 detail3 = mix(vec3(0.5), fourth.rgb, secondaryColor.a);
-        outColor = vec4(detail0 * detail1 * detail2 * detail3 * 8.0, 1.0);
+        // The 4-layer terrain-only variant exits before the shared material
+        // tail. Preserve the global distance fog that OpenGL applies to far
+        // terrain; without it distant islands keep their raw pale-blue color.
+        outColor = applySceneFog(vec4(detail0 * detail1 * detail2 * detail3 * 8.0, 1.0));
         return;
     }
     if (directionalLightmap != 0u && hasSecondTexture != 0u &&
@@ -442,5 +442,5 @@ void main() {
     color.rgb += stockSeparateSpecular;
     if (textureStageTransforms.materialAmbient.w > 1.5)
         color.rgb = clamp(color.rgb, 0.0, 1.0);
-    outColor = stockTerrainProgram() ? color : applySceneFog(color);
+    outColor = applySceneFog(color);
 }

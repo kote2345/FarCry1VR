@@ -14,6 +14,8 @@
 #include <array>
 #include <utility>
 #include <set>
+#include <deque>
+#include <unordered_map>
 
 namespace CryVR
 {
@@ -251,7 +253,11 @@ public:
                                      const float* reflectionModelView = nullptr,
                                      const float* reflectionClipPlane = nullptr,
                                      const VulkanWaterReflectionUpdate* reflectionUpdate = nullptr,
-                                     const void* gpuSkinIdentity = nullptr);
+                                     const void* gpuSkinIdentity = nullptr,
+                                     uint32_t validatedMinimumVertex = UINT32_MAX,
+                                     uint32_t validatedMaximumVertex = 0,
+                                     uint64_t immutableGeometryRevision = 0,
+                                     const void* cpuTangents = nullptr);
     bool QueueGpuSkinning(const void* identity, const SGpuSkinningData& mesh,
                          const float* bones, uint32_t count) {
         return m_frameActive && m_gpuSkinning.Queue(identity, mesh, bones, count);
@@ -295,7 +301,17 @@ public:
     }
     // Four vec4s per fixed light: position/type, diffuse, specular, attenuation.
     void SetStockProfilePlants(bool value) { m_stockProfilePlants = value; }
+    void SetStockFarSprites(bool value) { m_stockFarSprites = value; }
+    void SetStockSpecularProgram(uint32_t flags, int glossTexture = 0) {
+        m_stockSpecularProgramFlags = flags; m_stockSpecularGlossTexture = glossTexture;
+    }
     void SetStockDecalDraw(bool value) { m_stockDecalDraw = value; }
+    void SetStockGpuProfileCategories(bool terrain, bool water, bool character)
+    {
+        m_stockTerrainDraw = terrain;
+        m_stockWaterDraw = water;
+        m_stockCharacterDraw = character;
+    }
     void SetStockFixedLights(const std::array<std::array<float, 16>, 8>& lights, uint32_t count,
                             const float* modelView = nullptr, const float* normalMatrix = nullptr)
     {
@@ -325,6 +341,8 @@ public:
                                    float maxAnisotropy = 1.0f,
                                    const uint8_t* const* rgbaMipPixels = nullptr,
                                    uint32_t suppliedMipCount = 0);
+    bool CopyRecentSpriteSourceTexture(int textureId, uint32_t& width, uint32_t& height,
+                                       std::vector<uint8_t>& rgbaPixels);
     bool RegisterLegacyDepthTexture(int textureId, uint32_t width, uint32_t height);
     bool RegisterLegacyRgbaCubeTexture(int textureId, uint32_t width, uint32_t height,
                                        const uint8_t* const facePixels[6], bool noMipmaps,
@@ -397,8 +415,16 @@ private:
     };
     struct StockDraw
     {
+        // Value-initializing this aggregate zeroes every optional matrix and
+        // material array for every draw. The queue fills the fields it uses;
+        // only guarded effect payloads may remain untouched.
+        StockDraw() noexcept {}
+
         bool profilePlants = false;
         bool decalDraw = false;
+        bool terrainDraw = false;
+        bool waterDraw = false;
+        bool characterDraw = false;
         bool simpleDecalMode = false;
         VkDeviceSize decalVertexEndOffset = 0;
         // Coherent upload data stays alive until the frame submission retires.
@@ -433,6 +459,7 @@ private:
         uint32_t textureTransformOffset = 0;
         VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         std::array<uint32_t, 64> pipelineKey;
+        bool separateReflectionPipeline = false;
         VkPipeline pipeline = VK_NULL_HANDLE;
         VkPipeline reflectionPipeline = VK_NULL_HANDLE;
         VkViewport viewport;
@@ -457,6 +484,7 @@ private:
         float clipPlane[4];
         int normalMapTextureId = 0;
         int specularOcclusionTextureId = 0;
+        int specularGlossTextureId = 0;
         int specularOcclusionChannel = -1;
         float globalOpacity = 1.0f;
         float alphaTestRef = 0.0f;
@@ -526,6 +554,17 @@ private:
         bool depthOnly = false;
         std::vector<uint8_t> rgbaPixels;
     };
+    struct SpriteSourceTexture
+    {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint64_t serial = 0;
+        std::vector<uint8_t> pixels;
+    };
+    std::unordered_map<int, SpriteSourceTexture> m_spriteSourceTextures;
+    std::deque<std::pair<int, uint64_t>> m_spriteSourceOrder;
+    size_t m_spriteSourceBytes = 0;
+    uint64_t m_spriteSourceSerial = 0;
     struct ShadowMapTarget
     {
         VulkanTexture color;
@@ -556,6 +595,7 @@ private:
         bool valid = false;
         const void* sourceVertices = nullptr;
         const void* skinIdentity = nullptr;
+        const void* sourceTangents = nullptr;
         VkDeviceSize tangentBufferOffset = 0;
         const uint16_t* sourceIndices = nullptr;
         const void* sourceLightmapTexCoords = nullptr;
@@ -569,6 +609,7 @@ private:
         int32_t vertexOffset = 0;
         VkDeviceSize vertexBufferOffset = 0;
         VkDeviceSize lightmapTexCoordOffset = 0;
+        VkDeviceSize vertexBytes = 0;
     };
 
     bool LoadFunctions();
@@ -581,6 +622,7 @@ private:
                                      std::vector<VulkanBuffer>& previousBuffers,
                                      VkDeviceSize requiredSize, VkBufferUsageFlags usage);
     bool UpdateTextureTransformDescriptors();
+    bool InitializeTextureTransformDescriptor(VkDescriptorSet set);
     VkDescriptorSet GetLegacyTextureDescriptorSet(int textureId, int wrapMode);
     VkDescriptorSet GetProjectorTextureDescriptorSet(int baseTextureId, int cookieTextureId, int wrapMode);
     void ReleaseProjectorTextureDescriptorSets();
@@ -603,6 +645,8 @@ private:
     VulkanContext* m_context = nullptr;
     VulkanResourceManager* m_resources = nullptr;
     VulkanPipelineFactory m_pipelineFactory;
+    bool ResolveScenePipelines();
+    std::map<std::array<uint32_t, 64>, std::shared_future<VulkanPipelineFactory::CompileResult>> m_pendingScenePipelines;
     VulkanTexture m_gameTexture;
     VulkanBuffer m_dynamicVertexBuffer;
     VulkanBuffer m_dynamicIndexBuffer;
@@ -626,6 +670,7 @@ private:
     VkDeviceSize m_dynamicIndexUsed = 0;
     VkDeviceSize m_textureTransformStride = 0;
     size_t m_uniformDrawCapacity = 0;
+    size_t m_uniformBlockCapacity = 0;
     uint32_t m_uniformFrameSlot = 0;
     uint32_t m_pendingUniformFrameSlot = 0;
     uint32_t m_stereoDrawBase = 0;
@@ -664,7 +709,11 @@ private:
     uint32_t m_gpuProfileReports = 0;
     bool m_gpuProfileArmed = false;
     bool m_stockProfilePlants = false;
+    bool m_stockFarSprites = false;
+    uint32_t m_stockSpecularProgramFlags = 0;
+    int m_stockSpecularGlossTexture = 0;
     bool m_stockDecalDraw = false;
+    bool m_stockTerrainDraw = false, m_stockWaterDraw = false, m_stockCharacterDraw = false;
     bool m_gpuAbArmed = false, m_gpuAbBaselineReady = false;
     uint32_t m_gpuAbPairs = 0, m_recordedAbMode = 0, m_pendingAbMode = 0;
     uint32_t m_recordedAbSkipped = 0, m_pendingAbSkipped = 0, m_pendingAbGroup = 0;
@@ -675,6 +724,16 @@ private:
     bool m_visibilityQueriesEnabled = false;
     std::vector<PanelImage> m_panelImages;
     ReusableClientGeometry m_reusableClientGeometry;
+    struct GeometryUploadHash
+    {
+        size_t operator()(const std::array<uint64_t, 8>& key) const
+        {
+            size_t hash = 1469598103934665603ull;
+            for (auto value : key) hash = (hash ^ value) * 1099511628211ull;
+            return hash;
+        }
+    };
+    std::unordered_map<std::array<uint64_t, 8>, ReusableClientGeometry, GeometryUploadHash> m_frameGeometryUploads;
     VkRenderPass m_renderPass = VK_NULL_HANDLE;
     VkRenderPass m_multiviewRenderPass = VK_NULL_HANDLE;
     VkRenderPass m_multiviewLoadRenderPass = VK_NULL_HANDLE;
@@ -696,11 +755,23 @@ private:
     VkShaderModule m_outputFragmentShader = VK_NULL_HANDLE;
     std::map<uint32_t, VkPipeline> m_panelPipelineCache;
     VkPipelineLayout m_scenePipelineLayout = VK_NULL_HANDLE;
-    std::map<std::array<uint32_t, 64>, VkPipeline> m_scenePipelineCache;
+    struct ScenePipelineHash
+    {
+        size_t operator()(const std::array<uint32_t, 64>& key) const
+        {
+            // Hash state/program selectors; full equality still checks every
+            // field, including texture combiners and specialization constants.
+            size_t hash = 1469598103934665603ull;
+            for (unsigned index : {0u, 1u, 2u, 3u, 4u, 7u, 10u, 13u, 14u, 18u, 24u, 61u, 62u, 63u})
+                hash = (hash ^ key[index]) * 1099511628211ull;
+            return hash;
+        }
+    };
+    std::unordered_map<std::array<uint32_t, 64>, VkPipeline, ScenePipelineHash> m_scenePipelineCache;
     std::array<uint32_t, 64> m_lastScenePipelineKey{};
     VkPipeline m_lastScenePipeline = VK_NULL_HANDLE;
     bool m_lastScenePipelineValid = false;
-    std::map<int, LegacyTexture> m_legacyTextures;
+    std::unordered_map<int, LegacyTexture> m_legacyTextures;
     std::map<int, ShadowMapTarget> m_shadowMapTargets;
     std::vector<ShadowMapTarget> m_deferredShadowMapTargets;
     std::vector<LegacyTexture> m_deferredLegacyTextureReleases;
@@ -724,6 +795,7 @@ private:
     VkShaderModule m_causticsFragmentShader = VK_NULL_HANDLE;
     VkShaderModule m_plantsVertexShader = VK_NULL_HANDLE;
     VkShaderModule m_plantsFragmentShader = VK_NULL_HANDLE;
+    VkShaderModule m_plantsEarlyFragmentShader = VK_NULL_HANDLE;
     VkShaderModule m_waterColorVertexShader = VK_NULL_HANDLE;
     VkShaderModule m_beachVertexShader = VK_NULL_HANDLE;
     VkShaderModule m_seaFragmentShader = VK_NULL_HANDLE;

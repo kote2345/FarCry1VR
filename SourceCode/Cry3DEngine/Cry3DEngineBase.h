@@ -42,7 +42,7 @@ struct Cry3DEngineBase
   static int m_dwRecursionDrawFlags[2];
 	static int m_nRenderFrameID;
 	static bool m_bProfilerEnabled;
-	static float m_fPreloadStartTime;
+	static double m_dPreloadDeadline;
 
   static int m_CpuFlags;
   static double m_SecondsPerCycle;

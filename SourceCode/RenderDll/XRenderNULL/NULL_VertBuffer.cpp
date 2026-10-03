@@ -87,14 +87,31 @@ void CNULLRenderer::SetFenceCompleted(CVertexBuffer * buffer)
 // NOTE: src may be NULL, in which case the data will not be copied
 void CNULLRenderer::UpdateBuffer(CVertexBuffer *dest,const void *src,int vertexcount, bool bUnlock, int offs, int Type)
 {
-  assert (Type >= 0 && Type <= 2);
+  if (!dest)
+    return;
+  // As in OpenGL, a null source requests lock/unlock and Type is a
+  // stream bit mask (3 locks GENERAL and TANGENTS), not a stream index.
+  // These streams already reside in CPU memory; preserve their pointers.
+  if (!src)
+  {
+    assert(Type >= 0 && Type <= 3);
+    if (Type < 0 || Type > 3)
+      return;
+    for (int stream = 0; stream < VSF_NUM; ++stream)
+      if ((Type == 0 && stream == VSF_GENERAL) || (Type & (1 << stream)))
+        dest->m_VS[stream].m_bLocked = !bUnlock;
+    return;
+  }
+  assert (Type >= 0 && Type < VSF_NUM);
+  if (Type < 0 || Type >= VSF_NUM || vertexcount < 0 || offs < 0)
+    return;
 
   // NOTE: some subsystems need to initialize the system buffer without actually intializing its values;
 	// for that purpose, src may sometimes be NULL
   if(src && vertexcount)
   {
-    assert(vertexcount<=dest->m_NumVerts);
-    if(vertexcount>dest->m_NumVerts)
+    assert(offs <= dest->m_NumVerts && vertexcount <= dest->m_NumVerts - offs);
+    if(offs > dest->m_NumVerts || vertexcount > dest->m_NumVerts - offs)
     {
       iLog->Log("CNULLRenderer::UpdateBuffer: vertexcount>dest->m_NumVerts");
       return;

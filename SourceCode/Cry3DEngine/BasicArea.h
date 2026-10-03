@@ -32,7 +32,7 @@ struct IEntityRenderInfo
 
 struct CBasicArea : public Cry3DEngineBase
 {
-  CBasicArea() { m_nLastUsedFrameId=0; m_eSStatus=eSStatus_Unloaded; m_vBoxMin=m_vBoxMax=m_vAreaBrushFocusPos=Vec3d(0,0,0); m_StaticEntitiesSorted=false; }
+  CBasicArea() { m_nLastUsedFrameId=0; m_eSStatus=eSStatus_Unloaded; m_vBoxMin=m_vBoxMax=m_vAreaBrushFocusPos=Vec3d(0,0,0); m_StaticEntitiesSorted=false; m_nPreloadCursor[0]=m_nPreloadCursor[1]=0; }
 	~CBasicArea();
 
   list2<struct IEntityRender*> m_lstEntities[2];
@@ -42,6 +42,7 @@ struct CBasicArea : public Cry3DEngineBase
   int m_nLastUsedFrameId;
   ESStatus m_eSStatus;
 	bool m_StaticEntitiesSorted;
+    int m_nPreloadCursor[2];
 
   void SerializeArea(bool bSave);
   void DrawEntities(int nFogVolumeID, int nDLightMask,

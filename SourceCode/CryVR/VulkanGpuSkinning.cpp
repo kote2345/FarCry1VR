@@ -99,9 +99,16 @@ bool VulkanGpuSkinning::Queue(const void* identity, const SGpuSkinningData& data
 {
     if (!m_skinPipeline || !identity || !bones || !boneCount || data.vertices.empty() || data.influences.empty()) return false;
     auto found=m_poseByIdentity.find(identity);
-    if (found != m_poseByIdentity.end()) return true;
+    const auto matchesPose = [&](uint32_t index) {
+        const Pose& pose = m_poses[index];
+        return pose.meshKey == data.key && pose.boneCount == boneCount &&
+            std::memcmp(m_palette.data()+size_t(pose.paletteOffset)*16, bones,
+                size_t(boneCount)*16*sizeof(float)) == 0;
+    };
+    if (found != m_poseByIdentity.end() && !found->second.shadowKey &&
+        found->second.remapOffset == UINT32_MAX && matchesPose(found->second.pose)) return true;
     auto shared=m_poseSources.find(std::make_pair(data.key,bones));
-    if (shared!=m_poseSources.end()) {
+    if (shared!=m_poseSources.end() && matchesPose(shared->second)) {
         m_poseByIdentity[identity]=Binding{shared->second,UINT32_MAX,static_cast<uint32_t>(data.vertices.size()),0}; return true;
     }
     Mesh* captured=CaptureMesh(data);
@@ -109,13 +116,13 @@ bool VulkanGpuSkinning::Queue(const void* identity, const SGpuSkinningData& data
     Mesh& mesh=*captured;
     if (uint64_t(m_resultWords)+uint64_t(mesh.vertexCount)*20 > UINT32_MAX || m_poses.size()>=1024) return false;
     mesh.lastFrame=m_frame;
-    Pose pose{}; pose.meshKey=data.key; pose.resultWordOffset=m_resultWords;
+    Pose pose{}; pose.meshKey=data.key; pose.resultWordOffset=m_resultWords; pose.boneCount=boneCount;
     m_palette.resize((m_palette.size()+15u)&~size_t(15u), 0.0f);
     pose.paletteOffset=static_cast<uint32_t>(m_palette.size()/16);
     m_palette.insert(m_palette.end(), bones, bones+size_t(boneCount)*16);
     m_resultWords+=mesh.vertexCount*20;
-    m_poseByIdentity.emplace(identity, Binding{static_cast<uint32_t>(m_poses.size()), UINT32_MAX, mesh.vertexCount,0});
-    m_poseSources.emplace(std::make_pair(data.key,bones),static_cast<uint32_t>(m_poses.size())); m_poses.push_back(pose);
+    m_poseByIdentity[identity] = Binding{static_cast<uint32_t>(m_poses.size()), UINT32_MAX, mesh.vertexCount,0};
+    m_poseSources[std::make_pair(data.key,bones)] = static_cast<uint32_t>(m_poses.size()); m_poses.push_back(pose);
     return true;
 }
 

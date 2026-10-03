@@ -145,6 +145,8 @@ void CryModelSubmesh::DeleteLeafBuffers()
 		}
 
 		g_GetIRenderer()->DeleteLeafBuffer(m_pLeafBuffers[i]);
+        m_gpuAttributeBuffers[i] = nullptr;
+        m_gpuAttributeFormats[i] = 0;
 	}
 }
 
@@ -571,6 +573,22 @@ void CryModelSubmesh::Deform( int nLodToDeform, unsigned nDeformFlags)
         !g_GetCVars()->r_ShowNormals() && !g_GetCVars()->r_ShowTangents() &&
         g_GetIRenderer()->QueueGpuSkinning(pRenderVertexBuffer, pGeomInfo->getGpuSkinningData(),
             m_pParent->getBoneGlobalMatrices(), m_pMesh->numBoneInfos());
+    if (gpuSkinned && (m_gpuAttributeBuffers[nLodToDeform] != pRenderVertexBuffer ||
+        m_gpuAttributeFormats[nLodToDeform] != nVertexFormat ||
+        (nDeformFlags & FLAG_DEFORM_FORCE_UPDATE)))
+    {
+        // Compute patches positions and bases only. Preserve the CPU path's
+        // initialization of UVs and vertex colors whenever the layout changes.
+        char* attributes = pGeomInfo->getVertBuf(nVertexFormat);
+        if (attributes)
+        {
+            g_GetIRenderer()->UpdateBuffer(pRenderVertexBuffer, attributes,
+                lb->m_SecVertCount, true, 0, VSF_GENERAL);
+            m_gpuAttributeBuffers[nLodToDeform] = pRenderVertexBuffer;
+            m_gpuAttributeFormats[nLodToDeform] = nVertexFormat;
+        }
+        else gpuSkinned = false;
+    }
     if (gpuSkinned && nLodToDeform == 0 && NeedMorph() && !g_GetCVars()->ca_NoMorph())
         for (unsigned i=0; i<m_arrMorphEffectors.size(); ++i) {
             const CryModEffMorph& effector=m_arrMorphEffectors[i];

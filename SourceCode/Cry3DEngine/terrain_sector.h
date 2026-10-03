@@ -24,8 +24,6 @@
 
 #define DETAIL_TEX_DISTANCE (0.065f*m_fMaxViewDist)//64
 
-#define MIN_ALLOWED_MERGED_SECTORS_DISTANCE 512
-
 #define MAX_DETAIL_LAYERS_IN_SECTOR 7
 
 #include "BasicArea.h"

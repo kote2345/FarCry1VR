@@ -267,19 +267,66 @@ void VulkanResourceManager::CollectUploads(VkImage waitImage, bool waitAll)
         VkResult result = wait ? m_waitForFences(m_context->GetDevice(), 1, &it->fence,
             VK_TRUE, UINT64_MAX) : m_getFenceStatus(m_context->GetDevice(), it->fence);
         if (result == VK_NOT_READY) { ++it; continue; }
+        if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST)
+        {
+            SetError("checking upload completion failed");
+            ++it;
+            continue;
+        }
         m_freeCommandBuffers(m_context->GetDevice(), m_commandPool, 1, &it->command);
         m_destroyFence(m_context->GetDevice(), it->fence, nullptr);
-        DestroyBuffer(it->staging);
+        m_pendingUploadBytes -= it->staging.size;
+        if (result == VK_SUCCESS) RecycleUploadBuffer(it->staging);
+        else DestroyBuffer(it->staging);
         it = m_pendingUploads.erase(it);
     }
+}
+
+bool VulkanResourceManager::AcquireUploadBuffer(VkDeviceSize size, VulkanBuffer& buffer)
+{
+    CollectUploads();
+    size_t best = m_uploadPool.size();
+    for (size_t i = 0; i < m_uploadPool.size(); ++i)
+        if (m_uploadPool[i].size >= size &&
+            (best == m_uploadPool.size() || m_uploadPool[i].size < m_uploadPool[best].size)) best = i;
+    if (best != m_uploadPool.size())
+    {
+        buffer = m_uploadPool[best];
+        m_uploadPoolBytes -= buffer.size;
+        m_uploadPool.erase(m_uploadPool.begin() + best);
+        return true;
+    }
+    return CreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, buffer);
+}
+
+void VulkanResourceManager::RecycleUploadBuffer(VulkanBuffer& buffer)
+{
+    // Only completed transfer allocations enter this pool. Keeping mapped
+    // memory avoids allocation/map/free churn during sector and texture loads.
+    if (buffer.size <= 16u*1024u*1024u - m_uploadPoolBytes && m_uploadPool.size() < 32)
+    {
+        m_uploadPoolBytes += buffer.size;
+        m_uploadPool.push_back(buffer);
+        buffer = VulkanBuffer{};
+    }
+    else DestroyBuffer(buffer);
 }
 
 bool VulkanResourceManager::SubmitImmediate(const std::function<void(VkCommandBuffer)>& record,
                                            VulkanBuffer* upload, VkImage image)
 {
     CollectUploads();
-    if (m_pendingUploads.size() >= 64)
-        CollectUploads(m_pendingUploads.front().image);
+    while (!m_pendingUploads.empty() && (m_pendingUploads.size() >= 64 ||
+        (upload && m_pendingUploadBytes + upload->size > 32u*1024u*1024u)))
+    {
+        // Buffer transfers have no image handle. Waiting by image previously
+        // failed to enforce the queue limit for those transfers.
+        if (m_waitForFences(m_context->GetDevice(), 1, &m_pendingUploads.front().fence,
+                VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+            return false;
+        CollectUploads();
+    }
     VkFence fence = VK_NULL_HANDLE;
     const bool deferred = upload && m_createFence && m_destroyFence &&
         m_getFenceStatus && m_waitForFences;
@@ -321,6 +368,7 @@ bool VulkanResourceManager::SubmitImmediate(const std::function<void(VkCommandBu
     if (result && deferred)
     {
         m_pendingUploads.push_back(PendingUpload{commandBuffer, fence, *upload, image});
+        m_pendingUploadBytes += upload->size;
         *upload = VulkanBuffer{};
         return true;
     }
@@ -351,8 +399,7 @@ bool VulkanResourceManager::CreateBufferWithData(const void* data, VkDeviceSize 
                                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buffer))
         return false;
     VulkanBuffer staging;
-    if (!CreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging))
+    if (!AcquireUploadBuffer(size, staging))
     {
         DestroyBuffer(buffer);
         return false;
@@ -436,8 +483,19 @@ bool VulkanResourceManager::CreateTextureRGBA8(const void* rgbaData, uint32_t wi
         uint32_t levelWidth = width;
         uint32_t levelHeight = height;
         VkDeviceSize bufferOffset = 0;
-        copyRegions.reserve(suppliedMipCount);
-        for (uint32_t level = 0; level < suppliedMipCount; ++level)
+        const uint32_t uploadLevels = retainUploadBuffer || !generateMipmaps ? 1u : suppliedMipCount;
+        size_t totalBytes = 0;
+        for (uint32_t level = 0, w = width, h = height; level < uploadLevels; ++level)
+        {
+            const size_t bytes = static_cast<size_t>(w) * h * 4;
+            if (bytes > mipPixels.max_size() - totalBytes) return false;
+            totalBytes += bytes;
+            w = w > 1 ? w / 2 : 1;
+            h = h > 1 ? h / 2 : 1;
+        }
+        mipPixels.reserve(totalBytes);
+        copyRegions.reserve(uploadLevels);
+        for (uint32_t level = 0; level < uploadLevels; ++level)
         {
             if (!rgbaMipLevels[level])
                 return false;
@@ -458,7 +516,8 @@ bool VulkanResourceManager::CreateTextureRGBA8(const void* rgbaData, uint32_t wi
             levelHeight = levelHeight > 1 ? levelHeight / 2 : 1;
         }
     }
-    else if (!BuildRgbaMipChain(rgbaData, width, height, mipPixels, copyRegions))
+    else if (!BuildRgbaMipChain(rgbaData, width, height, mipPixels, copyRegions,
+                              retainUploadBuffer || !generateMipmaps ? 1u : 0u))
         return false;
     const uint32_t mipLevels = (retainUploadBuffer || !generateMipmaps) ?
         1u : static_cast<uint32_t>(copyRegions.size());
@@ -469,8 +528,7 @@ bool VulkanResourceManager::CreateTextureRGBA8(const void* rgbaData, uint32_t wi
     }
     const VkDeviceSize dataSize = mipPixels.size();
     VulkanBuffer staging;
-    if (!CreateBuffer(dataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging))
+    if (!AcquireUploadBuffer(dataSize, staging))
         return false;
     if (!UploadBuffer(staging, mipPixels.data(), dataSize))
     {
@@ -602,9 +660,7 @@ bool VulkanResourceManager::UpdateTextureRGBA8(const void* rgbaData, uint32_t wi
     // Each queued update owns its source bytes until its fence signals.
     // Reusing texture.uploadBuffer would require waiting for the GPU before
     // overwriting it and previously forced queueWaitIdle for every update.
-    if (!CreateBuffer(dataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      temporaryStaging))
+    if (!AcquireUploadBuffer(dataSize, temporaryStaging))
         return false;
     VulkanBuffer* uploadBuffer = &temporaryStaging;
     if (uploadBuffer->size < dataSize || !UploadBuffer(*uploadBuffer, mipPixels.data(), dataSize))
@@ -672,9 +728,7 @@ bool VulkanResourceManager::PrepareTextureRGBA8Update(const void* rgbaData, uint
                          lastMip.imageExtent.height * 4);
     const VkDeviceSize dataSize = mipPixels.size();
     if (!texture.uploadBuffer.buffer &&
-        !CreateBuffer(dataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      texture.uploadBuffer))
+        !AcquireUploadBuffer(dataSize, texture.uploadBuffer))
         return false;
     return texture.uploadBuffer.size >= dataSize &&
            UploadBuffer(texture.uploadBuffer, mipPixels.data(), dataSize);
@@ -967,6 +1021,10 @@ void VulkanResourceManager::Shutdown()
     if (m_context && m_commandPool && m_queueWaitIdle)
         m_queueWaitIdle(m_context->GetGraphicsQueue());
     if (m_context) CollectUploads(VK_NULL_HANDLE, true);
+    for (auto& buffer : m_uploadPool) DestroyBuffer(buffer);
+    m_uploadPool.clear();
+    m_uploadPoolBytes = 0;
+    m_pendingUploadBytes = 0;
     if (m_context && m_commandPool && m_destroyCommandPool)
         m_destroyCommandPool(m_context->GetDevice(), m_commandPool, nullptr);
     m_commandPool = VK_NULL_HANDLE;

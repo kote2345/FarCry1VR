@@ -84,6 +84,8 @@ public:
     XrSpace GetStageSpace() const { return m_stageSpace; }
     uint32_t GetRecommendedViewWidth() const { return m_viewConfig[0].recommendedImageRectWidth; }
     uint32_t GetRecommendedViewHeight() const { return m_viewConfig[0].recommendedImageRectHeight; }
+    uint32_t GetMaximumViewWidth(uint32_t eye = 0) const { return m_viewConfig[eye < m_viewCount ? eye : 0].maxImageRectWidth; }
+    uint32_t GetMaximumViewHeight(uint32_t eye = 0) const { return m_viewConfig[eye < m_viewCount ? eye : 0].maxImageRectHeight; }
     uint32_t GetViewCount() const { return m_viewCount; }
     const char* GetLastError() const { return m_lastError; }
     const ControllerState& GetLeftController() const { return m_leftController; }

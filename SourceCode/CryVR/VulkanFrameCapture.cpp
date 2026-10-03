@@ -190,7 +190,7 @@ void ApplyOpenXrEyeMatrices(const float eyeView[16], const float eyeViewProjecti
                            const float modelView[16], float mvp[16], float viewModel[16])
 {
     MultiplyColumnMajor(eyeViewProjection, modelView, mvp);
-    MultiplyColumnMajor(eyeView, modelView, viewModel);
+    if (viewModel) MultiplyColumnMajor(eyeView, modelView, viewModel);
 }
 
 bool BuildFlatPanelMvp(const XrView& leftView, const XrView& rightView,

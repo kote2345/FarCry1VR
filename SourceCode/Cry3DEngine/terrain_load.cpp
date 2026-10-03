@@ -19,6 +19,7 @@
 #include "detail_grass.h"
 #include "terrain_water.h"
 #include "3DEngine.h"
+#include "TerrainTextureStreamer.h"
 
 #ifdef PS2
 #include "File.h"
@@ -51,6 +52,8 @@ CTerrain::CTerrain( )
 
 void CTerrain::CloseTerrainTextureFile()
 {
+    delete m_pTextureStreamer;
+    m_pTextureStreamer = 0;
 	if(m_fpTerrainTextureFile)
 		GetSystem()->GetIPak()->FClose(m_fpTerrainTextureFile);
 	m_fpTerrainTextureFile=0;
@@ -58,6 +61,8 @@ void CTerrain::CloseTerrainTextureFile()
 
 CTerrain::~CTerrain()
 {
+    delete m_pTextureStreamer;
+    m_pTextureStreamer = 0;
 //  UnReg isterInAllSectors(0);
 
 	if(m_arrSecInfoTable.m_nSize)

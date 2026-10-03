@@ -202,7 +202,7 @@ bool CVisArea::PreloadVisArea(int nMaxReqursion, bool * pbOutdoorFound, CVisArea
 	if(nMaxReqursion>0)
 		for(int p=0; p<m_lstConnections.Count(); p++)
 			if(m_lstConnections[p] != pParentToAvoid)
-				if(GetCurTimeSec()>(m_fPreloadStartTime+0.010f)||
+				if(GetTimer()->GetAsyncCurTime()>=m_dPreloadDeadline||
 					m_lstConnections[p]->PreloadVisArea(nMaxReqursion-1, pbOutdoorFound, this, vPrevPortalPos, fPrevPortalDistance))
 					return true;
 

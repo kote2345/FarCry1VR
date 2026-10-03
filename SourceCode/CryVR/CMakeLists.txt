@@ -116,7 +116,7 @@ add_custom_command(
             "-DSIXTH_FRAGMENT_ARRAY_NAME=kVrSceneTextureBumpFragmentSpirv"
             "-DFRAGMENT_ARRAY_NAME=kVrSceneFragmentSpirv" "-DHEADER_GUARD=CRY_VR_SCENE_SHADERS_H"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
-    DEPENDS shaders/scene_stereo.glsl shaders/scene_lighting.glsl shaders/scene_alpha_test.glsl shaders/scene_vertex_lighting.glsl
+    DEPENDS shaders/scene_fog.glsl shaders/scene_stereo.glsl shaders/scene_lighting.glsl shaders/scene_alpha_test.glsl shaders/scene_vertex_lighting.glsl shaders/scene_water.glsl
             shaders/vr_scene.vert shaders/vr_scene.frag shaders/vr_scene_color.vert
             shaders/vr_scene_color.frag shaders/vr_scene_texture.vert shaders/vr_scene_texture.frag
             shaders/vr_scene_water.frag
@@ -257,7 +257,7 @@ add_custom_command(
             "-DVERTEX_ARRAY_NAME=kVrLitVertexSpirv" "-DEXTRA_VERTEX_ARRAY_NAME=kVrLitColorVertexSpirv"
             "-DFRAGMENT_ARRAY_NAME=kVrLitFragmentSpirv" "-DHEADER_GUARD=CRY_VR_LIT_SCENE_SHADERS_H"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
-    DEPENDS shaders/scene_stereo.glsl shaders/scene_lighting.glsl shaders/scene_alpha_test.glsl shaders/scene_vertex_lighting.glsl
+    DEPENDS shaders/scene_fog.glsl shaders/scene_stereo.glsl shaders/scene_lighting.glsl shaders/scene_alpha_test.glsl shaders/scene_vertex_lighting.glsl
             shaders/vr_scene_lit.vert shaders/vr_scene_lit_color.vert shaders/vr_scene_lit.frag
             cmake/EmbedSpirv.cmake VERBATIM)
 add_custom_target(CryVRLitSceneShaders DEPENDS "${CRYVR_LIT_SHADER_HEADER}")
@@ -306,6 +306,8 @@ add_custom_command(
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_plants.vert" -o "${CRYVR_GENERATED_DIR}/plants.vert.spv"
     COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_plants.frag" -o "${CRYVR_GENERATED_DIR}/plants.frag.spv"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O -DPLANT_EARLY_FRAGMENT_TESTS=1
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_plants.frag" -o "${CRYVR_GENERATED_DIR}/plants_early.frag.spv"
     COMMAND "${CMAKE_COMMAND}"
         "-DVERTEX_SPV=${CRYVR_GENERATED_DIR}/terrain_layer.vert.spv"
         "-DFRAGMENT_SPV=${CRYVR_GENERATED_DIR}/terrain_layer.frag.spv"
@@ -319,10 +321,12 @@ add_custom_command(
         "-DTHIRD_FRAGMENT_SPV=${CRYVR_GENERATED_DIR}/plants.frag.spv"
         "-DTHIRD_VERTEX_ARRAY_NAME=kVrPlantsVertexSpirv"
         "-DTHIRD_FRAGMENT_ARRAY_NAME=kVrPlantsFragmentSpirv"
+        "-DFOURTH_FRAGMENT_SPV=${CRYVR_GENERATED_DIR}/plants_early.frag.spv"
+        "-DFOURTH_FRAGMENT_ARRAY_NAME=kVrPlantsEarlyFragmentSpirv"
         "-DHEADER_GUARD=CRY_VR_STOCK_PROGRAMS_H"
         "-DOUTPUT_HEADER=${CRYVR_STOCK_PROGRAM_HEADER}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
-    DEPENDS shaders/vr_terrain_layer.vert shaders/vr_terrain_layer.frag
+    DEPENDS shaders/scene_fog.glsl shaders/vr_terrain_layer.vert shaders/vr_terrain_layer.frag
         shaders/vr_plants.vert shaders/vr_plants.frag shaders/scene_plants_uniforms.glsl
         shaders/vr_caustics.vert shaders/vr_caustics.frag
         shaders/scene_stereo.glsl shaders/scene_water.glsl shaders/scene_alpha_test.glsl cmake/EmbedSpirv.cmake VERBATIM)

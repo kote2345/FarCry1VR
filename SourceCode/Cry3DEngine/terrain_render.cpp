@@ -21,8 +21,9 @@
 
 bool CTerrain::IsSectorNonMergable(CSectorInfo * info)
 {
+  const int mergeDistance = GetCVars()->e_terrain_merge_far_sectors_distance;
   if( info->m_cGeometryMML<MAX_MML_LEVEL || 
-      info->m_fDistance<MIN_ALLOWED_MERGED_SECTORS_DISTANCE || 
+      info->m_fDistance<mergeDistance ||
       !(GetCVars()->e_terrain_merge_far_sectors && CTerrain::GetHeightMapUnitSize()>=2)||
       info->m_pFogVolume ||
       (m_nRenderStackLevel && info->m_nLastMergedFrameID != GetFrameID()))
@@ -85,7 +86,7 @@ void CTerrain::DrawVisibleSectors()
       continue;
 
     // set texgen offset
-		if(info->m_fDistance*fZoomFactor > MIN_ALLOWED_MERGED_SECTORS_DISTANCE)
+		if(info->m_fDistance*fZoomFactor > pCVars->e_terrain_merge_far_sectors_distance)
 		{
 			info->m_arrTexOffsets[0] = 0;
 			info->m_arrTexOffsets[1] = 0;

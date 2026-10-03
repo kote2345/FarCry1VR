@@ -15,6 +15,9 @@
 #include "../Common/RendElements/CREFlares.h"
 #include "../../CryCommon/CRETriMeshShadow.h"
 #include "../../CryCommon/LeafBuffer.h"
+#include "../../Cry3DEngine/StatObj.h"
+#include "../../Cry3DEngine/terrain.h"
+#include "../../Cry3DEngine/ObjMan.h"
 #include "../Common/Shadow_Renderer.h"
 #include "../Common/NvTriStrip/NvTriStrip.h"
 #include <array>
@@ -25,10 +28,42 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace
 {
+// Shader and CG parameter identifiers are ASCII. Keep these hot-path tests
+// inline instead of calling libc strcasecmp for every draw/material pass.
+inline int FastAsciiCaseCompare(const char* left, const char* right)
+{
+    if (!left || !right) return left == right ? 0 : (left ? 1 : -1);
+    for (;; ++left, ++right)
+    {
+        unsigned char a = static_cast<unsigned char>(*left);
+        unsigned char b = static_cast<unsigned char>(*right);
+        if (a >= 'A' && a <= 'Z') a = static_cast<unsigned char>(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = static_cast<unsigned char>(b + ('a' - 'A'));
+        if (a != b) return a < b ? -1 : 1;
+        if (!a) return 0;
+    }
+}
+
+inline int FastAsciiCaseCompareN(const char* left, const char* right, size_t count)
+{
+    if (!left || !right) return left == right ? 0 : (left ? 1 : -1);
+    for (size_t i = 0; i < count; ++i, ++left, ++right)
+    {
+        unsigned char a = static_cast<unsigned char>(*left);
+        unsigned char b = static_cast<unsigned char>(*right);
+        if (a >= 'A' && a <= 'Z') a = static_cast<unsigned char>(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = static_cast<unsigned char>(b + ('a' - 'A'));
+        if (a != b) return a < b ? -1 : 1;
+        if (!a) return 0;
+    }
+    return 0;
+}
+
 // Dynamic-light passes complement the baked lightmap path, as they do in the
 // stock OpenGL renderer. Their Vulkan implementation uses the translated
 // stock lighting path below, including DLF_LM specular occlusion sampling.
@@ -745,7 +780,38 @@ public:
     }
     void ReleaseBuffer(CVertexBuffer* vertices) override {
         ClearGpuSkinning(vertices);
+        m_frameBufferRevisions.erase(vertices);
+        for (auto entry = m_frameNormalGeometry.begin(); entry != m_frameNormalGeometry.end();)
+        {
+            if (entry->first[0] == reinterpret_cast<uintptr_t>(vertices))
+            {
+                m_frameNormalGeometryBytes -= entry->second.size();
+                entry = m_frameNormalGeometry.erase(entry);
+            }
+            else ++entry;
+        }
         CNULLRenderer::ReleaseBuffer(vertices);
+    }
+    void UpdateBuffer(CVertexBuffer* vertices, const void* source, int count,
+                      bool unlock, int offset, int type) override
+    {
+        m_frameBufferRevisions[vertices] = ++m_geometryRevision;
+        CNULLRenderer::UpdateBuffer(vertices, source, count, unlock, offset, type);
+    }
+    void CreateIndexBuffer(SVertexStream* stream, const void* source, int count) override
+    {
+        m_ownedIndexRevisions[stream] = ++m_geometryRevision;
+        CNULLRenderer::CreateIndexBuffer(stream, source, count);
+    }
+    void UpdateIndexBuffer(SVertexStream* stream, const void* source, int count, bool unlock = true) override
+    {
+        m_ownedIndexRevisions[stream] = ++m_geometryRevision;
+        CNULLRenderer::UpdateIndexBuffer(stream, source, count, unlock);
+    }
+    void ReleaseIndexBuffer(SVertexStream* stream) override
+    {
+        m_ownedIndexRevisions.erase(stream);
+        CNULLRenderer::ReleaseIndexBuffer(stream);
     }
     explicit CVulkanRenderer(CryVR::VulkanFrameRenderer* frameRenderer)
         : m_frameRenderer(frameRenderer)
@@ -1200,15 +1266,10 @@ public:
 
     void BeginFrame() override
     {
+        m_framePrograms.clear();
+        m_lastClassifiedPass = nullptr;
+        m_lastProgramInfo = nullptr;
         CNULLRenderer::BeginFrame();
-        // Quest performance preset: this cheat-protected cvar cannot reliably
-        // be changed through launcher commands outside developer mode.
-        if (iConsole)
-        {
-            ICVar* dynamicLight = iConsole->GetCVar("e_dynamic_light");
-            if (dynamicLight && dynamicLight->GetIVal() != 0)
-                dynamicLight->ForceSet("0");
-        }
         InitializeStockFogTextures();
         UpdateStockGamma(CV_r_gamma + m_fDeltaGamma, CV_r_brightness, CV_r_contrast);
         if (CV_r_reloadshaders)
@@ -1224,7 +1285,7 @@ public:
             const int anisotropy = clamp_tpl(CRenderer::CV_r_texture_anisotropic_level, 1,
                 crymax(1, static_cast<int>(m_frameRenderer->GetStockMaxAnisotropy())));
             CRenderer::CV_r_texture_anisotropic_level = anisotropy;
-            if (filter && anisotropy > 1 && stricmp(filter->GetString(), "GL_LINEAR_MIPMAP_LINEAR"))
+            if (filter && anisotropy > 1 && FastAsciiCaseCompare(filter->GetString(), "GL_LINEAR_MIPMAP_LINEAR"))
                 filter->Set("GL_LINEAR_MIPMAP_LINEAR");
             const char* name = filter ? filter->GetString() : "GL_LINEAR_MIPMAP_LINEAR";
             if (m_lastTextureFilter != name || m_lastTextureAnisotropy != anisotropy)
@@ -1234,7 +1295,7 @@ public:
                 const int modes[] = { eVTF_NearestNoMips, eVTF_Linear, eVTF_Nearest,
                     eVTF_Bilinear, eVTF_NearestMipLinear, eVTF_Trilinear };
                 for (int index = 0; index < 6; ++index)
-                    if (!stricmp(name, names[index]))
+                    if (!FastAsciiCaseCompare(name, names[index]))
                     {
                         if (m_vulkanTexMan->UpdateGlobalFilter(m_frameRenderer,
                                 anisotropy > 1 ? eVTF_Anisotropic : modes[index], static_cast<float>(anisotropy)))
@@ -1455,6 +1516,465 @@ public:
                 m_TexMan->m_nCurStages = crymax(m_TexMan->m_nCurStages, stage + 1);
         }
         CNULLRenderer::SetTexture(textureId, textureType);
+    }
+
+    uint MakeSprite(float objectScale, int textureSize, float angle, IStatObj* statObject,
+                    uchar*, uint) override
+    {
+        CStatObj* object = static_cast<CStatObj*>(statObject);
+        CLeafBuffer* leaf = object ? object->GetLeafBuffer() : nullptr;
+        const auto reportBake = [&](const char* status, int sourceId,
+                                    const char* shaderName = "", const char* diffuseName = "") {
+#if defined(__ANDROID__)
+            static unsigned reports = 0;
+            if (fabsf(angle - 90.0f) > 0.01f || reports >= 256) return;
+            if (FILE* file = fopen("/sdcard/FarCry/vulkan_sprite_bake.csv", reports ? "ab" : "wb")) {
+                if (!reports) fprintf(file, "model,size,status,source_texture,shader,diffuse\n");
+                fprintf(file, "%s,%d,%s,%d,%s,%s\n", object ? object->GetFileName() : "<null>",
+                    textureSize, status, sourceId, shaderName, diffuseName);
+                fclose(file);
+                ++reports;
+            }
+#endif
+        };
+        if (!object || !leaf || !leaf->m_pSecVertBuffer || textureSize <= 0 ||
+            textureSize > 256 || !leaf->m_pMats || leaf->m_pMats->Count() == 0 ||
+            !m_frameRenderer || !m_TexMan)
+            return 0;
+
+        struct SpriteMaterial {
+            int firstIndex = 0, indexCount = 0;
+            bool vertexColors = false;
+            bool sunDiffuse = false;
+            uint32_t alphaTest = GS_ALPHATEST_GEQUAL128;
+            float alphaRef = 0.0f;
+            uint32_t width = 0, height = 0;
+            std::vector<uint8_t> pixels;
+            uint32_t bumpWidth = 0, bumpHeight = 0;
+            std::vector<uint8_t> bumpPixels;
+        };
+        std::vector<SpriteMaterial> spriteMaterials;
+        for (int materialIndex = 0; materialIndex < leaf->m_pMats->Count(); ++materialIndex)
+        {
+            CMatInfo* material = leaf->m_pMats->Get(materialIndex);
+            SShader* materialShader = material && material->shaderItem.m_pShader ?
+                static_cast<SShader*>(material->shaderItem.m_pShader->GetTemplate(-1)) : nullptr;
+            // Match the normal GL/Vulkan submission path: helper geometry
+            // with a NODRAW shader is not part of the tree silhouette.
+            if (!material || !materialShader || (materialShader->m_Flags3 & EF3_NODRAW)) continue;
+            SRenderShaderResources* resources = material ? material->shaderItem.m_pShaderResources : nullptr;
+            SEfResTexture* diffuse = resources ? resources->m_Textures[EFTT_DIFFUSE] : nullptr;
+            if (diffuse && !diffuse->m_TU.m_TexPic && !diffuse->m_Name.empty())
+                diffuse->m_TU.m_TexPic = m_cEF.LoadVulkanResourceTexture(diffuse->m_Name.c_str(),
+                    resources->m_TexturePath.c_str(), diffuse->m_TU.GetTexFlags() | FT_NOSTREAM,
+                    diffuse->m_TU.GetTexFlags2(), eTT_Base, materialShader, diffuse, diffuse->m_Amount);
+            ITexPic* image = diffuse ? diffuse->m_TU.m_ITexPic : nullptr;
+            const auto passImage = [&](const SShaderPass& pass) -> ITexPic* {
+                if (!pass.m_TUnits.Num()) return nullptr;
+                STexPic* texture = pass.m_TUnits[0].m_TexPic;
+                if (!texture) return nullptr;
+                if (texture->m_Bind >= 0 && texture->m_Bind < EFTT_MAX) {
+                    SEfResTexture* resource = resources ? resources->m_Textures[texture->m_Bind] : nullptr;
+                    return resource ? resource->m_TU.m_ITexPic : nullptr;
+                }
+                return texture;
+            };
+            if (!image)
+                for (int pass = 0; pass < materialShader->m_Passes.Num() && !image; ++pass)
+                    image = passImage(materialShader->m_Passes[pass]);
+            if (!image)
+                for (int tech = 0; tech < materialShader->m_HWTechniques.Num() && !image; ++tech) {
+                    const SShaderTechnique* technique = materialShader->m_HWTechniques[tech];
+                    if (technique)
+                        for (int pass = 0; pass < technique->m_Passes.Num() && !image; ++pass)
+                            image = passImage(technique->m_Passes[pass]);
+                }
+            if (material && material->nNumIndices > 0)
+            {
+                SpriteMaterial source;
+                source.firstIndex = material->nFirstIndexId;
+                source.indexCount = material->nNumIndices;
+                source.vertexColors = (materialShader->m_Flags3 & EF3_HASVCOLORS) != 0;
+                if (resources && !(materialShader->m_Flags2 & EF2_IGNORERESOURCESTATES))
+                    source.alphaRef = resources->m_AlphaRef;
+                // Cg reads mesh colors independently of fixed-function
+                // texture-environment/global color selectors.
+                bool colorPassFound = false;
+                for (int tech = 0; tech < materialShader->m_HWTechniques.Num() && !colorPassFound; ++tech)
+                {
+                    const SShaderTechnique* technique = materialShader->m_HWTechniques[tech];
+                    if (!technique) continue;
+                    for (int pass = 0; pass < technique->m_Passes.Num(); ++pass)
+                    {
+                        const SShaderPassHW& candidate = technique->m_Passes[pass];
+                        if (candidate.m_ePassType != eSHP_General) continue;
+                        source.alphaTest = candidate.m_RenderState & GS_ALPHATEST_MASK;
+                        // Resource AlphaRef and the cutout shader's state are
+                        // committed separately from the hardware pass in GL.
+                        if (!source.alphaTest && (materialShader->m_Flags3 & EF3_HASALPHATEST))
+                            source.alphaTest = GS_ALPHATEST_GEQUAL128;
+                        if (!FastAsciiCaseCompare(candidate.m_StockFragmentProgram, "CGRCPlants"))
+                            source.vertexColors = true;
+                        if (!FastAsciiCaseCompare(candidate.m_StockFragmentProgram, "CGRCPlants_Bump"))
+                        {
+                            source.vertexColors = true;
+                            source.sunDiffuse = true;
+                        }
+                        if (!FastAsciiCaseCompare(candidate.m_StockFragmentProgram, "CGRCAmbientTempl"))
+                            source.vertexColors = candidate.m_StockUsesVertexColors;
+                        colorPassFound = true;
+                        break;
+                    }
+                }
+                const int sourceId = image ? image->GetTextureID() : 0;
+                bool available = sourceId > 0 &&
+                    m_frameRenderer->CopyRecentSpriteSourceTexture(sourceId,
+                        source.width, source.height, source.pixels);
+                if (!available && image && sourceId > 0) {
+                    // Existing GPU textures may outlive the bounded baking
+                    // cache. Restore their CPU source once, during baking.
+                    STexPic* pic = static_cast<STexPic*>(image);
+                    EF_LoadTexture(pic->m_SearchName.c_str(), pic->m_Flags | FT_NOSTREAM,
+                        pic->m_Flags2 | FT2_RELOAD, pic->m_eTT, pic->m_fAmount1,
+                        pic->m_fAmount2, pic->m_Id, pic->m_Bind);
+                    available = m_frameRenderer->CopyRecentSpriteSourceTexture(sourceId,
+                        source.width, source.height, source.pixels);
+                }
+                if (!available || !source.width || !source.height)
+                { reportBake("missing_material_source", sourceId,
+                    materialShader->m_Name.c_str(), diffuse ? diffuse->m_Name.c_str() : "<none>"); return 0; }
+                if (source.sunDiffuse && resources)
+                {
+                    SEfResTexture* bump = resources->m_Textures[EFTT_BUMP];
+                    if (bump && !bump->m_TU.m_ITexPic && !bump->m_Name.empty())
+                        bump->m_TU.m_ITexPic = m_cEF.LoadVulkanResourceTexture(bump->m_Name.c_str(),
+                            resources->m_TexturePath.c_str(), bump->m_TU.GetTexFlags() | FT_NOSTREAM,
+                            bump->m_TU.GetTexFlags2(), eTT_Base, materialShader, bump, bump->m_Amount);
+                    if (bump && bump->m_TU.m_ITexPic)
+                    {
+                        STexPic* pic = static_cast<STexPic*>(bump->m_TU.m_ITexPic);
+                        if (!m_frameRenderer->CopyRecentSpriteSourceTexture(pic->GetTextureID(),
+                            source.bumpWidth, source.bumpHeight, source.bumpPixels))
+                        {
+                            EF_LoadTexture(pic->m_SearchName.c_str(), pic->m_Flags | FT_NOSTREAM,
+                                pic->m_Flags2 | FT2_RELOAD, pic->m_eTT, pic->m_fAmount1,
+                                pic->m_fAmount2, pic->m_Id, pic->m_Bind);
+                            m_frameRenderer->CopyRecentSpriteSourceTexture(pic->GetTextureID(),
+                                source.bumpWidth, source.bumpHeight, source.bumpPixels);
+                        }
+                    }
+                }
+                spriteMaterials.push_back(std::move(source));
+            }
+        }
+        if (spriteMaterials.empty()) return 0;
+
+        int positionStride = 0, uvStride = 0;
+        const uint8_t* positions = leaf->GetPosPtr(positionStride, 0, true);
+        const uint8_t* texcoords = leaf->GetUVPtr(uvStride, 0, true);
+        int indexCount = 0;
+        const uint16_t* indices = leaf->GetIndices(&indexCount);
+        if (!positions || !texcoords || !indices || indexCount < 3 ||
+            leaf->m_SecVertCount <= 0)
+            return 0;
+
+        int colorStride = 0;
+        const uint8_t* colors = leaf->GetColorPtr(colorStride, 0, true);
+        int secondaryStride = 0;
+        const uint8_t* secondaryColors = leaf->GetSecColorPtr(secondaryStride, 0, true);
+        const Vec3 sunColor = iSystem->GetI3DEngine()->GetSunColor();
+        struct SpriteVertex { float x, y, z, u, v; float rgb[3]; float light[3]; };
+        std::vector<SpriteVertex> projected(static_cast<size_t>(leaf->m_SecVertCount));
+        const float radians = angle * (3.14159265358979323846f / 180.0f);
+        const float cosine = cosf(radians), sine = sinf(radians);
+        const float radiusX = crymax(object->GetRadiusHors(), 0.01f);
+        const float radiusZ = crymax(object->GetRadiusVert(), 0.01f);
+        // GL MakeSprite uses a narrow perspective camera looking along -X.
+        const float drawDistance = radiusZ * crymax(objectScale, 1.0f);
+        const float halfFov = (0.565f / crymax(objectScale, 1.0f) * 200.0f) *
+            (3.14159265358979323846f / 360.0f);
+        const float halfHeight = drawDistance * tanf(halfFov);
+        const float halfWidth = halfHeight * radiusX / radiusZ;
+        const Vec3 center = object->GetCenter();
+        for (int vertex = 0; vertex < leaf->m_SecVertCount; ++vertex)
+        {
+            const Vec3& position = *reinterpret_cast<const Vec3*>(positions +
+                static_cast<size_t>(vertex) * positionStride);
+            const SMRendTexVert& uv = *reinterpret_cast<const SMRendTexVert*>(texcoords +
+                static_cast<size_t>(vertex) * uvStride);
+            const float x = position.x - center.x;
+            const float y = position.y - center.y;
+            projected[vertex] = { x * cosine - y * sine, x * sine + y * cosine,
+                                  position.z - center.z, uv.vert[0], uv.vert[1] };
+            for (int channel = 0; channel < 3; ++channel)
+            {
+                projected[vertex].light[channel] = secondaryColors && secondaryStride > 0 ?
+                    secondaryColors[size_t(vertex)*secondaryStride+channel]*(2.0f/255.0f)-1.0f : 0.0f;
+                projected[vertex].rgb[channel] = colors && colorStride > 0 ?
+                    colors[size_t(vertex) * colorStride + channel] * (1.0f / 255.0f) : 1.0f;
+            }
+        }
+
+        const size_t outputBytes = static_cast<size_t>(textureSize) * textureSize * 4;
+        std::vector<uint8_t> sprite(outputBytes, 0);
+        // The GL capture clears RGB to 0.15, not black. Those transparent
+        // texels still participate in bilinear filtering at the silhouette.
+        for (size_t pixel = 0; pixel < outputBytes; pixel += 4)
+            sprite[pixel] = sprite[pixel+1] = sprite[pixel+2] = 38;
+        std::vector<float> depth(static_cast<size_t>(textureSize) * textureSize,
+                                 std::numeric_limits<float>::max());
+        const auto edge = [](float ax, float ay, float bx, float by, float px, float py)
+        { return (px - ax) * (by - ay) - (py - ay) * (bx - ax); };
+        const auto sample = [](uint32_t width, uint32_t height, const std::vector<uint8_t>& pixels,
+                               float u, float v, uint8_t rgba[4])
+        {
+            u -= floorf(u); v -= floorf(v);
+            // This is the exact RGBA upload used by the GPU. Source UVs must
+            // sample the same rows, independently of the output sprite's flip.
+            const float x = u * width - 0.5f;
+            const float y = v * height - 0.5f;
+            const int ix = int(floorf(x)), iy = int(floorf(y));
+            const float fx = x - ix, fy = y - iy;
+            const auto texel = [&](int px, int py) {
+                px = (px % int(width) + int(width)) % int(width);
+                py = (py % int(height) + int(height)) % int(height);
+                return pixels.data() + (size_t(py)*width+px)*4;
+            };
+            const uint8_t* a = texel(ix, iy);
+            const uint8_t* b = texel(ix+1, iy);
+            const uint8_t* c = texel(ix, iy+1);
+            const uint8_t* d = texel(ix+1, iy+1);
+            for (int channel = 0; channel < 4; ++channel)
+                rgba[channel] = uint8_t(((a[channel]*(1.0f-fx)+b[channel]*fx)*(1.0f-fy) +
+                    (c[channel]*(1.0f-fx)+d[channel]*fx)*fy) + 0.5f);
+        };
+        for (int triangle = 0; triangle + 2 < indexCount; triangle += 3)
+        {
+            const SpriteMaterial* source = nullptr;
+            for (const SpriteMaterial& material : spriteMaterials)
+                if (triangle >= material.firstIndex &&
+                    int64_t(triangle) + 2 < int64_t(material.firstIndex) + material.indexCount)
+                { source = &material; break; }
+            if (!source) continue;
+            const uint16_t ia = indices[triangle], ib = indices[triangle + 1], ic = indices[triangle + 2];
+            if (ia >= projected.size() || ib >= projected.size() || ic >= projected.size()) continue;
+            const SpriteVertex& a = projected[ia];
+            const SpriteVertex& b = projected[ib];
+            const SpriteVertex& c = projected[ic];
+            const float da = drawDistance - a.x, db = drawDistance - b.x, dc = drawDistance - c.x;
+            if (da <= 0.0f || db <= 0.0f || dc <= 0.0f) continue;
+            const auto pixelX = [&](const SpriteVertex& v, float d) {
+                return (v.y * drawDistance / (d * 2.0f * halfWidth) + 0.5f) * textureSize; };
+            const auto pixelY = [&](const SpriteVertex& v, float d) {
+                return (0.5f - v.z * drawDistance / (d * 2.0f * halfHeight)) * textureSize; };
+            const float ax = pixelX(a, da), ay = pixelY(a, da);
+            const float bx = pixelX(b, db), by = pixelY(b, db);
+            const float cx = pixelX(c, dc), cy = pixelY(c, dc);
+            const float area = edge(ax, ay, bx, by, cx, cy);
+            if (fabsf(area) < 1.0e-5f) continue;
+            const int minX = crymax(0, static_cast<int>(floorf(crymin(ax, crymin(bx, cx)))));
+            const int maxX = crymin(textureSize - 1, static_cast<int>(ceilf(crymax(ax, crymax(bx, cx)))));
+            const int minY = crymax(0, static_cast<int>(floorf(crymin(ay, crymin(by, cy)))));
+            const int maxY = crymin(textureSize - 1, static_cast<int>(ceilf(crymax(ay, crymax(by, cy)))));
+            for (int py = minY; py <= maxY; ++py)
+                for (int px = minX; px <= maxX; ++px)
+                {
+                    float wa = edge(bx, by, cx, cy, px + 0.5f, py + 0.5f) / area;
+                    float wb = edge(cx, cy, ax, ay, px + 0.5f, py + 0.5f) / area;
+                    float wc = 1.0f - wa - wb;
+                    if (wa < -1.0e-4f || wb < -1.0e-4f || wc < -1.0e-4f) continue;
+                    const float reciprocalDepth = wa/da + wb/db + wc/dc;
+                    const float z = 1.0f / reciprocalDepth;
+                    wa = wa / da * z; wb = wb / db * z; wc = wc / dc * z;
+                    const size_t pixel = static_cast<size_t>(py) * textureSize + px;
+                    if (z >= depth[pixel]) continue;
+                    uint8_t rgba[4];
+                    const float u = wa*a.u + wb*b.u + wc*c.u;
+                    const float v = wa*a.v + wb*b.v + wc*c.v;
+                    sample(source->width, source->height, source->pixels, u, v, rgba);
+                    if (source->alphaRef > 0.0f && float(rgba[3]) / 255.0f < source->alphaRef) continue;
+                    if (source->alphaRef <= 0.0f &&
+                        ((source->alphaTest == GS_ALPHATEST_GREATER0 && rgba[3] == 0) ||
+                        (source->alphaTest == GS_ALPHATEST_LESS128 && rgba[3] >= 128) ||
+                        (source->alphaTest == GS_ALPHATEST_GEQUAL128 && rgba[3] < 128) ||
+                        (source->alphaTest == GS_ALPHATEST_GEQUAL64 && rgba[3] < 64))) continue;
+                    float sun = 0.0f;
+                    if (source->sunDiffuse)
+                    {
+                        float normal[3] = {0.0f, 0.0f, 1.0f};
+                        if (!source->bumpPixels.empty() && source->bumpWidth && source->bumpHeight)
+                        {
+                            uint8_t bump[4];
+                            sample(source->bumpWidth, source->bumpHeight, source->bumpPixels, u, v, bump);
+                            for (int channel = 0; channel < 3; ++channel)
+                                normal[channel] = bump[channel]*(2.0f/255.0f)-1.0f;
+                        }
+                        for (int channel = 0; channel < 3; ++channel)
+                            sun += normal[channel]*(wa*a.light[channel]+wb*b.light[channel]+wc*c.light[channel]);
+                        sun = clamp_tpl(sun, 0.0f, 1.0f);
+                    }
+                    if (source->vertexColors)
+                        for (int channel = 0; channel < 3; ++channel)
+                            rgba[channel] = uint8_t(clamp_tpl(float(rgba[channel]) *
+                                (wa * a.rgb[channel] + wb * b.rgb[channel] + wc * c.rgb[channel] +
+                                 sun*sunColor[channel]),
+                                0.0f, 255.0f) + 0.5f);
+                    depth[pixel] = z;
+                    // MakeSprite in GL reads BGRA; CreateTexture(eTF_8888)
+                    // expects the same engine byte order. Our sampler is RGBA.
+                    std::swap(rgba[0], rgba[2]);
+                    rgba[3] = 255;
+                    memcpy(sprite.data() + pixel * 4, rgba, 4);
+                }
+        }
+
+        // Use the same RGB silhouette test and border clearing as GL.
+        SetTextureAlphaChannelFromRGB(sprite.data(), textureSize);
+        char name[256];
+        snprintf(name, sizeof(name), "$VulkanFarSprite$%s$%d$%.1f",
+                 object->GetFileName(), textureSize, angle);
+        STexPic* result = m_TexMan->CreateTexture(name, textureSize, textureSize, 1,
+            FT_HASALPHA | FT_NOMIPS | FT_CLAMP, 0, sprite.data(), eTT_Base,
+            -1.0f, -1.0f, 0, nullptr, 0, eTF_RGBA, object->GetFileName());
+        (void)objectScale;
+        reportBake(result ? "ready" : "texture_creation_failed", 0);
+        return result ? result->m_Bind : 0;
+    }
+
+    void DrawObjSprites(list2<CStatObjInst*>* instances, float maxViewDistance,
+                        CObjManager* objectManager) override
+    {
+        if (!m_frameOpen || !m_frameRenderer || !instances || !objectManager ||
+            instances->Count() == 0)
+            return;
+        struct SpriteBatch
+        {
+            std::vector<struct_VERTEX_FORMAT_P3F_COL4UB_TEX2F> vertices;
+            std::vector<uint16_t> indices;
+        };
+        static std::map<int, SpriteBatch> batches;
+        // Keep per-texture vectors and map nodes across frames. Clearing the
+        // map destroyed every bucket's capacity each frame, rebuilding the
+        // same billboard buffers and allocating on the CPU hot path.
+        for (std::map<int, SpriteBatch>::iterator it = batches.begin(); it != batches.end(); ++it)
+        {
+            it->second.vertices.clear();
+            it->second.indices.clear();
+        }
+        const Vec3 camera = m_RP.m_ViewOrg;
+        const float maxDistance = maxViewDistance * 0.8f;
+        const Vec3 world = iSystem->GetI3DEngine()->GetWorldColor();
+        for (int instanceIndex = 0; instanceIndex < instances->Count(); ++instanceIndex)
+        {
+            CStatObjInst* instance = instances->GetAt(instanceIndex);
+            if (!instance || instance->m_nObjectTypeID < 0 ||
+                instance->m_nObjectTypeID >= objectManager->m_lstStaticTypes.Count()) continue;
+            CStatObj* body = objectManager->m_lstStaticTypes[instance->m_nObjectTypeID].GetStatObj();
+            if (!body || !body->IsSpritesCreated()) continue;
+            CStatObj* spriteShape = body;
+            if (body->m_nLoadedLodsNum && body->m_arrpLowLODs[body->m_nLoadedLodsNum-1])
+                spriteShape = body->m_arrpLowLODs[body->m_nLoadedLodsNum-1];
+            const int distanceSlot = clamp_tpl(SRendItem::m_RecurseLevel - 1, 0, 2);
+            const float distance = crymax(instance->m_arrfDistance[distanceSlot], 0.01f);
+            float fade = 1.0f;
+            if (objectManager->m_lstStaticTypes[instance->m_nObjectTypeID].bFadeSize)
+            {
+                const float limit = crymin(instance->GetMaxViewDist(), maxDistance);
+                fade = (1.0f - distance * objectManager->m_fZoomFactor / crymax(limit, 0.01f)) * 8.0f;
+                if (fade <= 0.0f) continue;
+                fade = crymin(fade, 1.0f);
+            }
+            const float dx = instance->m_vPos.x - camera.x;
+            const float dy = instance->m_vPos.y - camera.y;
+            float angle = atan2f(dx + instance->m_fScale*spriteShape->GetCenter().x,
+                dy + instance->m_fScale*spriteShape->GetCenter().y) * (180.0f / 3.14159265358979323846f);
+            if (angle < 0.0f) angle += 360.0f;
+            const int slot = static_cast<int>(angle / FAR_TEX_ANGLE + 0.5f) % FAR_TEX_COUNT;
+            if (SRendItem::m_RecurseLevel == 1) instance->m_ucAngleSlotId = slot;
+            const int textureId = static_cast<int>(body->m_arrSpriteTexID[slot]);
+            if (textureId <= 0) continue;
+            const Vec3 center = spriteShape->GetCenter() * instance->m_fScale;
+            const float vertical = instance->m_fScale * spriteShape->GetRadiusVert() * fade;
+            const float horizontal = instance->m_fScale * spriteShape->GetRadiusHors() *
+                objectManager->m_fZoomFactor * fade;
+            const float halfX = dy * horizontal / distance;
+            const float halfY = dx * horizontal / distance;
+            const Vec3 origin = instance->m_vPos + center * fade;
+            SpriteBatch& batch = batches[textureId];
+            if (batch.vertices.size() > 65000)
+                continue;
+            const uint16_t base = static_cast<uint16_t>(batch.vertices.size());
+            const float brightness = crymin(crymax(float(instance->m_ucBright), 32.0f) * (1.0f / 255.0f) *
+                objectManager->m_lstStaticTypes[instance->m_nObjectTypeID].fBrightness, 1.0f);
+            const auto colorByte = [](float v) -> uint8_t
+            { return static_cast<uint8_t>(clamp_tpl(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
+            const uint8_t rgb[3] = { colorByte(world.x * brightness),
+                                     colorByte(world.y * brightness),
+                                     colorByte(world.z * brightness) };
+            const Vec3 p[4] = {
+                Vec3(origin.x - halfX, origin.y + halfY, origin.z - vertical),
+                Vec3(origin.x + halfX, origin.y - halfY, origin.z - vertical),
+                Vec3(origin.x + halfX, origin.y - halfY, origin.z + vertical),
+                Vec3(origin.x - halfX, origin.y + halfY, origin.z + vertical) };
+            // CPU baking stores the top scanline first, unlike glReadPixels.
+            const float uv[4][2] = { {0,1}, {1,1}, {1,0}, {0,0} };
+            for (int corner = 0; corner < 4; ++corner)
+            {
+                struct_VERTEX_FORMAT_P3F_COL4UB_TEX2F v{};
+                v.xyz = p[corner];
+                v.st[0] = uv[corner][0]; v.st[1] = uv[corner][1];
+                v.color.bcolor[0] = rgb[0]; v.color.bcolor[1] = rgb[1];
+                v.color.bcolor[2] = rgb[2]; v.color.bcolor[3] = 255;
+                batch.vertices.push_back(v);
+            }
+            const uint16_t quad[6] = { base, static_cast<uint16_t>(base+1),
+                static_cast<uint16_t>(base+2), base, static_cast<uint16_t>(base+2),
+                static_cast<uint16_t>(base+3) };
+            batch.indices.insert(batch.indices.end(), quad, quad + 6);
+        }
+        // GL's sprite executor binds its own one-texture program. The direct
+        // Vulkan client draw must not inherit a model's pass or extra TMUs.
+        SShaderPass* savedPass = m_activePass;
+        SRenderShaderResources* savedResources = m_activeResources;
+        const EShaderPassType savedPassType = m_activeHardwarePassType;
+        SEfState* savedState = m_activeStateShaderState;
+        m_activePass = nullptr;
+        m_activeResources = nullptr;
+        m_activeHardwarePassType = eSHP_MAX;
+        m_activeStateShaderState = nullptr;
+        ResetToDefault();
+        SetCullMode(R_CULL_NONE);
+        SetColorOp(eCO_MODULATE, eCO_MODULATE, DEF_TEXARG0, DEF_TEXARG0);
+        EF_SetState(GS_ALPHATEST_GEQUAL128 | GS_DEPTHWRITE);
+        m_frameRenderer->SetStockFarSprites(true);
+        m_frameRenderer->SetStockFixedLights({}, 0);
+        m_frameRenderer->SetStockProjector(0, nullptr, 1.0f);
+        m_frameRenderer->ResetStockLinearTexgen();
+        m_frameRenderer->SetStockShadowTransforms(nullptr, 0);
+        m_frameRenderer->SetStockGpuSkinIdentity(nullptr);
+        float spriteIdentity[16] = {};
+        spriteIdentity[0] = spriteIdentity[5] = spriteIdentity[10] = spriteIdentity[15] = 1.0f;
+        for (std::map<int, SpriteBatch>::iterator it = batches.begin(); it != batches.end(); ++it)
+        {
+            SpriteBatch& batch = it->second;
+            if (batch.vertices.empty()) continue;
+            // Billboard vertices are already in world space. Do not run them
+            // through the previous model's object transform, RGBA generators,
+            // light passes or resource opacity in DrawBuffer.
+            m_frameRenderer->QueueStockClientIndexedDraw(batch.vertices.data(),
+                static_cast<uint32_t>(batch.vertices.size()), batch.indices.data(),
+                static_cast<uint32_t>(batch.indices.size()), VERTEX_FORMAT_P3F_COL4UB_TEX2F,
+                R_PRIMV_TRIANGLES, GS_ALPHATEST_GEQUAL128 | GS_DEPTHWRITE, R_CULL_NONE,
+                it->first, 0, eCO_MODULATE, eCO_MODULATE, eCO_MODULATE, eCO_MODULATE,
+                DEF_TEXARG0, DEF_TEXARG0, 0xffffffffu, DEF_TEXARG1, DEF_TEXARG1, 0xffffffffu,
+                0, 0, 0xff, m_CameraMatrix.GetData(), spriteIdentity, spriteIdentity);
+        }
+        m_frameRenderer->SetStockFarSprites(false);
+        ResetToDefault();
+        m_activePass = savedPass;
+        m_activeResources = savedResources;
+        m_activeHardwarePassType = savedPassType;
+        m_activeStateShaderState = savedState;
     }
 
     void SetLodBias(float value) override
@@ -2851,6 +3371,7 @@ public:
                             if (m_RP.m_fCurOpacity != 1.0f)
                                 m_RP.m_ObjFlags &= ~FOB_LIGHTPASS;
                             bool submittedTranslatedTechniquePass = false;
+                            int nextShadowCaster = -1;
                             bool inPerLightPassGroup = false;
                             int perLightPassGroupStart = -1;
                             bool perLightNoBumpBreak[32]{};
@@ -3014,7 +3535,7 @@ public:
                                         (resources && resources->m_Textures[EFTT_LIGHTMAP_DIR]) ||
                                         renderObject->m_nLMId;
                                     for (int lightIndex = 0;
-                                         lightIndex < m_RP.m_DLights[lightLevel].Num() && lightIndex < 8;
+                                         lightIndex < m_RP.m_DLights[lightLevel].Num() && lightIndex < 32;
                                          ++lightIndex)
                                     {
                                         if (!(itemLightMask & (1u << lightIndex)))
@@ -3108,6 +3629,8 @@ public:
                                 }
                                 else if (pass->m_ePassType == eSHP_Shadow)
                                 {
+                                    if ((m_RP.m_ObjFlags & FOB_LIGHTPASS) && (shader->m_Flags & EF_USELIGHTS))
+                                        continue;
                                     // Port the stock per-caster shadow-pass
                                     // loop. ETC_ShadowMap addresses the caster
                                     // at m_nCurStartCaster plus the texture
@@ -3121,8 +3644,8 @@ public:
 
                                     int firstCaster = 0;
                                     if (shader->m_eSort != eS_TerrainShadowPass &&
-                                        !CV_r_selfshadow &&
-                                        !(m_Features & RFT_SHADOWMAP_SELFSHADOW))
+                                        (!CV_r_selfshadow ||
+                                         !(m_Features & RFT_SHADOWMAP_SELFSHADOW)))
                                     {
                                         ShadowMapLightSourceInstance& caster =
                                             shadowCasters->GetAt(0);
@@ -3134,6 +3657,7 @@ public:
                                     }
 
                                     uint32_t samplesPerPass = 1;
+                                    if (nextShadowCaster >= 0) firstCaster = crymax(firstCaster, nextShadowCaster);
                                     if (pass->m_LMFlags & LMF_SAMPLES)
                                     {
                                         if (pass->m_LMFlags & LMF_4SAMPLES) samplesPerPass = 4;
@@ -3206,6 +3730,7 @@ public:
                                                 pass->m_SecondRenderState : pass->m_RenderState;
                                         DrawRenderItem(item->Item, shader, pass, resources,
                                                        shadowState, cull, true);
+                                        nextShadowCaster = casterIndex + static_cast<int>(samplesPerPass);
                                         submittedTranslatedTechniquePass = true;
                                     }
                                     m_RP.m_nCurStartCaster = savedCasterStart;
@@ -3999,31 +4524,20 @@ public:
         const SShaderPassHW* stockHardwarePass = m_activePass &&
             m_activeHardwarePassType != eSHP_MAX ?
             static_cast<SShaderPassHW*>(m_activePass) : nullptr;
-        int stockWaterMode = 0;
-        if (stockHardwarePass)
-        {
-            const char* program = stockHardwarePass->m_StockFragmentProgram;
-            if (!stricmp(program, "CGRCLowMedWater")) stockWaterMode = 1;
-            else if (!stricmp(program, "CGRCIndoorWater_final")) stockWaterMode = 2;
-            else if (!stricmp(program, "CGRCIndoorWaterSpec")) stockWaterMode = 3;
-            else if (!stricmp(program, "CGRCOutdoorWaterRefraction")) stockWaterMode = 4;
-            else if (!stricmp(program, "CGRCIndoorWater")) stockWaterMode = 5;
-            else if (!stricmp(program, "CGRCWater")) stockWaterMode = 7;
-            else if (!stricmp(program, "CGRCWater_Beach_Refr")) stockWaterMode = 8;
-            else if (!stricmp(program, "CGRCWater_Beach")) stockWaterMode = 9;
-            else if (!stricmp(program, "CGRCOcean_NoRefl") || !stricmp(program, "CGRCOcean")) stockWaterMode = 6;
-            if (!stockWaterMode &&
-                !strnicmp(stockHardwarePass->m_StockVertexProgram, "CGVProgWater_Beach_Shift", 25))
-                stockWaterMode = 10;
-        }
+        const StockProgramInfo& programInfo = ClassifyStockProgram(stockHardwarePass);
+        const int stockWaterMode = programInfo.water;
         const bool stockAmbientTemplate = stockHardwarePass &&
-            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCAmbientTempl");
+            programInfo.ambient;
         const bool stockLightTemplate = stockHardwarePass &&
-            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCLightTempl");
+            programInfo.light;
         const bool stockParticleAmbient = stockHardwarePass &&
-            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCAmbient_Particle");
+            programInfo.particle;
+        const bool stockReceiverShadow = stockHardwarePass &&
+            !FastAsciiCaseCompare(stockHardwarePass->m_StockFragmentProgram, "CGRCShadowTempl");
+        const bool stockAmbientDecal = stockHardwarePass &&
+            !FastAsciiCaseCompare(stockHardwarePass->m_StockFragmentProgram, "CGRCAmbient_Decal");
         const bool stockTerrainLayerBase = stockHardwarePass &&
-            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCTerrainLayerTempl") &&
+            programInfo.terrainLayer &&
             !(stockHardwarePass->m_StockProgramMask & 0x10000000u);
         // OpenGL's TerrainShadowPass is a two-stage material program, not a
         // generic shadowed texture combine. Its fragment program writes the
@@ -4031,7 +4545,7 @@ public:
         // alpha; the declared SRC_ALPHA blend then overlays only shadowed
         // pixels. Keep this identity through the stock Vulkan draw path.
         const bool stockTerrainShadowProgram = stockHardwarePass &&
-            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCTerrainShadow");
+            programInfo.terrainShadow;
         if (stockAmbientTemplate)
         {
             techniqueHasLightmap = (stockHardwarePass->m_StockProgramMask & 0x02000000ull) != 0;
@@ -4922,6 +5436,10 @@ public:
         const auto generateLegacyTexCoords = [&](int stage, const SShaderTexUnit* unit,
                                                  const float* stageMatrix)
         {
+            // CGVProgSimple_Plant_Bump copies the mesh UV to both samplers.
+            // Fixed-function texgen is not executed by this vertex program.
+            if (programInfo.plantsBump && stage < 2)
+                return;
             if (flareDeformActive)
                 return;
             // GL mfSetTexture resolves the image through pSTU but enables
@@ -5374,9 +5892,9 @@ public:
         bool hardwareGeneralAmbientProgram = false;
         bool hardwareMaterialAmbientProgram = false;
         if ((m_activeHardwarePassType == eSHP_General ||
-             (stockTerrainShadowProgram && m_activeHardwarePassType == eSHP_Shadow) ||
+             ((stockTerrainShadowProgram || stockReceiverShadow) && m_activeHardwarePassType == eSHP_Shadow) ||
              (hardwareMaterialLightPass && !hardwareSpecularPass)) && m_activePass &&
-            m_RP.m_pShader && (stockTerrainShadowProgram || !shaderLightingDisabled))
+            m_RP.m_pShader && (stockTerrainShadowProgram || stockReceiverShadow || !shaderLightingDisabled))
         {
             SShaderPassHW* hardwarePass = static_cast<SShaderPassHW*>(m_activePass);
             TArray<SCGParam4f>* parameterLists[] = {
@@ -5388,14 +5906,14 @@ public:
                 for (int parameter = 0; parameter < parameters->Num(); ++parameter)
                 {
                     SCGParam4f& value = parameters->Get(parameter);
-                    if (!stricmp(value.m_Name.c_str(), "Ambient"))
+                    if (!FastAsciiCaseCompare(value.m_Name.c_str(), "Ambient"))
                     {
                         memcpy(hardwareAmbientParameter, value.mfGet(), sizeof(hardwareAmbientParameter));
                         hardwareGeneralAmbientProgram = m_activeHardwarePassType == eSHP_General;
                         hardwareMaterialAmbientProgram = hardwareMaterialLightPass &&
                             m_RP.m_RendPass == 1 && !(m_RP.m_ObjFlags & FOB_LIGHTPASS);
                     }
-                    else if (!stricmp(value.m_Name.c_str(), "FogColor"))
+                    else if (!FastAsciiCaseCompare(value.m_Name.c_str(), "FogColor"))
                         memcpy(hardwareTerrainFogColor, value.mfGet(),
                                sizeof(hardwareTerrainFogColor));
                 }
@@ -5508,7 +6026,7 @@ public:
             materialLighting[5] = diffuse.g;
             materialLighting[6] = diffuse.b;
         }
-        if (stockTerrainShadowProgram && m_activeHardwarePassType == eSHP_Shadow)
+        if ((stockTerrainShadowProgram || stockReceiverShadow) && m_activeHardwarePassType == eSHP_Shadow)
         {
             // CGRCTerrainShadow uses its own CGPSParam Ambient directly; it
             // must not inherit the generic object/material ambient product.
@@ -5544,20 +6062,43 @@ public:
         std::vector<std::array<int, 2>>& lightPassSpecularOcclusion =
             m_lightPassSpecularOcclusionScratch;
         std::vector<bool>& ambientOnlyLightPasses = m_ambientOnlyLightPassScratch;
+        std::vector<CDLight*>& translatedLights = m_translatedLightScratch;
         lightPasses.clear();
         lightPassSpecularOcclusion.clear();
         ambientOnlyLightPasses.clear();
+        translatedLights.clear();
         const auto appendLightPass = [&](const std::array<float, 19>& parameters,
                                          int occlusionTextureId = 0,
                                          int occlusionChannel = -1,
-                                         bool ambientOnly = false)
+                                         bool ambientOnly = false,
+                                         CDLight* sourceLight = nullptr)
         {
             lightPasses.push_back(parameters);
             lightPassSpecularOcclusion.push_back(
                 { occlusionTextureId, occlusionChannel });
             ambientOnlyLightPasses.push_back(ambientOnly);
+            translatedLights.push_back(sourceLight);
         };
         bool hasTranslatedDynamicLightPass = false;
+        const auto evaluateSpecularParameter = [&](CDLight* light, std::array<float, 19>& parameters)
+        {
+            if (!stockLightTemplate || parameters[3] >= 0.0f) return;
+            CDLight* previousLight = m_RP.m_pCurLight;
+            m_RP.m_pCurLight = light;
+            const TArray<SCGParam4f>* lists[] = {
+                stockHardwarePass->m_CGFSParamsNoObj, stockHardwarePass->m_CGFSParamsObj };
+            for (const auto* list : lists)
+                if (list)
+                    for (int index = 0; index < list->Num(); ++index)
+                    {
+                        SCGParam4f& parameter = const_cast<SCGParam4f&>(list->Get(index));
+                        if (FastAsciiCaseCompare(parameter.m_Name.c_str(), "Specular")) continue;
+                        const float* value = parameter.mfGet();
+                        for (int channel = 0; channel < 3; ++channel) parameters[4+channel] = value[channel];
+                        parameters[3] = -crymax(value[3], 0.001f);
+                    }
+            m_RP.m_pCurLight = previousLight;
+        };
         // OpenGL's MultiLights ambient pass is independent of its packed
         // direct-light passes. Keep it as the first Vulkan draw as well:
         // projected lights use materialAmbient.xyz for projector direction,
@@ -5603,7 +6144,9 @@ public:
                     // value to derive the render-element constant/linear terms.
                     return b / a * a * 2.0f;
                 };
-                const int lightLimit = m_activeHardwarePassType == eSHP_MultiLights ? 32 : 8;
+                // Eight is the fixed-function slot limit, not a limit on
+                // scene light IDs. Programmable passes select by the mask.
+                const int lightLimit = fixedFunctionLightList ? 8 : 32;
                 bool fixedPointBoundsUsed = false;
                 for (int lightIndex = 0; lightIndex < lightCount && lightIndex < lightLimit; ++lightIndex)
                 {
@@ -5676,7 +6219,7 @@ public:
                         for (TArray<SCGParam4f>* list : lists)
                             if (list)
                                 for (int parameter = 0; parameter < list->Num(); ++parameter)
-                                    if (!stricmp(list->Get(parameter).m_Name.c_str(), "Diffuse"))
+                                    if (!FastAsciiCaseCompare(list->Get(parameter).m_Name.c_str(), "Diffuse"))
                                     {
                                         const float* diffuse = list->Get(parameter).mfGet();
                                         for (int channel = 0; channel < 3; ++channel)
@@ -5909,7 +6452,8 @@ public:
                             }
                         }
                     }
-                    appendLightPass(parameters);
+                    evaluateSpecularParameter(light, parameters);
+                    appendLightPass(parameters, 0, -1, false, light);
                     hasTranslatedDynamicLightPass = true;
 
                     // OpenGL marks DLF_LM lights as specular-only on baked
@@ -5936,9 +6480,9 @@ public:
                         TransformPosition(objectCameraPosition, cameraPosition, inverseObject);
                         Vec3d viewDirection = objectCameraPosition;
                         Vec3d lightDirection = objectLightPosition;
-                        const float specularAttenuation = pointLight ?
-                            1.0f / crymax(1.0e-6f, parameters[11] +
-                                parameters[12] * lightDirection.Length()) : 1.0f;
+                        // Programmable attenuation belongs to each fragment,
+                        // not to the object's origin or fixed-function lights.
+                        const float specularAttenuation = 1.0f;
                         safeNormalize(lightDirection);
                         safeNormalize(viewDirection);
                         Vec3d halfVector = lightDirection + viewDirection;
@@ -5978,9 +6522,19 @@ public:
                         }
                         specularParameters[8] = specularParameters[9] =
                             specularParameters[10] = 0.0f;
+                        specularParameters[11] = objectLightPosition.x;
+                        specularParameters[12] = objectLightPosition.y;
+                        specularParameters[13] = objectLightPosition.z;
+                        specularParameters[14] = light->m_fRadius;
+                        specularParameters[15] = pointLight ?
+                            ((light->m_Flags & DLF_PROJECT) ? 3.0f : 2.0f) : 1.0f;
+                        specularParameters[16] = objectCameraPosition.x;
+                        specularParameters[17] = objectCameraPosition.y;
+                        specularParameters[18] = objectCameraPosition.z;
+                        evaluateSpecularParameter(light, specularParameters);
                         appendLightPass(specularParameters,
                                         specularOcclusionTextureId,
-                                        specularOcclusionChannel);
+                                        specularOcclusionChannel, false, light);
                     }
                 }
             }
@@ -6044,6 +6598,7 @@ public:
                     lightPasses.resize(hardwareMultiLightsAmbient ? 2 : 1);
                     lightPassSpecularOcclusion.resize(lightPasses.size());
                     ambientOnlyLightPasses.resize(lightPasses.size());
+                    translatedLights.resize(lightPasses.size());
                 }
             }
         }
@@ -6307,7 +6862,7 @@ public:
         // planes. Their texture units deliberately have no fixed-function
         // texgen; the terrain translation below supplies those coordinates.
         const bool terrainProgramTexgen = stockHardwarePass &&
-            !strnicmp(stockHardwarePass->m_StockFragmentProgram, "CGRCTerrain", 11);
+            programInfo.terrainTexgen;
         const auto resolveStageTextureId = [&](const SShaderTexUnit* unit,
                                                 int resourceSlot,
                                                 int textureStage) -> int
@@ -6402,7 +6957,7 @@ public:
             // WaterVolume has no template texture stages, although its
             // resources carry an animated normal map in EFTT_BUMP.
             if (textureIds[0] <= 0 && m_RP.m_pShader &&
-                !stricmp(m_RP.m_pShader->m_Name.c_str(), "watervolume"))
+                !FastAsciiCaseCompare(m_RP.m_pShader->m_Name.c_str(), "watervolume"))
             {
                 SEfResTexture* waterNormal = m_activeResources->m_Textures[EFTT_BUMP];
                 if (waterNormal)
@@ -7117,6 +7672,8 @@ public:
             static_cast<const void*>(flareVertexData.data()) : drawVertexData;
         const uint32_t finalVertexCount = flareDeformActive ? 16u :
             static_cast<uint32_t>(vertices->m_NumVerts);
+        uint32_t validatedMinimumVertex = UINT32_MAX;
+        uint32_t validatedMaximumVertex = 0;
         // Material groups reference only a part of their shared leaf buffer.
         // Convert that range; unrelated vertices are never fetched by this draw.
         uint32_t conversionFirst = 0, conversionEnd = finalVertexCount;
@@ -7133,6 +7690,8 @@ public:
                 m_frameRenderer->RequirePanelFallback();
                 return;
             }
+            validatedMinimumVertex = minimum;
+            validatedMaximumVertex = maximum;
             conversionFirst = minimum;
             conversionEnd = maximum + 1;
         }
@@ -7184,12 +7743,16 @@ public:
                     TArray<SCGParam4f>* lists[] = { &beachPass->m_VPParamsNoObj, &beachPass->m_VPParamsObj };
                     for (auto* list : lists)
                         for (int parameter = 0; parameter < list->Num(); ++parameter)
-                            if (!stricmp(list->Get(parameter).m_Name.c_str(), "TexShift"))
+                            if (!FastAsciiCaseCompare(list->Get(parameter).m_Name.c_str(), "TexShift"))
                                 memcpy(beachShift, list->Get(parameter).mfGet(), sizeof(beachShift));
                 }
                 waterDeformedVertices.resize(static_cast<size_t>(finalVertexCount) * format.stride);
-                memcpy(waterDeformedVertices.data(), finalVertexData, waterDeformedVertices.size());
-                for (uint32_t i = 0; i < finalVertexCount; ++i)
+                // QueueStockClientIndexedDraw uploads this validated index
+                // range only. Copy/deform no vertices outside that range.
+                memcpy(waterDeformedVertices.data() + size_t(conversionFirst) * format.stride,
+                    static_cast<const byte*>(finalVertexData) + size_t(conversionFirst) * format.stride,
+                    size_t(conversionEnd - conversionFirst) * format.stride);
+                for (uint32_t i = conversionFirst; i < conversionEnd; ++i)
                 {
                     Vec3d position;
                     byte* destination = waterDeformedVertices.data() + i * format.stride;
@@ -7277,8 +7840,8 @@ public:
             }
         }
         if (stockHardwarePass &&
-            !stricmp(stockHardwarePass->m_StockVertexProgram, "CGVProgTexGen_1Unit") &&
-            m_RP.m_pShader && !strnicmp(m_RP.m_pShader->GetName(), "TerrainWaterBottom", 18) &&
+            programInfo.texgenOne &&
+            m_RP.m_pShader && !FastAsciiCaseCompareN(m_RP.m_pShader->GetName(), "TerrainWaterBottom", 18) &&
             finalVertexFormat == VERTEX_FORMAT_P3F)
         {
             float planes[2][4]{};
@@ -7288,7 +7851,7 @@ public:
             for (auto* list : lists)
                 for (int i = 0; i < list->Num(); ++i)
                     for (int plane = 0; plane < 2; ++plane)
-                        if (!stricmp(list->Get(i).m_Name.c_str(), names[plane]))
+                        if (!FastAsciiCaseCompare(list->Get(i).m_Name.c_str(), names[plane]))
                             memcpy(planes[plane], list->Get(i).mfGet(), sizeof(planes[plane]));
             const Vec3d* positions = static_cast<const Vec3d*>(finalVertexData);
             hardwareTexturedVertices.resize(finalVertexCount);
@@ -7312,15 +7875,15 @@ public:
         // CGVProgMuzzleFlash drives the Training sunlight meshes as well as
         // muzzle flashes. Its RGB comes from the object-space view/normal angle.
         const bool muzzleFlashShader = m_RP.m_pShader &&
-            (!stricmp(m_RP.m_pShader->GetName(), "templmuzzleflash_auto") ||
-             !stricmp(m_RP.m_pShader->GetName(), "templmuzzleflash_auto_fp"));
+            (!FastAsciiCaseCompare(m_RP.m_pShader->GetName(), "templmuzzleflash_auto") ||
+             !FastAsciiCaseCompare(m_RP.m_pShader->GetName(), "templmuzzleflash_auto_fp"));
         const bool muzzleFlashAngularFade = muzzleFlashShader &&
-            !stricmp(m_RP.m_pShader->GetName(), "templmuzzleflash_auto");
+            !FastAsciiCaseCompare(m_RP.m_pShader->GetName(), "templmuzzleflash_auto");
         const bool stockPlantsProgram = stockHardwarePass &&
-            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCPlants");
+            programInfo.plants;
         const bool stockSimplePlantsProgram = stockPlantsProgram &&
-            (!stricmp(stockHardwarePass->m_StockVertexProgram, "CGVProgSimple_Plant") ||
-             !stricmp(stockHardwarePass->m_StockVertexProgram, "CGVProgSimple_Plant_Bended"));
+            (programInfo.simplePlant ||
+             programInfo.bendedPlant);
         if ((stockAmbientTemplate || stockLightTemplate) &&
             !stockHardwarePass->m_StockUsesVertexColors)
         {
@@ -7331,7 +7894,7 @@ public:
             primaryColorMask[0] = primaryColorMask[1] = primaryColorMask[2] = 1.0f;
         }
         if (stockAmbientTemplate || (stockHardwarePass &&
-            !stricmp(stockHardwarePass->m_StockFragmentProgram, "CGRCLightTempl") &&
+            programInfo.light &&
             (stockHardwarePass->m_StockProgramMask & 0x20000000ull)))
         {
             // CGRCAmbientTempl/CGRCLightTempl output diffuse alpha only
@@ -7348,28 +7911,10 @@ public:
             primaryColor[3] = 1.0f;
             primaryColorMask[3] = 1.0f;
         }
-        int stockTerrainLayers = -1;
-        int stockTerrainOnlyLayers = 0;
-        int stockTerrainAmbientMode = 0;
-        int stockTerrainFogLayers = -1;
-        if (stockHardwarePass)
-        {
-            const char* program = stockHardwarePass->m_StockFragmentProgram;
-            if (!stricmp(program, "CGRCTerrain")) stockTerrainLayers = 0;
-            else if (!stricmp(program, "CGRCTerrain_1Layers")) stockTerrainLayers = 1;
-            else if (!stricmp(program, "CGRCTerrain_2Layers")) stockTerrainLayers = 2;
-            else if (!stricmp(program, "CGRCTerrain_3Layers")) stockTerrainLayers = 3;
-            else if (!stricmp(program, "CGRCTerrain_1Layers_Only")) stockTerrainOnlyLayers = 1;
-            else if (!stricmp(program, "CGRCTerrain_2Layers_Only")) stockTerrainOnlyLayers = 2;
-            else if (!stricmp(program, "CGRCTerrain_3Layers_Only")) stockTerrainOnlyLayers = 3;
-            else if (!stricmp(program, "CGRCTerrain_4Layers_Only")) stockTerrainOnlyLayers = 4;
-            else if (!stricmp(program, "CGRCTerrain_NoCol")) stockTerrainAmbientMode = 1;
-            else if (!stricmp(program, "CGRCTerrain_Far")) stockTerrainAmbientMode = 2;
-            else if (!stricmp(program, "CGRCTerrain_DetTex")) stockTerrainAmbientMode = 3;
-            else if (!stricmp(program, "CGRCTerrain_VF")) stockTerrainAmbientMode = 4;
-            else if (!stricmp(program, "CGRCTerrain_1Layers_VF")) stockTerrainFogLayers = 1;
-            else if (!stricmp(program, "CGRCTerrain_2Layers_VF")) stockTerrainFogLayers = 2;
-        }
+        const int stockTerrainLayers = programInfo.terrainLayers;
+        const int stockTerrainOnlyLayers = programInfo.terrainOnly;
+        const int stockTerrainAmbientMode = programInfo.terrainAmbient;
+        const int stockTerrainFogLayers = programInfo.terrainFog;
         if (stockPlantsProgram || stockTerrainLayers >= 0)
         {
             // CGRCPlants/CGRCTerrain encode the albedo/color product by x2.
@@ -7454,6 +7999,7 @@ public:
         // EF_CommitStreams overrides the normal pointer with current TNormal
         // for resources requiring normals, including animated tangent streams.
         auto& leafLitVertices = scratchStorage.litVertices;
+        const void* immutableNormalGeometry = nullptr;
         // Keep the previous size as well as capacity; the referenced range is
         // overwritten below, so clearing would zero unrelated mesh vertices.
         const bool resourceNormalOverride = m_RP.m_pShaderResources &&
@@ -7518,6 +8064,16 @@ public:
                 {
                 // Preserve secondary colors, extra UVs and every other attribute
                 // when the layout already has room for the committed normal.
+                const void* cachedNormals = CacheFrameNormalGeometry(vertices, finalVertexData,
+                    finalVertexCount, finalVertexFormat, finalVertexFormat,
+                    committedNormal, committedNormalStride);
+                if (cachedNormals)
+                {
+                    finalVertexData = cachedNormals;
+                    immutableNormalGeometry = cachedNormals;
+                }
+                else
+                {
                 const size_t bytes = static_cast<size_t>(finalVertexCount) * sourceFormat.stride;
                 leafLitVertices.resize(bytes);
                 const size_t start = static_cast<size_t>(conversionFirst) * sourceFormat.stride;
@@ -7527,6 +8083,7 @@ public:
                     memcpy(leafLitVertices.data() + static_cast<size_t>(i) * sourceFormat.stride + normalOffset,
                         committedNormal + static_cast<size_t>(i) * committedNormalStride, sizeof(float) * 3);
                 finalVertexData = leafLitVertices.data();
+                }
                 }
             }
             else if ((committedNormal || (!resourceNormalOverride && !normalPointer && secondaryNormals)) &&
@@ -7550,6 +8107,15 @@ public:
                     const byte* normals = committedNormal ?
                         committedNormal : leaf->GetNormalPtr(stride);
                     if (committedNormal) stride = committedNormalStride;
+                    const void* cachedNormals = CacheFrameNormalGeometry(vertices, finalVertexData,
+                        finalVertexCount, finalVertexFormat, target, normals, stride);
+                    if (cachedNormals)
+                    {
+                        finalVertexData = cachedNormals;
+                        immutableNormalGeometry = cachedNormals;
+                    }
+                    else
+                    {
                     leafLitVertices.resize(static_cast<size_t>(finalVertexCount) * targetFormat.stride);
                     for (uint32_t i = conversionFirst; i < conversionEnd; ++i)
                     {
@@ -7563,6 +8129,7 @@ public:
                             memcpy(output + (secondary != ~0u ? 32 : color == ~0u ? 24 : 28), source + uv, 8);
                     }
                     finalVertexData = leafLitVertices.data();
+                    }
                     finalVertexFormat = target;
                 }
             }
@@ -7607,11 +8174,18 @@ public:
             finalVertexCount > 0 && terrainShaderSort)
         {
             const float* terrainTexgen = static_cast<const float*>(m_RP.m_pRE->m_CustomData);
-            const float offsetY = terrainTexgen[0];
-            const float offsetX = terrainTexgen[1];
+            // TerrainLowLOD's HWScripts bind BaseTexGen0/1 to FromRE[2],
+            // FromRE[3], and FromRE[4]. The first two custom-data values
+            // are flags (both 1), not texgen offsets; the low-LOD offsets
+            // are the final two values and are zero.
+            const float offsetY = terrainLowResVertices ? terrainTexgen[3] : terrainTexgen[0];
+            const float offsetX = terrainLowResVertices ? terrainTexgen[4] : terrainTexgen[1];
             const float scale = terrainTexgen[2];
             if (!terrainDetailSort)
             {
+                // TerrainLowLOD's BaseTexGen parameters map to custom data
+                // [2], [3], [4]: positive full-map scale and zero offsets.
+                // Sector terrain uses its separate [0]/[1] origins.
                 terrainProjectionRows[0][0][1] = scale;
                 terrainProjectionRows[0][0][3] = offsetY;
                 terrainProjectionRows[1][0][0] = scale;
@@ -7764,10 +8338,8 @@ public:
                     destination.color.bcolor[2] = static_cast<uint8_t>(clamp_tpl(
                         m_WorldColor.b * 255.0f, 0.0f, 255.0f));
                     destination.color.bcolor[3] = 255;
-                    destination.st[0] =
-                        source[vertex].xyz.y * scale + offsetY;
-                    destination.st[1] =
-                        source[vertex].xyz.x * scale + offsetX;
+                    destination.st[0] = source[vertex].xyz.y * scale + offsetY;
+                    destination.st[1] = source[vertex].xyz.x * scale + offsetX;
                 }
                 finalVertexData = terrainLowResTexturedVertices.data();
                 finalVertexFormat = VERTEX_FORMAT_P3F_COL4UB_TEX2F;
@@ -7827,7 +8399,7 @@ public:
                 for (auto* list : lists)
                     for (int i = 0; i < list->Num(); ++i)
                         for (int parameter = 0; parameter < 2; ++parameter)
-                            if (!stricmp(list->Get(i).m_Name.c_str(), names[parameter]))
+                            if (!FastAsciiCaseCompare(list->Get(i).m_Name.c_str(), names[parameter]))
                                 memcpy(destinations[parameter], list->Get(i).mfGet(),
                                        sizeof(float) * 4);
             }
@@ -7915,6 +8487,10 @@ public:
             }
             indexData = &leafElement->m_pBuffer->m_SecIndices[0];
             topology = 0;
+            // BeamDeform substitutes a different index stream after the
+            // initial bounds pass; let the queue validate this stream.
+            validatedMinimumVertex = UINT32_MAX;
+            validatedMaximumVertex = 0;
         }
         if (topology == 3)
         {
@@ -8088,7 +8664,9 @@ public:
             }
             float projectorBasis[9]{};
             float projectorFrustumScale = 1.0f;
-            CDLight* const currentLight = m_RP.m_pCurLight;
+            // MultiLights expands to separate draws here. Use the source of
+            // this contribution, never the light left by a preceding item.
+            CDLight* const currentLight = translatedLights[lightPass];
             if (!ambientOnlyLightPasses[lightPass] && m_activeHardwarePassType != eSHP_MAX && currentLight &&
                 (currentLight->m_Flags & DLF_PROJECT) &&
                 currentLight->m_pLightImage && m_RP.m_pCurObject)
@@ -8173,6 +8751,46 @@ public:
                     drawTextureMatrix0[8], drawTextureMatrix0[9], drawTextureMatrix0[10], drawTextureMatrix0[11],
                     drawTextureMatrix0[12], drawTextureMatrix0[13], drawTextureMatrix0[14], drawTextureMatrix0[15]);
             }
+            if (stockReceiverShadow)
+            {
+                auto* casters = static_cast<list2<ShadowMapLightSourceInstance>*>(m_RP.m_pCurObject->m_pShadowCasters);
+                const int samples = (activeHardwareLightFlags & LMF_3SAMPLES) ? 3 :
+                    ((activeHardwareLightFlags & LMF_2SAMPLES) ? 2 : 1);
+                if (!casters || m_RP.m_nCurStartCaster + samples > casters->Count()) continue;
+                hasTerrainProjection = true;
+                terrainProjectionRows[1][7][3] = -15.0f;
+                for (int channel = 0; channel < 3; ++channel)
+                    terrainProjectionRows[0][6][channel] = hardwareAmbientParameter[channel];
+                terrainProjectionRows[0][7][0] = float(samples);
+                shadowMapStageMask = 0;
+                for (int sample = 0; sample < samples; ++sample)
+                {
+                    auto& caster = casters->GetAt(m_RP.m_nCurStartCaster + sample);
+                    ShadowMapFrustum* frustum = caster.m_pLS ? caster.m_pLS->GetShadowMapFrustum() : nullptr;
+                    if (!frustum || !frustum->depth_tex_id) continue;
+                    const int stage = sample + 1;
+                    Matrix44* receiver = (m_RP.m_ObjFlags & FOB_TRANS_MASK) ? &m_RP.m_pCurObject->m_Matrix : nullptr;
+                    SetupShadowOnlyPass(stage, frustum, &caster.m_vProjTranslation, caster.m_fProjScale,
+                        m_RP.m_pCurObject->GetTranslation(), 1.0f, Vec3d(0,0,0), receiver);
+                    memcpy(shadowMapTransforms[stage], m_cEF.m_TempMatrices[stage][0].GetData(), sizeof(shadowMapTransforms[stage]));
+                    shadowMapStageMask |= 1u << stage;
+                    terrainProjectionRows[1][6][sample] = frustum->fAlpha;
+                    if (!sample) { secondaryTextureId = frustum->depth_tex_id; textureStage1UsesTexCoord1 = false; }
+                    else
+                    {
+                        auto& unit = sample == 1 ? textureStage2 : textureStage3;
+                        unit = {};
+                        unit.textureId = frustum->depth_tex_id;
+                        unit.colorOp = unit.alphaOp = eCO_MODULATE;
+                        if (sample == 1) textureStage2Ptr = &textureStage2;
+                        else textureStage3Ptr = &textureStage3;
+                    }
+                }
+                normalMapTextureId = 0;
+                textureStages4To7Ptr = nullptr;
+                passState &= ~(GS_BLEND_MASK | GS_DEPTHWRITE);
+                passState |= GS_BLSRC_SRCALPHA | GS_BLDST_ONEMINUSSRCALPHA | GS_DEPTHFUNC_EQUAL;
+            }
             m_frameRenderer->SetStockShadowTransforms(
                 shadowMapTransforms, shadowMapStageMask);
             // The original water programs generate UVs from object positions;
@@ -8205,8 +8823,7 @@ public:
                 }
                 SParamComp_Opacity opacity;
                 terrainProjectionRows[0][6][3] = opacity.mfGet();
-                const bool bendedPlants = !stricmp(stockHardwarePass->m_StockVertexProgram,
-                                                  "CGVProgSimple_Plant_Bended");
+                const bool bendedPlants = programInfo.bendedPlant;
                 if (bendedPlants && m_RP.m_pCurObject)
                 {
                     SParamComp_ObjWave wave;
@@ -8224,18 +8841,18 @@ public:
                         for (int parameter = 0; parameter < list->Num(); ++parameter)
                         {
                             SCGParam4f& value = const_cast<SCGParam4f&>(list->Get(parameter));
-                            if (!stricmp(value.m_Name.c_str(), "Ambient"))
+                            if (!FastAsciiCaseCompare(value.m_Name.c_str(), "Ambient"))
                             {
                                 memcpy(terrainProjectionRows[0][6], value.mfGet(), sizeof(float) * 4);
                             }
-                            else if (!stricmp(value.m_Name.c_str(), "Bend"))
+                            else if (!FastAsciiCaseCompare(value.m_Name.c_str(), "Bend"))
                                 memcpy(terrainProjectionRows[1][6], value.mfGet(), sizeof(float) * 4);
                         }
                 {
                     hasTerrainProjection = true;
                     terrainProjectionRows[0][7][3] = -13.0f;
                     terrainProjectionRows[1][7][3] =
-                        !stricmp(stockHardwarePass->m_StockVertexProgram, "CGVProgSimple_Plant_Bended") ? 1.0f : 0.0f;
+                        programInfo.bendedPlant ? 1.0f : 0.0f;
                     // Ambient.w is the original evaluated Opacity, including
                     // object fade. Do not apply the generic opacity again.
                     globalOpacity = 1.0f;
@@ -8250,8 +8867,61 @@ public:
                     m_frameRenderer->ResetStockLinearTexgen();
                 }
             }
+            if (programInfo.plantsBump)
+            {
+                // The Cg program declares exactly baseMap at texunit0 and
+                // bumpMap at texunit1. Inherited fixed Layer bindings/extra
+                // stages must not select a multitexture shader for this pass.
+                const auto bindPlantResource = [&](int slot, int stage) -> int {
+                    SEfResTexture* resource = m_activeResources ? m_activeResources->m_Textures[slot] : nullptr;
+                    if (!resource) return 0;
+                    if (!resource->m_TU.m_ITexPic && !resource->m_Name.empty())
+                        resource->m_TU.m_ITexPic = m_cEF.LoadVulkanResourceTexture(resource->m_Name.c_str(),
+                            m_activeResources->m_TexturePath.c_str(), resource->m_TU.GetTexFlags() | FT_NOSTREAM,
+                            resource->m_TU.GetTexFlags2(), eTT_Base, m_RP.m_pShader, resource, resource->m_Amount);
+                    resource->m_TU.mfUpdate();
+                    if (!resource->m_TU.m_ITexPic) return 0;
+                    textureLodBias[stage] = resource->m_TU.m_fTexFilterLodBias;
+                    return resource->m_TU.m_ITexPic->GetTextureID();
+                };
+                int base = bindPlantResource(EFTT_DIFFUSE, 0);
+                if (!base) base = bindPlantResource(EFTT_BUMP_DIFFUSE, 0);
+                if (base) textureIds[0] = base;
+                const int bump = bindPlantResource(EFTT_BUMP, 1);
+                if (bump) normalMapTextureId = bump;
+                normalMapLodBias = textureLodBias[1];
+                commitStockLodBias(0, textureLodBias[0]);
+                commitStockLodBias(1, normalMapLodBias);
+                secondaryTextureId = 0;
+                textureStage2Ptr = textureStage3Ptr = nullptr;
+                textureStages4To7Ptr = nullptr;
+                m_frameRenderer->ResetStockLinearTexgen();
+                m_frameRenderer->SetStockProjector(0, nullptr, 1.0f);
+                hasTerrainProjection = true;
+                terrainProjectionRows[1][7][3] = -14.0f;
+                for (int channel = 0; channel < 3; ++channel)
+                {
+                    terrainProjectionRows[0][6][channel] = hardwareAmbientParameter[channel];
+                    SParamComp_SunColor sun;
+                    sun.m_Offs = channel; sun.m_Mult = 1.0f;
+                    terrainProjectionRows[1][6][channel] = sun.mfGet();
+                }
+                terrainProjectionRows[0][6][3] = hardwareAmbientParameter[3];
+                const TArray<SCGParam4f>* lists[] = {
+                    stockHardwarePass->m_CGFSParamsNoObj, stockHardwarePass->m_CGFSParamsObj };
+                for (const auto* list : lists)
+                    if (list)
+                        for (int parameter = 0; parameter < list->Num(); ++parameter)
+                        {
+                            SCGParam4f& value = const_cast<SCGParam4f&>(list->Get(parameter));
+                            if (!FastAsciiCaseCompare(value.m_Name.c_str(), "Diffuse"))
+                                memcpy(terrainProjectionRows[1][6], value.mfGet(), sizeof(float)*4);
+                        }
+                globalOpacity = 1.0f;
+            }
             if (stockParticleAmbient)
             {
+                // Particle path below owns this payload independently.
                 hasTerrainProjection = true;
                 terrainProjectionRows[1][7][3] = -12.0f;
                 terrainProjectionRows[0][6][3] = 1.0f;
@@ -8261,7 +8931,7 @@ public:
                 for (auto* list : parameters)
                     if (list)
                         for (int parameter = 0; parameter < list->Num(); ++parameter)
-                            if (!stricmp(list->Get(parameter).m_Name.c_str(), "Ambient"))
+                            if (!FastAsciiCaseCompare(list->Get(parameter).m_Name.c_str(), "Ambient"))
                                 memcpy(terrainProjectionRows[0][6], list->Get(parameter).mfGet(), sizeof(float) * 4);
                 for (int channel = 0; channel < 4; ++channel)
                     primaryColorMask[channel] = 0.0f;
@@ -8288,7 +8958,7 @@ public:
                     {
                         if (!list) continue;
                         for (int i = 0; i < list->Num(); ++i)
-                            if (!stricmp(list->Get(i).m_Name.c_str(), name))
+                            if (!FastAsciiCaseCompare(list->Get(i).m_Name.c_str(), name))
                             {
                                 memcpy(destination, const_cast<SCGParam4f&>(list->Get(i)).mfGet(),
                                     sizeof(float) * 4);
@@ -8453,10 +9123,10 @@ public:
                     {
                         if (!list) continue;
                         for (int i = 0; i < list->Num(); ++i)
-                            if (!stricmp(list->Get(i).m_Name.c_str(), name))
+                            if (!FastAsciiCaseCompare(list->Get(i).m_Name.c_str(), name))
                             {
                                 memcpy(target, list->Get(i).mfGet(), sizeof(float) * 4);
-                                if (!stricmp(name, "Matrix"))
+                                if (!FastAsciiCaseCompare(name, "Matrix"))
                                     waterMatrixRectangle = (list->Get(i).m_dwBind & 0x80000) != 0;
                                 return true;
                             }
@@ -8566,8 +9236,55 @@ public:
             m_frameRenderer->SetStockFixedLights(fixedLights, fixedLightCount,
                 modelView, fixedNormalMatrix.GetData());
             m_frameRenderer->SetStockProfilePlants(stockPlantsProgram);
+            if (stockAmbientDecal)
+            {
+                // DecalCharacter binds $FromRE, not a material diffuse map.
+                // Match its Cg alpha/RGB product and preserve the lit skin.
+                if (m_RP.m_pRE && m_RP.m_pRE->m_CustomTexBind[0] > 0)
+                    textureIds[0] = m_RP.m_pRE->m_CustomTexBind[0];
+                secondaryTextureId = normalMapTextureId = 0;
+                textureStage2Ptr = textureStage3Ptr = nullptr;
+                textureStages4To7Ptr = nullptr;
+                hasTerrainProjection = true;
+                terrainProjectionRows[1][7][3] = -16.0f;
+                memcpy(terrainProjectionRows[0][6], hardwareAmbientParameter, sizeof(hardwareAmbientParameter));
+                passState &= ~(GS_BLEND_MASK | GS_DEPTHWRITE);
+                passState |= GS_BLSRC_SRCALPHA | GS_BLDST_ONEMINUSSRCALPHA | GS_DEPTHFUNC_EQUAL;
+            }
             m_frameRenderer->SetStockDecalDraw(m_RP.m_pShader &&
                 m_RP.m_pShader->m_eSort == eS_Decal);
+            // The A/B GPU capture must include terrain techniques and all
+            // translated water programs (including WaterVolume, whose draws
+            // do not set QueueStockIndexedDraw's ocean waterEffect flag).
+            m_frameRenderer->SetStockGpuProfileCategories(terrainShaderSort,
+                stockWaterMode > 0,
+                m_RP.m_pCurObject && m_RP.m_pCurObject->m_pCharInstance);
+            const uint64 specularMask = stockLightTemplate ? stockHardwarePass->m_StockProgramMask : 0;
+            int specularGlossTexture = 0;
+            if (stockLightTemplate && lightPasses[lightPass][3] < 0.0f &&
+                (specularMask & (0x10ull | 0x800ull)) && m_activeResources)
+            {
+                SEfResTexture* gloss = m_activeResources->m_Textures[EFTT_GLOSS];
+                if (gloss && !gloss->m_TU.m_ITexPic && !gloss->m_Name.empty())
+                    gloss->m_TU.m_ITexPic = m_cEF.LoadVulkanResourceTexture(gloss->m_Name.c_str(),
+                        m_activeResources->m_TexturePath.c_str(), gloss->m_TU.GetTexFlags() | FT_NOSTREAM,
+                        gloss->m_TU.GetTexFlags2(), eTT_Base, m_RP.m_pShader, gloss, gloss->m_Amount);
+                if (gloss) gloss->m_TU.mfUpdate();
+                if (gloss && gloss->m_TU.m_ITexPic)
+                {
+                    STexPic* pic = static_cast<STexPic*>(gloss->m_TU.m_ITexPic);
+                    specularGlossTexture = pic->GetTextureID();
+                    if (!m_frameRenderer->HasLegacyTexture(specularGlossTexture))
+                        EF_LoadTexture(pic->m_SearchName.c_str(), pic->m_Flags | FT_NOSTREAM,
+                            pic->m_Flags2 | FT2_RELOAD, pic->m_eTT, pic->m_fAmount1,
+                            pic->m_fAmount2, pic->m_Id, pic->m_Bind);
+                }
+            }
+            m_frameRenderer->SetStockSpecularProgram(stockLightTemplate ?
+                (8u | ((specularMask & 0x400ull) ? 1u : 0u) |
+                 ((specularMask & 0x800ull) ? 2u : 0u) |
+                 ((specularMask & 0x20ull) ? 4u : 0u) |
+                 ((specularMask & 0x10ull) ? 32u : 0u)) : 0u, specularGlossTexture);
             const bool queued = m_frameRenderer->QueueStockClientIndexedDraw(
                 finalVertexData,
                 finalVertexCount, indexData,
@@ -8605,7 +9322,7 @@ public:
                 // Applying evaluateStockLighting to its primary color first
                 // would multiply that term by ambient a second time.
                 kVulkanDynamicLightingEnabled && !shaderLightingDisabled && !translatedWaterEffect &&
-                    !stockParticleAmbient &&
+                    !stockParticleAmbient && !programInfo.plantsBump &&
                     !stockTerrainLayerBase &&
                     // CGRCTerrain programs own their ambient term in the
                     // fragment program (CGPSParam Ambient). Feeding them
@@ -8634,11 +9351,99 @@ public:
                 4.0f,
                 hasWaterReflectionTransform ? waterReflectionModelView : nullptr,
                 hasWaterReflectionTransform ? waterReflectionClipPlane : nullptr,
-                waterReflectionUpdatePtr, vertices);
+                waterReflectionUpdatePtr, vertices,
+                validatedMinimumVertex, validatedMaximumVertex,
+                ImmutableGeometryRevision(vertices, indices, finalVertexData, immutableNormalGeometry,
+                    indexData, firstIndex, lightmapTexCoords.empty()),
+                vertices->m_VS[VSF_TANGENTS].m_VData ?
+                    vertices->m_VS[VSF_TANGENTS].m_VData : sourceTangentBasis);
             // Auxiliary and subsequent material draws must not inherit this array.
             m_frameRenderer->SetStockProfilePlants(false);
             m_frameRenderer->SetStockDecalDraw(false);
+            m_frameRenderer->SetStockGpuProfileCategories(false, false, false);
             m_frameRenderer->SetStockFixedLights({}, 0);
+            m_frameRenderer->SetStockSpecularProgram(0);
+#if defined(__ANDROID__)
+            // Capture distance-dependent material changes with a hard bound.
+            // The general material census cannot distinguish the same pass
+            // at two distances, or identify a missing CPU tangent upload.
+            if (queued && !m_collectingShadowCasters && GetFrameID() % 60 == 0 &&
+                m_RP.m_pCurObject && m_activeResources)
+            {
+                SEfResTexture* diffuse = m_activeResources->m_Textures[EFTT_DIFFUSE];
+                const char* name = diffuse ? diffuse->m_Name.c_str() : "";
+                const bool physical = strstr(name, "bucket") || strstr(name, "meat") ||
+                    strstr(name, "Bucket") || strstr(name, "Meat");
+                const bool character = m_RP.m_pCurObject->m_pCharInstance ||
+                    (m_RP.m_ObjFlags & FOB_NEAREST);
+                static std::set<std::array<uint64, 4>> physicalStates, characterStates;
+                auto& states = physical ? physicalStates : characterStates;
+                if ((physical || character) && states.size() < 128)
+                {
+                    const float distance = (m_RP.m_pCurObject->GetTranslation() -
+                        GetCamera().GetPos()).Length();
+                    const std::array<uint64, 4> key = {{
+                        reinterpret_cast<uint64>(m_activeResources),
+                        reinterpret_cast<uint64>(m_activePass),
+                        static_cast<uint64>(crymin(32, int(distance))),
+                        uint64(m_RP.m_DynLMask) | (uint64(passState) << 32) }};
+                    if (states.insert(key).second)
+                        if (FILE* file = fopen("/sdcard/FarCry/vulkan_model_lighting.txt",
+                            physicalStates.size() + characterStates.size() == 1 ? "wb" : "ab"))
+                        {
+                            fprintf(file, "frame=%d diffuse=%s distance=%g lod=%d shader=%s fp=%s mask=%llx hw=%d flags=%x lights=%x light=%d state=%x vf=%d bump=%d cpuTangents=%d lm=%d diffuseRGB=%g,%g,%g ambient=%g,%g,%g exponent=%g\n",
+                                GetFrameID(), name, distance, m_RP.m_pCurObject->m_nLod,
+                                m_RP.m_pShader ? m_RP.m_pShader->GetName() : "?",
+                                stockHardwarePass ? stockHardwarePass->m_StockFragmentProgram : "fixed",
+                                static_cast<unsigned long long>(stockHardwarePass ? stockHardwarePass->m_StockProgramMask : 0),
+                                m_activeHardwarePassType, m_RP.m_ObjFlags, m_RP.m_DynLMask,
+                                currentLight ? currentLight->m_Id : -1, passState, finalVertexFormat,
+                                normalMapTextureId, vertices->m_VS[VSF_TANGENTS].m_VData != nullptr || sourceTangentBasis != nullptr,
+                                m_RP.m_pCurObject->m_nLMId,
+                                lightPasses[lightPass][4], lightPasses[lightPass][5], lightPasses[lightPass][6],
+                                lightPasses[lightPass][8], lightPasses[lightPass][9], lightPasses[lightPass][10], lightPasses[lightPass][3]);
+                            fclose(file);
+                        }
+                }
+            }
+            if (queued && programInfo.plantsBump)
+            {
+                static std::unordered_set<uint64> barkInputs;
+                const uint64 key = uint64(uint32(textureIds[0])) |
+                    (uint64(uint32(normalMapTextureId)) << 32);
+                const bool first = barkInputs.empty();
+                if (barkInputs.size() < 32 && barkInputs.insert(key).second)
+                    if (FILE* file = fopen("/sdcard/FarCry/vulkan_bark_trace.txt", first ? "wb" : "ab"))
+                    {
+                        STexPic* baseImage = m_TexMan->GetByID(textureIds[0]);
+                        STexPic* bumpImage = m_TexMan->GetByID(normalMapTextureId);
+                        fprintf(file, "frame=%d shader=%s base=%d:%s bump=%d:%s vf=%d uvSource=%d ambient=%g,%g,%g diffuse=%g,%g,%g state=%x\n",
+                            GetFrameID(), m_RP.m_pShader->GetName(), textureIds[0],
+                            baseImage ? baseImage->m_SearchName.c_str() : "missing", normalMapTextureId,
+                            bumpImage ? bumpImage->m_SearchName.c_str() : "missing", finalVertexFormat,
+                            hardwareTempTexCoordCount, terrainProjectionRows[0][6][0],
+                            terrainProjectionRows[0][6][1], terrainProjectionRows[0][6][2],
+                            terrainProjectionRows[1][6][0], terrainProjectionRows[1][6][1],
+                            terrainProjectionRows[1][6][2], passState);
+                        fprintf(file, "gpuBase=%d gpuBump=%d tangentHandle=%p\n",
+                            m_frameRenderer->HasLegacyTexture(textureIds[0]),
+                            m_frameRenderer->HasLegacyTexture(normalMapTextureId),
+                            reinterpret_cast<void*>(vertices->m_VS[VSF_TANGENTS].m_VulkanBufferHandle));
+                        CryVR::VulkanVertexFormat barkFormat;
+                        if (finalVertexData && CryVR::GetVulkanVertexFormat(finalVertexFormat, barkFormat))
+                            for (uint32_t attribute = 0; attribute < barkFormat.attributeCount; ++attribute)
+                                if (barkFormat.attributes[attribute].location == 3)
+                                    for (int vertex = 0; vertex < crymin(finalVertexCount, 4); ++vertex)
+                                    {
+                                        const float* uv = reinterpret_cast<const float*>(
+                                            static_cast<const byte*>(finalVertexData) + vertex * barkFormat.stride +
+                                            barkFormat.attributes[attribute].offset);
+                                        fprintf(file, "uv%d=%g,%g\n", vertex, uv[0], uv[1]);
+                                    }
+                        fclose(file);
+                    }
+            }
+#endif
 #if defined(__ANDROID__)
             // Bounded material census for the reported outdoor/character/
             // sprite failures. Capture unique inputs, not every frame.
@@ -8654,7 +9459,15 @@ public:
                     elementType == eDATA_ParticleSpray ||
                     elementType == eDATA_PolyBlend || elementType == eDATA_AnimPolyBlend ||
                     elementType == eDATA_ClientPoly;
-                static std::vector<std::array<uint64, 4>> captured;
+                struct TraceHash {
+                    size_t operator()(const std::array<uint64, 4>& key) const {
+                        size_t hash = 1469598103934665603ull;
+                        for (auto value : key) hash = (hash ^ value) * 1099511628211ull;
+                        return hash;
+                    }
+                };
+                static std::unordered_set<std::array<uint64, 4>, TraceHash> captured;
+                const bool firstCapture = captured.empty();
                 const std::array<uint64, 4> key = {{
                     reinterpret_cast<uint64>(m_RP.m_pShader),
                     static_cast<uint64>(static_cast<uint32>(textureIds[0])) |
@@ -8662,9 +9475,9 @@ public:
                     static_cast<uint64>(finalVertexFormat) | (static_cast<uint64>(elementType) << 32),
                     static_cast<uint64>(passState) | (static_cast<uint64>(m_activeHardwarePassType) << 32) }};
                 if (relevant && captured.size() < 512 &&
-                    std::find(captured.begin(), captured.end(), key) == captured.end())
+                    captured.insert(key).second)
                 {
-                    if (FILE* file = fopen("/sdcard/FarCry/vulkan_material_trace.txt", captured.empty() ? "wb" : "ab"))
+                    if (FILE* file = fopen("/sdcard/FarCry/vulkan_material_trace.txt", firstCapture ? "wb" : "ab"))
                     {
                         STexPic* image = m_TexMan ? m_TexMan->GetByID(textureIds[0]) : nullptr;
                         STexPic* image1 = m_TexMan && secondaryTextureId > 0 ?
@@ -8687,7 +9500,7 @@ public:
                             stockHardwarePass ? stockHardwarePass->m_StockVertexProgram : "fixed",
                             hasTerrainProjection && terrainProjectionRows[0][7][3] == -13.0f);
                         fclose(file);
-                        captured.push_back(key);
+
                     }
                 }
             }
@@ -9431,7 +10244,7 @@ private:
 
     int TextureWrapModeForId(int textureId) const
     {
-        const std::map<int, int>::const_iterator found = m_textureWrapOverrides.find(textureId);
+        const auto found = m_textureWrapOverrides.find(textureId);
         return found == m_textureWrapOverrides.end() ? -1 : found->second;
     }
 
@@ -9995,7 +10808,7 @@ private:
         // Losing it replaces their black background with an opaque square.
         if (hardwareTechniquePass && m_RP.m_pCurObject &&
             m_RP.m_pCurObject->m_RenderState &&
-            stricmp(static_cast<SShaderPassHW*>(pass)->m_StockFragmentProgram, "CGRCFog"))
+            FastAsciiCaseCompare(static_cast<SShaderPassHW*>(pass)->m_StockFragmentProgram, "CGRCFog"))
             state = m_RP.m_pCurObject->m_RenderState | (state & GS_STENCIL);
         // EF_Flush applies resource overrides before state-shader overrides.
         // A state shader can therefore select front culling even when the
@@ -10287,7 +11100,7 @@ private:
             textureLower.find("shipwall") == std::string::npos &&
             textureLower.find("support") == std::string::npos &&
             textureLower.find("moss") == std::string::npos &&
-            !(shader && !stricmp(shader->GetName(), "templmuzzleflash_auto")))
+            !(shader && !FastAsciiCaseCompare(shader->GetName(), "templmuzzleflash_auto")))
             return;
         static std::vector<std::string> keys;
         if (keys.size() >= 192) return;
@@ -11426,7 +12239,169 @@ private:
         return queued;
     }
 
+    struct StockProgramInfo
+    {
+        int water = 0, terrainLayers = -1, terrainOnly = 0, terrainAmbient = 0, terrainFog = -1;
+        bool ambient = false, light = false, particle = false, terrainLayer = false;
+        bool terrainShadow = false, plants = false, plantsBump = false, texgenOne = false;
+        bool simplePlant = false, bendedPlant = false, terrainTexgen = false;
+    };
+    std::unordered_map<const SShaderPassHW*, StockProgramInfo> m_framePrograms;
+    const SShaderPassHW* m_lastClassifiedPass = nullptr;
+    const StockProgramInfo* m_lastProgramInfo = nullptr;
+    const StockProgramInfo& ClassifyStockProgram(const SShaderPassHW* pass)
+    {
+        static const StockProgramInfo empty;
+        if (!pass) return empty;
+        if (pass == m_lastClassifiedPass && m_lastProgramInfo) return *m_lastProgramInfo;
+        auto found = m_framePrograms.find(pass);
+        if (found == m_framePrograms.end())
+        {
+            StockProgramInfo info;
+            int stockWaterMode = 0;
+            if (pass)
+            {
+                const char* program = pass->m_StockFragmentProgram;
+                if (!FastAsciiCaseCompare(program, "CGRCLowMedWater")) stockWaterMode = 1;
+                else if (!FastAsciiCaseCompare(program, "CGRCIndoorWater_final")) stockWaterMode = 2;
+                else if (!FastAsciiCaseCompare(program, "CGRCIndoorWaterSpec")) stockWaterMode = 3;
+                else if (!FastAsciiCaseCompare(program, "CGRCOutdoorWaterRefraction")) stockWaterMode = 4;
+                else if (!FastAsciiCaseCompare(program, "CGRCIndoorWater")) stockWaterMode = 5;
+                else if (!FastAsciiCaseCompare(program, "CGRCWater")) stockWaterMode = 7;
+                else if (!FastAsciiCaseCompare(program, "CGRCWater_Beach_Refr")) stockWaterMode = 8;
+                else if (!FastAsciiCaseCompare(program, "CGRCWater_Beach")) stockWaterMode = 9;
+                else if (!FastAsciiCaseCompare(program, "CGRCOcean_NoRefl") || !FastAsciiCaseCompare(program, "CGRCOcean")) stockWaterMode = 6;
+                if (!stockWaterMode &&
+                    !FastAsciiCaseCompareN(pass->m_StockVertexProgram, "CGVProgWater_Beach_Shift", 25))
+                    stockWaterMode = 10;
+            }
+            int stockTerrainLayers = -1;
+            int stockTerrainOnlyLayers = 0;
+            int stockTerrainAmbientMode = 0;
+            int stockTerrainFogLayers = -1;
+            if (pass)
+            {
+                const char* program = pass->m_StockFragmentProgram;
+                if (!FastAsciiCaseCompare(program, "CGRCTerrain")) stockTerrainLayers = 0;
+                else if (!FastAsciiCaseCompare(program, "CGRCTerrain_1Layers")) stockTerrainLayers = 1;
+                else if (!FastAsciiCaseCompare(program, "CGRCTerrain_2Layers")) stockTerrainLayers = 2;
+                else if (!FastAsciiCaseCompare(program, "CGRCTerrain_3Layers")) stockTerrainLayers = 3;
+                else if (!FastAsciiCaseCompare(program, "CGRCTerrain_1Layers_Only")) stockTerrainOnlyLayers = 1;
+                else if (!FastAsciiCaseCompare(program, "CGRCTerrain_2Layers_Only")) stockTerrainOnlyLayers = 2;
+                else if (!FastAsciiCaseCompare(program, "CGRCTerrain_3Layers_Only")) stockTerrainOnlyLayers = 3;
+                else if (!FastAsciiCaseCompare(program, "CGRCTerrain_4Layers_Only")) stockTerrainOnlyLayers = 4;
+                else if (!FastAsciiCaseCompare(program, "CGRCTerrain_NoCol")) stockTerrainAmbientMode = 1;
+                else if (!FastAsciiCaseCompare(program, "CGRCTerrain_Far")) stockTerrainAmbientMode = 2;
+                else if (!FastAsciiCaseCompare(program, "CGRCTerrain_DetTex")) stockTerrainAmbientMode = 3;
+                else if (!FastAsciiCaseCompare(program, "CGRCTerrain_VF")) stockTerrainAmbientMode = 4;
+                else if (!FastAsciiCaseCompare(program, "CGRCTerrain_1Layers_VF")) stockTerrainFogLayers = 1;
+                else if (!FastAsciiCaseCompare(program, "CGRCTerrain_2Layers_VF")) stockTerrainFogLayers = 2;
+            }
+
+            info.water = stockWaterMode;
+            info.terrainLayers = stockTerrainLayers;
+            info.terrainOnly = stockTerrainOnlyLayers;
+            info.terrainAmbient = stockTerrainAmbientMode;
+            info.terrainFog = stockTerrainFogLayers;
+            info.ambient = !FastAsciiCaseCompare(pass->m_StockFragmentProgram, "CGRCAmbientTempl");
+            info.light = !FastAsciiCaseCompare(pass->m_StockFragmentProgram, "CGRCLightTempl");
+            info.particle = !FastAsciiCaseCompare(pass->m_StockFragmentProgram, "CGRCAmbient_Particle");
+            info.terrainLayer = !FastAsciiCaseCompare(pass->m_StockFragmentProgram, "CGRCTerrainLayerTempl");
+            info.terrainShadow = !FastAsciiCaseCompare(pass->m_StockFragmentProgram, "CGRCTerrainShadow");
+            info.plants = !FastAsciiCaseCompare(pass->m_StockFragmentProgram, "CGRCPlants");
+            info.plantsBump = !FastAsciiCaseCompare(pass->m_StockFragmentProgram, "CGRCPlants_Bump");
+            info.texgenOne = !FastAsciiCaseCompare(pass->m_StockVertexProgram, "CGVProgTexGen_1Unit");
+            info.simplePlant = !FastAsciiCaseCompare(pass->m_StockVertexProgram, "CGVProgSimple_Plant");
+            info.bendedPlant = !FastAsciiCaseCompare(pass->m_StockVertexProgram, "CGVProgSimple_Plant_Bended");
+            info.terrainTexgen = !FastAsciiCaseCompareN(pass->m_StockFragmentProgram, "CGRCTerrain", 11);
+            found = m_framePrograms.emplace(pass, info).first;
+        }
+        m_lastClassifiedPass = pass;
+        m_lastProgramInfo = &found->second;
+        return *m_lastProgramInfo;
+    }
+
     CryVR::VulkanFrameRenderer* m_frameRenderer = nullptr;
+    struct NormalGeometryHash
+    {
+        size_t operator()(const std::array<uintptr_t, 8>& key) const
+        {
+            size_t hash = 1469598103934665603ull;
+            for (auto value : key) hash = (hash ^ value) * 1099511628211ull;
+            return hash;
+        }
+    };
+    std::unordered_map<std::array<uintptr_t, 8>, std::vector<byte>, NormalGeometryHash> m_frameNormalGeometry;
+    std::unordered_map<const CVertexBuffer*, uint64_t> m_frameBufferRevisions;
+    std::unordered_map<const SVertexStream*, uint64_t> m_ownedIndexRevisions;
+    uint64_t m_geometryRevision = 0;
+    uint64_t ImmutableGeometryRevision(CVertexBuffer* vertices, SVertexStream* indices,
+        const void* data, const void* cachedNormals, const uint16_t* indexData,
+        int firstIndex, bool noLightmapCoordinates) const
+    {
+        if (!vertices || vertices->m_bDynamic || !noLightmapCoordinates ||
+            (data != vertices->m_VS[VSF_GENERAL].m_VData && (!cachedNormals || data != cachedNormals)) ||
+            (m_RP.m_pCurObject && m_RP.m_pCurObject->m_pCharInstance) ||
+            indexData != static_cast<const uint16_t*>(indices->m_VData) + firstIndex)
+            return 0;
+        const auto index = m_ownedIndexRevisions.find(indices);
+        if (index == m_ownedIndexRevisions.end()) return 0;
+        const auto vertex = m_frameBufferRevisions.find(vertices);
+        return vertex == m_frameBufferRevisions.end() ? index->second :
+            std::max(index->second, vertex->second);
+    }
+    size_t m_frameNormalGeometryBytes = 0;
+    const void* CacheFrameNormalGeometry(CVertexBuffer* vertices, const void* source,
+        uint32_t count, int sourceId, int targetId, const byte* normals, int normalStride)
+    {
+        if (!vertices || vertices->m_bDynamic || !normals || normalStride <= 0 ||
+            source != vertices->m_VS[VSF_GENERAL].m_VData ||
+            (m_RP.m_pCurObject && m_RP.m_pCurObject->m_pCharInstance)) return nullptr;
+        CryVR::VulkanVertexFormat input{}, output{};
+        if (!CryVR::GetVulkanVertexFormat(sourceId, input) ||
+            !CryVR::GetVulkanVertexFormat(targetId, output)) return nullptr;
+        const auto revision = m_frameBufferRevisions.find(vertices);
+        const std::array<uintptr_t, 8> key{{reinterpret_cast<uintptr_t>(vertices),
+            reinterpret_cast<uintptr_t>(source), reinterpret_cast<uintptr_t>(normals),
+            uintptr_t(sourceId), uintptr_t(targetId), count, uintptr_t(normalStride),
+            revision == m_frameBufferRevisions.end() ? 0 : uintptr_t(revision->second)}};
+        const auto found = m_frameNormalGeometry.find(key);
+        if (found != m_frameNormalGeometry.end()) return found->second.data();
+        const size_t bytes = size_t(count) * output.stride;
+        // Static attribute conversion survives frames. Buffer revisions reject
+        // updates and ReleaseBuffer removes entries before addresses are reused.
+        // Bound copies so unusually large scenes fall back to the scratch path.
+        if (bytes > 32u*1024u*1024u - m_frameNormalGeometryBytes) return nullptr;
+        auto& data = m_frameNormalGeometry[key];
+        data.resize(bytes);
+        for (uint32_t vertex = 0; vertex < count; ++vertex)
+        {
+            byte* dst = data.data() + size_t(vertex) * output.stride;
+            const byte* src = static_cast<const byte*>(source) + size_t(vertex) * input.stride;
+            if (sourceId == targetId) std::memcpy(dst, src, input.stride);
+            for (uint32_t d = 0; d < output.attributeCount; ++d)
+            {
+                const auto& target = output.attributes[d];
+                if (target.location == 1)
+                {
+                    std::memcpy(dst + target.offset, normals + size_t(vertex) * normalStride, 12);
+                    continue;
+                }
+                if (sourceId == targetId) continue;
+                for (uint32_t s = 0; s < input.attributeCount; ++s)
+                {
+                    const auto& original = input.attributes[s];
+                    if (original.location != target.location || original.format != target.format) continue;
+                    const size_t size = original.format == VK_FORMAT_R32G32B32_SFLOAT ? 12 :
+                        original.format == VK_FORMAT_R32G32_SFLOAT ? 8 : 4;
+                    std::memcpy(dst + target.offset, src + original.offset, size);
+                    break;
+                }
+            }
+        }
+        m_frameNormalGeometryBytes += bytes;
+        return data.data();
+    }
     CVulkanTexMan* m_vulkanTexMan = nullptr;
     SShaderPass* m_activePass = nullptr;
     struct FailedBumpTextureLoad
@@ -11504,7 +12479,7 @@ private:
     int m_currentTextureId = 0;
     std::string m_lastTextureFilter;
     int m_lastTextureAnisotropy = -1;
-    std::map<int, int> m_textureWrapOverrides;
+    std::unordered_map<int, int> m_textureWrapOverrides;
     bool m_forceCurrentTextureForClientDraw = false;
     int m_flatLightmapNormalTextureId = 0;
     float m_screenSpaceWidth = 800.0f;
@@ -11514,6 +12489,7 @@ private:
     std::vector<const SDeform*> m_stockDeformScratch;
     std::vector<float> m_detailFogCoordinatesScratch;
     std::vector<std::array<float, 19>> m_lightPassScratch;
+    std::vector<CDLight*> m_translatedLightScratch;
     std::vector<std::array<int, 2>> m_lightPassSpecularOcclusionScratch;
     std::vector<bool> m_ambientOnlyLightPassScratch;
     int m_stageColorOps[8] = { eCO_MODULATE, eCO_MODULATE, eCO_MODULATE, eCO_MODULATE,

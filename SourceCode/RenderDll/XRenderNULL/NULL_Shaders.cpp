@@ -124,7 +124,9 @@ bool CShader::mfCompileHWShadeLayer(SShader *ef, char *scr, TArray<SShaderPassHW
     }
     // Retain CG pixel parameters without changing the established fallback
     // state/stream metadata of untranslated programs.
-    const bool translatedLayers = !stricmp(pass->m_StockFragmentProgram, "CGRCPlants") ||
+    const bool translatedLayers = !stricmp(pass->m_StockFragmentProgram, "CGRCAmbient_Decal") ||
+      !stricmp(pass->m_StockFragmentProgram, "CGRCPlants") ||
+      !stricmp(pass->m_StockFragmentProgram, "CGRCPlants_Bump") ||
       strstr(pass->m_StockFragmentProgram, "_Particle") != nullptr ||
       !stricmp(pass->m_StockFragmentProgram, "CGRCCaust") ||
       !stricmp(pass->m_StockFragmentProgram, "CGRCFog") ||

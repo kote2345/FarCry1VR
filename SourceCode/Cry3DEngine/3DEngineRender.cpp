@@ -264,7 +264,13 @@ void C3DEngine::RenderScene(unsigned int dwDrawFlags)
 
 	if(GetCVars()->e_stream_preload_textures && Cry3DEngineBase::m_nRenderStackLevel==0)
 	{
-		m_fPreloadStartTime = GetCurTimeSec();
+        // Frame time is constant inside a render call and cannot enforce a
+        // streaming deadline. Use the monotonic clock across all areas.
+#if defined(__ANDROID__)
+        m_dPreloadDeadline = GetTimer()->GetAsyncCurTime() + 0.002;
+#else
+        m_dPreloadDeadline = GetTimer()->GetAsyncCurTime() + 0.010;
+#endif
 		bool bPreloadOutdoor = m_pVisAreaManager->PreloadResources();
 		GetTimer()->MeasureTime("3TexPrelInd");
 

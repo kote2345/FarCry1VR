@@ -7,6 +7,8 @@ layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec4 inColor;
 layout(location = 3) in vec2 inTexCoord;
+layout(location = 5) in vec2 inLightmapTexCoord;
+layout(location = 10) out vec2 lightmapTexCoord;
 layout(location = 4) in vec4 inSecondaryColor;
 layout(location = 6) in vec3 inTangent;
 layout(location = 7) in vec3 inBinormal;
@@ -36,6 +38,7 @@ void main() {
     clipPosition = inPosition;
     projectorDirection = inPosition - transformData.objectLightPositionRadius.xyz;
     texCoord = inTexCoord;
+    lightmapTexCoord = inLightmapTexCoord;
     gl_Position = stockStereoMvp() * vec4(inPosition, 1.0);
     vertexColor = inColor;
     secondaryColor = inSecondaryColor;

@@ -6,6 +6,20 @@
 
 namespace CryVR
 {
+const char* VulkanPipelineFactory::GetLastError() const
+{
+    thread_local char error[256];
+    std::lock_guard<std::mutex> lock(m_compileMutex);
+    std::memcpy(error, m_lastError, sizeof(error));
+    return error;
+}
+
+VkResult VulkanPipelineFactory::GetLastResult() const
+{
+    std::lock_guard<std::mutex> lock(m_compileMutex);
+    return m_lastResult;
+}
+
 void VulkanPipelineFactory::SetError(const char* message)
 {
     std::snprintf(m_lastError, sizeof(m_lastError), "%s", message ? message : "unknown error");
@@ -85,6 +99,7 @@ bool VulkanPipelineFactory::Initialize(VulkanContext& context)
 bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineDesc& desc,
                                                     VkPipeline& pipeline)
 {
+    std::lock_guard<std::mutex> compileLock(m_compileMutex);
     m_lastResult = VK_SUCCESS;
     pipeline = VK_NULL_HANDLE;
     if (!m_context || !desc.renderPass || !desc.layout || !desc.vertexShader ||
@@ -96,7 +111,7 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
 
     VulkanVertexFormat vertexFormat{};
     VulkanPipelineState legacyState{};
-    if ((desc.hasNormalMap && !desc.hasTangents) ||
+    if ((desc.hasNormalMap && !desc.hasTangents && desc.stockTerrainMarker != -14.0f) ||
         (desc.useVertexInput && !GetVulkanVertexFormat(desc.cryVertexFormat, vertexFormat)) ||
         !DecodeLegacyPipelineState(desc.renderState, desc.cullMode, desc.mirror,
                                    desc.stencilTestState, legacyState))
@@ -126,12 +141,19 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = desc.fragmentShader;
     stages[1].pName = desc.fragmentEntry;
-    const uint32_t stereoEnabled = desc.multiview ? 1u : 0u;
-    VkSpecializationMapEntry stereoEntry{63, 0, sizeof(uint32_t)};
-    VkSpecializationInfo stereoSpecialization{1, &stereoEntry, sizeof(uint32_t), &stereoEnabled};
+    const uint32_t vertexSpecializationData[3] = {
+        desc.multiview ? 1u : 0u, desc.stockWaterProgram, desc.stockTerrainLayerMask
+    };
+    VkSpecializationMapEntry vertexEntries[3] = {
+        {63, 0, sizeof(uint32_t)}, {67, sizeof(uint32_t), sizeof(uint32_t)},
+        {68, 2 * sizeof(uint32_t), sizeof(uint32_t)}
+    };
+    VkSpecializationInfo stereoSpecialization{
+        3, vertexEntries, sizeof(vertexSpecializationData), vertexSpecializationData
+    };
     if (desc.supportsStereoTransform)
         stages[0].pSpecializationInfo = &stereoSpecialization;
-    uint32_t specializationData[64] = {
+    uint32_t specializationData[75] = {
         static_cast<uint32_t>(legacyState.alphaTest), desc.stage0ColorMode, desc.stage0AlphaMode,
         desc.stage1ColorMode, desc.stage1AlphaMode, desc.stage0ColorArg, desc.stage0AlphaArg,
         desc.stage0Constant, desc.stage1ColorArg, desc.stage1AlphaArg, desc.stage1Constant,
@@ -173,7 +195,18 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
         std::memcpy(&specializationData[55 + stageIndex],
                     &desc.stages4To7[stageIndex].lodBias, sizeof(uint32_t));
     specializationData[63] = desc.simpleDecalMode ? 1u : 0u;
-    VkSpecializationMapEntry specializationEntries[64]{};
+    specializationData[64] = desc.bakedLightmapFastPath ? 1u : 0u;
+    specializationData[65] = desc.stockShaderDisabledFeatures;
+    specializationData[66] = desc.stockWaterProgram;
+    specializationData[67] = desc.stockTerrainLayerMask;
+    specializationData[68] = desc.stockFogMode;
+    specializationData[69] = desc.stockZeroAlphaBlendNoOp ? 1u : 0u;
+    specializationData[70] = desc.multiview ? 1u : 0u;
+    std::memcpy(&specializationData[71], &desc.stockTerrainMarker, sizeof(float));
+    std::memcpy(&specializationData[72], &desc.stockMaterialLightingMode, sizeof(float));
+    std::memcpy(&specializationData[73], &desc.stockMaterialColorMode, sizeof(float));
+    specializationData[74] = desc.stockMaterialNormalMode;
+    VkSpecializationMapEntry specializationEntries[75]{};
     VkSpecializationInfo alphaTestSpecialization{};
     uint32_t specializationCount = 0;
     if (desc.supportsDiscardSpecialization || desc.supportsAlphaTest || desc.supportsStage0Combine || desc.supportsStage1Combine ||
@@ -190,7 +223,13 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
         };
         addSpecialization(0, 0);
         if (desc.supportsDiscardSpecialization)
+        {
             addSpecialization(62, 62);
+            addSpecialization(71, 71);
+            addSpecialization(72, 72);
+            addSpecialization(73, 73);
+            addSpecialization(74, 74);
+        }
         if (desc.supportsStage0Combine)
         {
             addSpecialization(1, 1); addSpecialization(2, 2);
@@ -239,6 +278,20 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
             addSpecialization(61, 61);
         if (desc.simpleDecalMode)
             addSpecialization(64, 63);
+        if (desc.bakedLightmapFastPath)
+            addSpecialization(65, 64);
+        if (desc.stockShaderDisabledFeatures)
+            addSpecialization(66, 65);
+        if (desc.stockWaterProgram)
+            addSpecialization(67, 66);
+        if (desc.stockTerrainLayerMask != 0xffffffffu)
+            addSpecialization(68, 67);
+        if (desc.stockFogMode)
+            addSpecialization(69, 68);
+        if (desc.stockZeroAlphaBlendNoOp)
+            addSpecialization(70, 69);
+        if (desc.supportsStereoTransform && desc.multiview)
+            addSpecialization(63, 70);
         alphaTestSpecialization.mapEntryCount = specializationCount;
         alphaTestSpecialization.pMapEntries = specializationEntries;
         alphaTestSpecialization.dataSize = sizeof(specializationData);
@@ -307,6 +360,25 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
             attribute.binding = 2;
             attribute.format = VK_FORMAT_R32G32_SFLOAT;
             attribute.offset = 0;
+        }
+    }
+    if (!desc.hasLightmapTexCoords)
+    {
+        // Lighting shaders share a UV1 varying. Meshes without a dedicated
+        // lightmap stream use base UVs rather than an undefined vertex input.
+        int baseUv = -1;
+        bool hasUv1 = false;
+        for (uint32_t i = 0; i < vertexFormat.attributeCount; ++i)
+        {
+            if (vertexFormat.attributes[i].location == 3) baseUv = static_cast<int>(i);
+            if (vertexFormat.attributes[i].location == 5) hasUv1 = true;
+        }
+        if (!hasUv1 && baseUv >= 0 && vertexFormat.attributeCount <
+            sizeof(vertexFormat.attributes)/sizeof(vertexFormat.attributes[0]))
+        {
+            auto uv = vertexFormat.attributes[baseUv];
+            uv.location = 5;
+            vertexFormat.attributes[vertexFormat.attributeCount++] = uv;
         }
     }
     VkPipelineVertexInputStateCreateInfo vertexInput{};
@@ -445,6 +517,7 @@ void VulkanPipelineFactory::DestroyPipeline(VkPipeline& pipeline)
 
 void VulkanPipelineFactory::Shutdown()
 {
+    StopCompiler();
 #if defined(__ANDROID__)
     // Save only during orderly shutdown, never in the frame/streaming path.
     if (m_context && m_pipelineCache && m_getPipelineCacheData)
@@ -472,5 +545,56 @@ void VulkanPipelineFactory::Shutdown()
     m_context = nullptr;
     m_createGraphicsPipelines = nullptr;
     m_destroyPipeline = nullptr;
+}
+
+std::shared_future<VulkanPipelineFactory::CompileResult>
+VulkanPipelineFactory::EnqueueGraphicsPipeline(const VulkanGraphicsPipelineDesc& desc)
+{
+    // The renderer uses persistent modules/layouts and the literal main entry.
+    // Capture the state by value; never capture a draw or stack specialization data.
+    std::packaged_task<CompileResult()> task([this, desc] {
+        CompileResult result;
+        if (!CreateGraphicsPipeline(desc, result.pipeline))
+            result.result = VK_ERROR_INITIALIZATION_FAILED;
+        return result;
+    });
+    auto result = task.get_future().share();
+    std::unique_lock<std::mutex> lock(m_jobMutex);
+    if (!m_compileThread.joinable())
+    {
+        m_compileStopping = false;
+        m_compileThread = std::thread([this] { CompileWorker(); });
+    }
+    // Bound the queue; normal streaming only queues unique material variants.
+    m_jobReady.wait(lock, [this] { return m_jobs.size() < 128; });
+    m_jobs.emplace_back(std::move(task));
+    m_jobReady.notify_all();
+    return result;
+}
+
+void VulkanPipelineFactory::CompileWorker()
+{
+    std::unique_lock<std::mutex> lock(m_jobMutex);
+    for (;;)
+    {
+        m_jobReady.wait(lock, [this] { return m_compileStopping || !m_jobs.empty(); });
+        if (m_jobs.empty() && m_compileStopping) return;
+        auto task = std::move(m_jobs.front());
+        m_jobs.pop_front();
+        m_jobReady.notify_all();
+        lock.unlock();
+        task();
+        lock.lock();
+    }
+}
+
+void VulkanPipelineFactory::StopCompiler()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_jobMutex);
+        m_compileStopping = true;
+        m_jobReady.notify_all();
+    }
+    if (m_compileThread.joinable()) m_compileThread.join();
 }
 }

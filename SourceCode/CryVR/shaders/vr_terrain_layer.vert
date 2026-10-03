@@ -25,18 +25,29 @@ void main() {
     clipPosition=position.xyz;
     baseUv=vec2(dot(scene.terrainProjectionS[0],position),
                 dot(scene.terrainProjectionS[1],position));
-    float distanceRatio=min(length(scene.terrainProjectionS[2].xyz-position.xyz)/
-                            max(scene.terrainProjectionS[3].x,1.e-6),1.0);
-    distanceRatio*=distanceRatio;
+    vec3 cameraDelta=scene.terrainProjectionS[2].xyz-position.xyz;
+    float detailRadius=max(scene.terrainProjectionS[3].x,1.e-6);
+    float distanceRatio=min(dot(cameraDelta,cameraDelta)/(detailRadius*detailRadius),1.0);
     distanceRatio*=distanceRatio;
     layerWeight=inColor.a*(1.0-distanceRatio);
-    // CGVProgTerrainLayerTempl uses Tangent=(0,1,0).
-    vec3 normal=length(inNormal)>1.e-6 ? normalize(inNormal) : vec3(0.0,0.0,1.0);
-    vec3 binormal=cross(vec3(0.0,1.0,0.0),normal);
-    binormal=length(binormal)>1.e-6 ? normalize(binormal) : vec3(1.0,0.0,0.0);
-    vec3 tangent=cross(normal,binormal);
-    vec3 light=scene.terrainProjectionS[4].xyz;
-    tangentLight=normalize(vec3(dot(tangent,light),dot(binormal,light),dot(normal,light)));
-    vec3 view=scene.terrainProjectionS[2].xyz-position.xyz;
-    tangentView=vec3(dot(tangent,view),dot(binormal,view),dot(normal,view));
+    // CGVProgTerrainLayerTempl uses Tangent=(0,1,0). Most terrain passes
+    // need neither tangent-space lighting nor parallax; avoid constructing
+    // the basis for those passes. The mask is uniform for this draw.
+    uint mask=stockTerrainLayerMask != 0xffffffffu ? stockTerrainLayerMask : uint(scene.terrainProjectionS[7].x+0.5);
+    tangentLight=vec3(0.0,0.0,1.0);
+    tangentView=vec3(0.0,0.0,1.0);
+    if ((mask&0x1001u)!=0u) {
+        vec3 normal=length(inNormal)>1.e-6 ? normalize(inNormal) : vec3(0.0,0.0,1.0);
+        vec3 binormal=cross(vec3(0.0,1.0,0.0),normal);
+        binormal=length(binormal)>1.e-6 ? normalize(binormal) : vec3(1.0,0.0,0.0);
+        vec3 tangent=cross(normal,binormal);
+        if ((mask&1u)!=0u) {
+            vec3 light=scene.terrainProjectionS[4].xyz;
+            tangentLight=normalize(vec3(dot(tangent,light),dot(binormal,light),dot(normal,light)));
+        }
+        if ((mask&0x1000u)!=0u) {
+            vec3 view=scene.terrainProjectionS[2].xyz-position.xyz;
+            tangentView=vec3(dot(tangent,view),dot(binormal,view),dot(normal,view));
+        }
+    }
 }

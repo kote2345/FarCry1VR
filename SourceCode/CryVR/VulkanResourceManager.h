@@ -91,6 +91,8 @@ private:
     bool SubmitImmediate(const std::function<void(VkCommandBuffer)>& record,
                          VulkanBuffer* upload = nullptr, VkImage image = VK_NULL_HANDLE);
     void CollectUploads(VkImage waitImage = VK_NULL_HANDLE, bool waitAll = false);
+    bool AcquireUploadBuffer(VkDeviceSize size, VulkanBuffer& buffer);
+    void RecycleUploadBuffer(VulkanBuffer& buffer);
     struct PendingUpload {
         VkCommandBuffer command;
         VkFence fence;
@@ -98,6 +100,9 @@ private:
         VkImage image;
     };
     std::vector<PendingUpload> m_pendingUploads;
+    VkDeviceSize m_pendingUploadBytes = 0;
+    VkDeviceSize m_uploadPoolBytes = 0;
+    std::vector<VulkanBuffer> m_uploadPool;
     void SetError(const char* message);
 
     VulkanContext* m_context = nullptr;

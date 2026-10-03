@@ -8,15 +8,51 @@ layout(set = 7, binding = 0) uniform sampler2D stockSpecularOcclusionTexture;
 
 #include "scene_alpha_test.glsl"
 
+// Zero preserves the complete legacy path. Bits are set only when the CPU
+// knows a feature is absent for this pipeline, allowing dead-code elimination.
+layout(constant_id = 66) const uint stockShaderDisabledFeatures = 0u;
+layout(constant_id = 71) const float stockTerrainMarkerValue = -1.0e30;
+layout(constant_id = 72) const float stockMaterialLightingModeValue = -1.0;
+layout(constant_id = 73) const float stockMaterialColorModeValue = -1.0;
+layout(constant_id = 74) const uint stockMaterialNormalModeValue = 0xffffffffu;
+uint stockMaterialNormalMode(uint varyingMode) {
+    return stockMaterialNormalModeValue != 0xffffffffu ? stockMaterialNormalModeValue : varyingMode;
+}
+float stockMaterialColorMode() {
+    return stockMaterialColorModeValue >= 0.0 ? stockMaterialColorModeValue :
+        textureStageTransforms.materialParams.w;
+}
+float stockTerrainMarker() {
+    return stockTerrainMarkerValue > -1.0e29 ? stockTerrainMarkerValue :
+        textureStageTransforms.terrainProjectionT[7].w;
+}
+float stockMaterialLightingMode() {
+    return stockMaterialLightingModeValue >= 0.0 ? stockMaterialLightingModeValue :
+        textureStageTransforms.materialAmbient.w;
+}
+const uint STOCK_NO_FRAGMENT_LIGHTING = 1u;
+const uint STOCK_NO_TERRAIN = 2u;
+const uint STOCK_NO_LINEAR_TEXGEN = 4u;
+const uint STOCK_NO_SHADOW_COMPARE = 8u;
+const uint STOCK_NO_FOG = 16u;
+const uint STOCK_NO_PROJECTOR = 32u;
+const uint STOCK_DIRECTIONAL_LIGHTMAP_FAST = 64u;
+bool stockFeatureDisabled(uint feature)
+{
+    return (stockShaderDisabledFeatures & feature) != 0u;
+}
+
 int stockTerrainLayerCount()
 {
-    float marker = textureStageTransforms.terrainProjectionT[7].w;
+    if (stockFeatureDisabled(STOCK_NO_TERRAIN)) return 0;
+    float marker = stockTerrainMarker();
     return marker > 100.5 && marker < 104.5 ? int(marker - 100.0 + 0.5) : 0;
 }
 
 bool stockTerrainProgram()
 {
-    float marker = textureStageTransforms.terrainProjectionT[7].w;
+    if (stockFeatureDisabled(STOCK_NO_TERRAIN)) return false;
+    float marker = stockTerrainMarker();
     return (marker > 99.5 && marker < 104.5) ||
            (marker > 200.5 && marker < 204.5) ||
            (marker > 300.5 && marker < 304.5) ||
@@ -26,25 +62,29 @@ bool stockTerrainProgram()
 
 bool stockTerrainShadowProgram()
 {
-    float marker = textureStageTransforms.terrainProjectionT[7].w;
+    if (stockFeatureDisabled(STOCK_NO_TERRAIN)) return false;
+    float marker = stockTerrainMarker();
     return marker > 399.5 && marker < 400.5;
 }
 
 int stockTerrainFogLayerCount()
 {
-    float marker = textureStageTransforms.terrainProjectionT[7].w;
+    if (stockFeatureDisabled(STOCK_NO_TERRAIN)) return 0;
+    float marker = stockTerrainMarker();
     return marker > 410.5 && marker < 412.5 ? int(marker - 410.0 + 0.5) : 0;
 }
 
 int stockTerrainOnlyCount()
 {
-    float marker = textureStageTransforms.terrainProjectionT[7].w;
+    if (stockFeatureDisabled(STOCK_NO_TERRAIN)) return 0;
+    float marker = stockTerrainMarker();
     return marker > 200.5 && marker < 204.5 ? int(marker - 200.0 + 0.5) : 0;
 }
 
 int stockTerrainAmbientMode()
 {
-    float marker = textureStageTransforms.terrainProjectionT[7].w;
+    if (stockFeatureDisabled(STOCK_NO_TERRAIN)) return 0;
+    float marker = stockTerrainMarker();
     return marker > 300.5 && marker < 304.5 ? int(marker - 300.0 + 0.5) : 0;
 }
 
@@ -57,6 +97,7 @@ vec3 stockTerrainDetail(vec3 texel, float weight)
 vec4 compareStockShadowStage(uint stage, sampler2D depthTexture,
                              vec4 sampledColor, vec3 objectPositionForShadow)
 {
+    if (stockFeatureDisabled(STOCK_NO_SHADOW_COMPARE)) return sampledColor;
     float enabled = stage < 4u ?
         textureStageTransforms.shadowMapStageMask[0][stage] :
         textureStageTransforms.shadowMapStageMask[1][stage - 4u];
@@ -81,9 +122,42 @@ vec4 compareStockShadowStage(uint stage, sampler2D depthTexture,
     return vec4(visible, visible, visible, 1.0);
 }
 
+// CGRCShadowTempl blends ambient albedo over the lit surface, with shadow
+// coverage in alpha. A visible sample must leave the existing lighting intact.
+float stockReceiverShadowCoverage(uint stage, sampler2D map, vec3 position)
+{
+    float enabled = textureStageTransforms.shadowMapStageMask[stage / 4u][stage % 4u];
+    if (enabled < 0.5) return 0.0;
+    return (1.0 - compareStockShadowStage(stage, map, vec4(1.0), position).r) *
+        textureStageTransforms.terrainProjectionT[6][stage - 1u];
+}
+vec4 stockReceiverShadowColor(vec4 albedo, float coverage)
+{
+    return vec4(albedo.rgb * textureStageTransforms.terrainProjectionS[6].rgb * 2.0,
+                clamp(coverage, 0.0, 1.0));
+}
+
+vec4 sampleStockTextureStage(uint stage, sampler2D stageTexture, vec2 uv,
+                            float gradientScale, vec3 objectPositionForShadow)
+{
+    if (!stockFeatureDisabled(STOCK_NO_SHADOW_COMPARE))
+    {
+        float enabled = textureStageTransforms.shadowMapStageMask[stage / 4u][stage % 4u];
+        if (enabled >= 0.5)
+            return compareStockShadowStage(stage, stageTexture, vec4(1.0), objectPositionForShadow);
+    }
+    // A projected depth comparison replaces the color sample entirely.
+    // Do not fetch the same texture first at the unrelated material UV.
+    return textureGrad(stageTexture, uv, dFdx(uv) * gradientScale, dFdy(uv) * gradientScale);
+}
+
 vec2 stockTerrainRawTexCoord(uint stage, vec2 fallbackUv, vec3 objectPositionForTexgen)
 {
-    if (textureStageTransforms.materialParams.w < 1.5)
+    // Receiver shadows and character decals use this payload for program
+    // constants; their albedo keeps the mesh UV, not object-linear texgen.
+    float programMarker = stockTerrainMarker();
+    if (programMarker > -16.5 && programMarker < -14.5) return fallbackUv;
+    if (stockFeatureDisabled(STOCK_NO_TERRAIN) || textureStageTransforms.materialParams.w < 1.5)
         return fallbackUv;
     vec4 position = vec4(objectPositionForTexgen, 1.0);
     return vec2(dot(textureStageTransforms.terrainProjectionS[stage], position),
@@ -93,7 +167,7 @@ vec2 stockTerrainRawTexCoord(uint stage, vec2 fallbackUv, vec3 objectPositionFor
 vec2 stockTerrainStageTexCoord(uint stage, vec2 fallbackUv,
                                vec3 objectPositionForTexgen)
 {
-    if (textureStageTransforms.linearControls[stage].x > 0.5)
+    if (!stockFeatureDisabled(STOCK_NO_LINEAR_TEXGEN) && textureStageTransforms.linearControls[stage].x > 0.5)
     {
         uint mask = uint(textureStageTransforms.linearControls[stage].y + 0.5);
         uint base = stage * 4u;
@@ -109,7 +183,7 @@ vec2 stockTerrainStageTexCoord(uint stage, vec2 fallbackUv,
             dot(textureStageTransforms.linearMatrixRows[base + 3u], coordinate));
         return transformed.xy / transformed.w;
     }
-    vec2 projectedUv = textureStageTransforms.materialParams.w >= 1.5 ?
+    vec2 projectedUv = !stockFeatureDisabled(STOCK_NO_TERRAIN) && textureStageTransforms.materialParams.w >= 1.5 ?
         stockTerrainRawTexCoord(stage, fallbackUv, objectPositionForTexgen) : fallbackUv;
     vec3 projectedUv3 = vec3(projectedUv, 1.0);
     float q = dot(textureStageTransforms.uvRowQ[stage].xyz, projectedUv3);
@@ -132,7 +206,19 @@ float stockProgramAttenuation(float normalizedDistance, bool projected)
                        normalizedDistance * normalizedDistance), 0.0, 1.0);
 }
 
-float stockProgramSpecular(vec3 position, vec3 normal, vec3 legacyHalfVector)
+float stockProgramVectorAttenuation(vec3 toLight, float radius, bool projected)
+{
+    float squaredDistance = dot(toLight, toLight) / (radius * radius);
+    // Point attenuation needs squared distance, not sqrt followed by square.
+    return clamp(1.0 - (projected ? sqrt(squaredDistance) : squaredDistance), 0.0, 1.0);
+}
+
+layout(set = 6, binding = 0) uniform sampler2D stockSpecularGlossTexture;
+vec4 stockProgramGloss(vec2 uv) {
+    uint flags = uint(textureStageTransforms.terrainProjectionS[6].x + 0.5);
+    return (flags & 16u) != 0u ? textureGrad(stockSpecularGlossTexture, uv, dFdx(uv), dFdy(uv)) : vec4(1.0);
+}
+float stockProgramSpecular(vec3 position, vec3 normal, vec3 legacyHalfVector, float glossAlpha)
 {
     vec4 camera = textureStageTransforms.terrainProjectionS[7];
     vec4 light = textureStageTransforms.terrainProjectionT[7];
@@ -144,10 +230,21 @@ float stockProgramSpecular(vec3 position, vec3 normal, vec3 legacyHalfVector)
         halfVector = stockLightingNormalize(stockLightingNormalize(toLight) +
             stockLightingNormalize(camera.xyz - position));
         if (camera.w > 1.5)
-            attenuation = stockProgramAttenuation(length(toLight) / max(light.w, 1.0e-6), camera.w > 2.5);
+            attenuation = stockProgramVectorAttenuation(toLight, max(light.w, 1.0e-6), camera.w > 2.5);
+        uint flags = uint(textureStageTransforms.terrainProjectionS[6].x + 0.5);
+        if (textureStageTransforms.terrainProjectionS[6].w > 0.5 && (flags & 1u) != 0u) {
+            vec3 reflectedLight = reflect(-stockLightingNormalize(toLight), normal);
+            float power = textureStageTransforms.terrainProjectionS[6].y;
+            if ((flags & 2u) != 0u) power *= glossAlpha;
+            return pow(max(dot(reflectedLight, stockLightingNormalize(camera.xyz-position)), 0.0),
+                       max(power, 0.0)) * attenuation;
+        }
     }
     float specular = clamp((dot(normal, halfVector) - 0.75) * 4.0, 0.0, 1.0);
     return specular * specular * attenuation;
+}
+float stockProgramSpecular(vec3 position, vec3 normal, vec3 legacyHalfVector) {
+    return stockProgramSpecular(position, normal, legacyHalfVector, 1.0);
 }
 
 vec3 evaluateStockLighting(vec3 objectPositionForLighting,
@@ -155,9 +252,10 @@ vec3 evaluateStockLighting(vec3 objectPositionForLighting,
                            vec2 lightmapUvForLighting,
                            uint hasLightingForMaterial)
 {
+    hasLightingForMaterial = stockMaterialNormalMode(hasLightingForMaterial);
     // OpenGL only evaluates this lighting term in an active ambient/light
     // pass. Base albedo and baked-lightmap passes stay unlit here.
-    if (textureStageTransforms.materialAmbient.w < 0.5 ||
+    if (stockFeatureDisabled(STOCK_NO_FRAGMENT_LIGHTING) || stockMaterialLightingMode() < 0.5 ||
         hasLightingForMaterial == 0u)
         return vec3(1.0);
 
@@ -176,7 +274,7 @@ vec3 evaluateStockLighting(vec3 objectPositionForLighting,
         normal = stockLightingNormalize(normal);
     vec4 lightPositionRadius = textureStageTransforms.objectLightPositionRadius;
     vec4 lightColorAmbient = textureStageTransforms.lightColorAmbient;
-    bool fixedFunctionLighting = textureStageTransforms.materialAmbient.w > 1.5;
+    bool fixedFunctionLighting = stockMaterialLightingMode() > 1.5;
     vec3 lightVector = lightPositionRadius.xyz;
     float radius = lightPositionRadius.w;
     bool specularPass = radius < 0.0;
@@ -186,16 +284,16 @@ vec3 evaluateStockLighting(vec3 objectPositionForLighting,
     if (!specularPass && radius > 0.0)
     {
         lightVector -= objectPositionForLighting;
-        float distanceToLight = length(lightVector);
         if (fixedFunctionLighting)
         {
+            float distanceToLight = length(lightVector);
             float constantAttenuation = max(textureStageTransforms.uvRow0[6].w, 1.0e-6);
             float linearAttenuation = max(textureStageTransforms.uvRow1[6].w, 0.0);
             attenuation = 1.0 / max(constantAttenuation +
                                     linearAttenuation * distanceToLight, 1.0e-6);
         }
         else
-            attenuation = stockProgramAttenuation(distanceToLight / radius, projectedPass);
+            attenuation = stockProgramVectorAttenuation(lightVector, radius, projectedPass);
 
         if (projectedPass)
         {
