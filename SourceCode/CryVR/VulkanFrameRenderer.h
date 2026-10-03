@@ -6,6 +6,7 @@
 #include "VulkanResourceManager.h"
 #include "VulkanPipelineFactory.h"
 #include "VulkanFrameWorker.h"
+#include "VulkanGpuSkinning.h"
 
 #include <vulkan/vulkan.h>
 #include <vector>
@@ -249,7 +250,25 @@ public:
                                      float lightmapEncodeScale = 4.0f,
                                      const float* reflectionModelView = nullptr,
                                      const float* reflectionClipPlane = nullptr,
-                                     const VulkanWaterReflectionUpdate* reflectionUpdate = nullptr);
+                                     const VulkanWaterReflectionUpdate* reflectionUpdate = nullptr,
+                                     const void* gpuSkinIdentity = nullptr);
+    bool QueueGpuSkinning(const void* identity, const SGpuSkinningData& mesh,
+                         const float* bones, uint32_t count) {
+        return m_frameActive && m_gpuSkinning.Queue(identity, mesh, bones, count);
+    }
+    void ClearGpuSkinning(const void* identity) { m_gpuSkinning.Clear(identity); }
+    bool QueueGpuMorph(const void* identity, const SGpuSkinningData& mesh, float weight, float normalAmplify) {
+        return m_gpuSkinning.Morph(identity, mesh, weight, normalAmplify);
+    }
+    bool QueueGpuSkinningRemap(const void* identity, const void* source, const uint32_t* map, uint32_t count) {
+        return m_gpuSkinning.Remap(identity, source, map, count);
+    }
+    bool QueueGpuSkinShadow(const void* identity, const void* source, const SGpuSkinningData& mesh,
+        const SGpuSkinShadowData& topology, const float* bones, uint32_t count, const float* light, float extent, uint32_t first = 0) {
+        return m_frameActive && m_gpuSkinning.Shadow(identity,source,mesh,topology,bones,count,light,extent,first);
+    }
+    void SetStockGpuSkinIdentity(const void* identity) { m_stockGpuSkinIdentity=identity; }
+    bool QueueGpuSkinReadback(const void* identity, const GpuSkinReadback& callback) { return m_gpuSkinning.Readback(identity,callback); }
     bool QueuePanelImage(int textureId, float x, float y, float width, float height,
                          float s0, float t0, float s1, float t1, float angleDegrees,
                          float red, float green, float blue, float alpha,
@@ -320,6 +339,8 @@ public:
     const char* GetLastError() const { return m_lastError; }
 
 private:
+    VulkanGpuSkinning m_gpuSkinning;
+    const void* m_stockGpuSkinIdentity = nullptr;
     struct Target
     {
         VkImage image = VK_NULL_HANDLE;
@@ -396,6 +417,7 @@ private:
         uint32_t auxiliaryIndex = UINT32_MAX;
         VkBuffer vertexBuffer = VK_NULL_HANDLE;
         VkBuffer tangentBuffer = VK_NULL_HANDLE;
+        VkDeviceSize tangentBufferOffset = 0;
         VkBuffer lightmapTexCoordBuffer = VK_NULL_HANDLE;
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         int vertexFormat = 0;
@@ -533,6 +555,8 @@ private:
     {
         bool valid = false;
         const void* sourceVertices = nullptr;
+        const void* skinIdentity = nullptr;
+        VkDeviceSize tangentBufferOffset = 0;
         const uint16_t* sourceIndices = nullptr;
         const void* sourceLightmapTexCoords = nullptr;
         uint32_t vertexCount = 0;

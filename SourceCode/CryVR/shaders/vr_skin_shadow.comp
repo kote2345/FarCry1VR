@@ -1,0 +1,49 @@
+#version 450
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer Results { uint result[]; };
+layout(set=0,binding=1,std430) buffer Destination { uint destination[]; };
+layout(set=0,binding=2,std430) readonly buffer Parameters { uint parameters[]; };
+layout(set=0,binding=3,std430) readonly buffer Topology { uint topology[]; };
+layout(push_constant) uniform Patch {
+    uint resultOffset, faceCount, edgeCount, destinationOffset;
+    uint firstVertex, vertexCount, stride, lightOffset;
+} params;
+vec3 position(uint vertex) {
+    uint offset=params.resultOffset+vertex*20;
+    return vec3(uintBitsToFloat(result[offset]),uintBitsToFloat(result[offset+1]),uintBitsToFloat(result[offset+2]));
+}
+vec3 lightPosition() {
+    return vec3(uintBitsToFloat(parameters[params.lightOffset]),uintBitsToFloat(parameters[params.lightOffset+1]),uintBitsToFloat(parameters[params.lightOffset+2]));
+}
+bool facing(uint face, vec3 light) {
+    if (face==0xffffffffu) return false;
+    vec3 a=position(topology[face*3]), b=position(topology[face*3+1]), c=position(topology[face*3+2]);
+    return dot(cross(b-a,c-a),light-a)>0;
+}
+void main() {
+    uint index=gl_GlobalInvocationID.x;
+    if (index>=params.vertexCount) return;
+    uint vertex=params.firstVertex+index, primitive=vertex/6, corner=vertex%6;
+    vec3 light=lightPosition(), outputPosition=vec3(0);
+    float extent=uintBitsToFloat(parameters[params.lightOffset+3]);
+    if (primitive<params.edgeCount) {
+        uint edge=params.faceCount*3+primitive*4;
+        bool a=facing(topology[edge+2],light), b=facing(topology[edge+3],light);
+        if (a != b) {
+            uint v0=topology[edge+(a?0:1)], v1=topology[edge+(a?1:0)];
+            bool first=corner==1 || corner==2 || corner==3;
+            bool extruded=corner>=2 && corner<=4;
+            outputPosition=position(first?v0:v1);
+            if (extruded) outputPosition=outputPosition*extent+(1.0-extent)*light;
+        }
+    } else {
+        uint face=primitive-params.edgeCount;
+        if (!facing(face,light)) {
+            uint axis=corner<3 ? (corner==0?0:(corner==1?2:1)) : corner-3;
+            outputPosition=position(topology[face*3+axis]);
+            if (corner>=3) outputPosition=outputPosition*extent+(1.0-extent)*light;
+        }
+    }
+    uint target=params.destinationOffset+index*params.stride;
+    for (uint axis=0; axis<3; ++axis) destination[target+axis]=floatBitsToUint(outputPosition[axis]);
+}

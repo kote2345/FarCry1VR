@@ -12,6 +12,7 @@
 #include "CryCharDecal.h"
 #include "SparseArrayDriver.h"
 #include "CryCharRenderElement.h"
+#include <memory>
 
 #ifndef DECAL_USE_HELPERS
 #error DECAL_USE_HELPERS must be defined in this header. Please include "CryCharDecal.h"
@@ -44,6 +45,7 @@ public:
 
 	// realizes (creates geometry for) unrealized(requested) decals
 	void Realize (const Vec3* pPositions);
+    bool RealizeGpu(CVertexBuffer* source);
 
 	// returns true if the Realize() needs to be called
 	bool NeedRealize () const;
@@ -64,6 +66,8 @@ public:
 	// returns the memory usage by this object into the sizer
 	void GetMemoryUsage (ICrySizer* pSizer);
 protected:
+    struct GpuLifetime { CryCharDecalManager* manager; explicit GpuLifetime(CryCharDecalManager* value):manager(value) {} };
+    std::shared_ptr<GpuLifetime> m_gpuLifetime;
 	// sets up the given material to default state: just clean decal material
   void initDefaultMaterial (CMatInfo& rMat);
 

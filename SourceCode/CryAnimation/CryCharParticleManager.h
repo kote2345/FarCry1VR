@@ -15,6 +15,8 @@
 #include "I3DEngine.h"
 #include "CryParticleSpawnInfo.h"
 #include "GeomCommon.h"
+#include "GpuSkinning.h"
+#include <memory>
 
 // This class is used for spawning particles (misc. types simultaneously, if needed)
 // from an animated character
@@ -23,6 +25,7 @@ class CryCharParticleManager
 public:
 
 	CryCharParticleManager();
+    ~CryCharParticleManager();
 
 	// adds a particle spawn task, returns a handle to be used to 
 	int add (const ParticleParams& rParticleInfo, const CryParticleSpawnInfo& rSpawnInfo);
@@ -80,11 +83,15 @@ public:
 
 	// spawn the particles (using the external tangent info and mapping)
 	void spawn (const SpawnParams& params);
+    bool spawnGpu(const SpawnParams& params, const void* identity, const SGpuSkinningData& mesh);
 
 	void validateThis();
 
 	void GetMemoryUsage (ICrySizer* pSizer);
 protected:
+    struct GpuLifetime { CryCharParticleManager* manager; explicit GpuLifetime(CryCharParticleManager* p):manager(p) {} };
+    std::shared_ptr<GpuLifetime> m_gpuLifetime;
+    int m_gpuQueuedFrame = -1;
 	struct Emitter
 	{
 		ParticleParams m_ParticleInfo;

@@ -4,6 +4,7 @@
 #include "CrySkinTypes.h"
 #include "CrySkinBase.h"
 #include "platform.h"
+#include "GpuSkinning.h"
 
 //////////////////////////////////////////////////////////////////////////
 // the optimized skinner; built with the CrySkinBuilder class instance,
@@ -13,6 +14,7 @@ class CrySkinFull: public CrySkinBase
 {
 public:
 	friend class CrySkinBuilder;
+    void exportGpuInfluences(std::vector<std::vector<SGpuSkinInfluence> >& output) const;
 
 	// does the skinning out of the given array of global matrices
 	void skin (const Matrix44* pBones, Vec3* pDest);

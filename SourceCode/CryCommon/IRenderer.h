@@ -15,6 +15,7 @@
 #define _IRENDERER_H
 
 #include <stddef.h>
+#include <functional>
 
 //#if defined(LINUX)
 //	#include "Splash.h"
@@ -1099,6 +1100,15 @@ struct IRenderer//: public IRendererCallbackServer
 
   virtual void DeleteLeafBuffer(CLeafBuffer * pLBuffer)=0;
   virtual int GetFrameID(bool bIncludeRecursiveCalls=true)=0;
+  virtual bool QueueGpuSkinning(CVertexBuffer*, const struct SGpuSkinningData&,
+                                const Matrix44*, unsigned) { return false; }
+  virtual bool SupportsGpuSkinning() const { return false; }
+  virtual bool QueueGpuMorph(const void*, const struct SGpuSkinningData&, float, float) { return false; }
+  virtual void ClearGpuSkinning(const void*) {}
+  virtual bool QueueGpuSkinningRemap(CVertexBuffer*, CVertexBuffer*, const unsigned*, unsigned) { return false; }
+  virtual bool QueueGpuSkinShadow(const void*, const void*, const struct SGpuSkinningData&,
+      const struct SGpuSkinShadowData&, const Matrix44*, unsigned, const Vec3&, float, unsigned = 0) { return false; }
+  virtual bool QueueGpuSkinReadback(const void*, const std::function<void(const float*, unsigned)>&) { return false; }
 
   virtual void MakeMatrix(const Vec3 & pos, const Vec3 & angles,const Vec3 & scale, Matrix44* mat)=0;
 

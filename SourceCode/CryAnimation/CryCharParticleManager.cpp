@@ -8,6 +8,38 @@ CryCharParticleManager::CryCharParticleManager():
 	m_numActive (0),
 	m_nLastFrame (0)
 {
+    m_gpuLifetime=std::make_shared<GpuLifetime>(this);
+}
+
+
+CryCharParticleManager::~CryCharParticleManager() { m_gpuLifetime->manager=nullptr; }
+
+bool CryCharParticleManager::spawnGpu(const SpawnParams& params, const void* identity, const SGpuSkinningData& mesh)
+{
+    if (m_gpuQueuedFrame==g_nFrameID) return true;
+    const auto lifetime=m_gpuLifetime;
+    const auto mapping=mesh.internalToExternal;
+    const std::vector<GeomFace> faces(params.pFaces,params.pFaces+params.numFaces);
+    const Matrix44 model=*params.pModelMatrix;
+    const std::vector<Matrix44> bones(params.pBoneGlobalMatrices,params.pBoneGlobalMatrices+params.numBoneMatrices);
+    if (!g_GetIRenderer()->QueueGpuSkinReadback(identity,[lifetime,mapping,faces,model,bones](const float* data,unsigned count) {
+        if (!lifetime->manager) return;
+        std::vector<Vec3> positions(mapping.size(),Vec3(0,0,0));
+        for (unsigned i=0;i<mapping.size();++i) if (mapping[i]<count) {
+            const float* p=data+mapping[i]*20;
+            positions[i]=Vec3(p[0],p[1],p[2]);
+        }
+        SpawnParams deferred;
+        deferred.setVertices(positions.data(),positions.size());
+        deferred.setFaces(faces.data(),faces.size());
+        deferred.pModelMatrix=&model;
+        deferred.pNormalsA16=nullptr;
+        deferred.pBoneGlobalMatrices=bones.data();
+        deferred.numBoneMatrices=bones.size();
+        lifetime->manager->spawn(deferred);
+    })) return false;
+    m_gpuQueuedFrame=g_nFrameID;
+    return true;
 }
 
 
@@ -37,6 +69,8 @@ int CryCharParticleManager::add (const ParticleParams& rParticleInfo, const CryP
 // deletes a particle spawn task by the handle
 bool CryCharParticleManager::remove (int nHandle)
 {
+    m_gpuLifetime->manager=nullptr;
+    m_gpuLifetime=std::make_shared<GpuLifetime>(this);
 	validateThis();
 	if (nHandle == -1)
 	{
@@ -143,6 +177,7 @@ void CryCharParticleManager::Emitter::spawnFromBone(const SpawnParams& params)
 // spawns one particle from the skin
 void CryCharParticleManager::Emitter::spawnFromSkin(const SpawnParams& params)
 {
+	if (!params.numFaces || !params.pVertices) return;
 	// find the face that's ok for spawning the particle
 	Vec3 arrFace[2][4]; // the first [0..2] are the vertices of the face, the [3] one is the normal
 	Vec3* pBestFace = arrFace[0], *pTempFace = arrFace[1];
@@ -158,7 +193,7 @@ void CryCharParticleManager::Emitter::spawnFromSkin(const SpawnParams& params)
 
 		// attempt #0
 		params.getFaceVN (irand() % params.numFaces, pBestFace);
-		fBestBet = vWindLCS * pTempFace[3];
+		fBestBet = vWindLCS * pBestFace[3];
 
 		for (int nAttempt = 1; nAttempt < nRainPower; ++nAttempt)
 		{

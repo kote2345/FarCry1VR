@@ -2,6 +2,7 @@
 #define _CRY_ANIMATION_CRY_SKIN_MORPH_HDR_
 
 #include "CrySkinBase.h"
+#include "GpuSkinning.h"
 
 //////////////////////////////////////////////////////////////////////////
 // This skinner is capable only of morphing a few vertices and adding their
@@ -9,6 +10,7 @@
 class CrySkinMorph: public CrySkinBase
 {
 public:
+    const SGpuSkinningData& getGpuSkinningData(const unsigned* mapping, unsigned count) const;
 	// does the skinning out of the given array of global matrices:
 	// adds the corresponding displacements with the given weight
 	void skin (const Matrix44* pBones, float fWeight, Vec3d* pDest)const;
@@ -25,6 +27,7 @@ public:
 	}
 
 	friend class CrySkinMorphBuilder;
+    mutable SGpuSkinningData m_gpuData;
 
 	class CStatistics: public CrySkinBase::CStatistics
 	{

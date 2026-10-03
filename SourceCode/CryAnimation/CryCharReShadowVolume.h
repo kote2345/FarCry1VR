@@ -11,6 +11,8 @@
 
 #ifndef _CRY_CHAR_RE_SHADOW_VOLUME_HDR_
 #define _CRY_CHAR_RE_SHADOW_VOLUME_HDR_
+#include <memory>
+#include <vector>
 
 // This is the utility/helper class for rendering the shadow volumes,
 // all the dirty work (of double buffering and managing the memory)
@@ -35,6 +37,11 @@ public:
 	// numVertices is the minimal length of the vertex buffer
 	// numIndices is the minimal length of the index buffer
 	void prepare (unsigned numIndices, unsigned numVertices);
+    bool prepareGpu(unsigned count);
+    const void* getRenderIdentity() const { return m_pMesh; }
+    unsigned getGpuPartCount() const { return m_gpuChildren.empty()?1u:(unsigned)m_gpuChildren.size(); }
+    CryCharReShadowVolume* getGpuPart(unsigned i) { return m_gpuChildren.empty()?this:m_gpuChildren[i].get(); }
+    unsigned getGpuVertexCount() const { return m_gpuCount; }
 	
 	// returns the pointer to the array of vertices to fill in
 	// the vertices are used to form the shadow volume mesh/geometry
@@ -68,6 +75,9 @@ protected:
 
 	//! Shader RenderElements for stencil
 	CRETriMeshShadow* m_pMesh;
+    unsigned m_gpuCount = 0;
+    bool m_gpuSubmission = false;
+    std::vector<std::unique_ptr<CryCharReShadowVolume>> m_gpuChildren;
 
 	//! shadow volume indices
 	TFixedArray<unsigned short> m_arrIndices;

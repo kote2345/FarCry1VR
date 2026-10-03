@@ -1,0 +1,52 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Source { uint source[]; };
+layout(set=0, binding=1, std430) readonly buffer Palette { mat4 bones[]; };
+layout(set=0, binding=2, std430) buffer Result { uint result[]; };
+layout(push_constant) uniform Parameters {
+    uint vertexCount, linkOffset, paletteOffset, resultOffset;
+    float morphWeight, normalAmplify; uint reserved0, reserved1;
+} params;
+vec3 readVector(uint offset) {
+    return vec3(uintBitsToFloat(source[offset]), uintBitsToFloat(source[offset+1]), uintBitsToFloat(source[offset+2]));
+}
+vec3 deform(uint first, uint count, float homogeneous) {
+    vec3 value = vec3(0);
+    for (uint i=0; i<count; ++i) {
+        uint link = params.linkOffset + (first+i)*8;
+        value += (bones[params.paletteOffset + source[link+4]] * vec4(readVector(link), homogeneous)).xyz * uintBitsToFloat(source[link+3]);
+    }
+    return value;
+}
+void storeVector(uint offset, vec3 value) {
+    result[offset] = floatBitsToUint(value.x); result[offset+1] = floatBitsToUint(value.y); result[offset+2] = floatBitsToUint(value.z);
+}
+void main() {
+    uint vertex = gl_GlobalInvocationID.x;
+    if (vertex >= params.vertexCount) return;
+    uint inputOffset = vertex*16, outputOffset = params.resultOffset+vertex*20;
+#ifdef SKIN_MORPH
+    vec3 offset = deform(source[inputOffset],source[inputOffset+1],0.0)*params.morphWeight;
+    for (uint axis=0; axis<3; ++axis) {
+        result[outputOffset+axis] = floatBitsToUint(uintBitsToFloat(result[outputOffset+axis])+offset[axis]);
+        if (result[outputOffset+7] != 0 && params.normalAmplify != 0)
+            result[outputOffset+4+axis] = floatBitsToUint(uintBitsToFloat(result[outputOffset+4+axis])+offset[axis]*params.normalAmplify);
+    }
+#else
+    storeVector(outputOffset, deform(source[inputOffset], source[inputOffset+1], 1.0));
+    storeVector(outputOffset+4, deform(source[inputOffset+2], source[inputOffset+3], 0.0));
+    // Validity is carried beside the normal; missing normal skin retains the
+    // original stream, matching SelfNormalSkin's null result.
+    result[outputOffset+7] = source[inputOffset+3];
+    vec3 tangent = readVector(inputOffset+4), binormal = readVector(inputOffset+8);
+    uint bone = source[inputOffset+12];
+    if (bone != 0xffffffffu) {
+        mat4 transform = bones[params.paletteOffset+bone];
+        tangent = (transform*vec4(tangent,0)).xyz;
+        binormal = (transform*vec4(binormal,0)).xyz;
+    }
+    storeVector(outputOffset+8, tangent);
+    storeVector(outputOffset+12, binormal);
+    storeVector(outputOffset+16, source[inputOffset+13] != 0 ? cross(binormal,tangent) : cross(tangent,binormal));
+#endif
+}

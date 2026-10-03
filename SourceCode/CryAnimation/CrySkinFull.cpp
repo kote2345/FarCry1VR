@@ -6,6 +6,27 @@
 
 #define FOR_TEST 0
 
+void CrySkinFull::exportGpuInfluences(std::vector<std::vector<SGpuSkinInfluence> >& output) const
+{
+    output.clear(); output.resize(m_numDests);
+    unsigned vertex = 0, aux = 0;
+    for (unsigned bone = m_numSkipBones; bone < m_numBones; ++bone)
+        for (unsigned group = 0; group < 3; ++group) {
+            const unsigned count = m_arrAux[aux++];
+            for (unsigned i = 0; i < count; ++i, ++vertex) {
+                const Vertex& source = m_arrVertices[vertex];
+                const unsigned destination = group == 0 ? source.nDest : m_arrAux[aux++];
+                assert(destination < output.size());
+                SGpuSkinInfluence link = {};
+                link.pointWeight[0] = source.pt.x; link.pointWeight[1] = source.pt.y;
+                link.pointWeight[2] = source.pt.z;
+                link.pointWeight[3] = group == 0 ? 1.0f : source.fWeight;
+                link.bone = bone;
+                output[destination].push_back(link);
+            }
+        }
+}
+
 // takes each offset and includes it into the bbox of corresponding bone
 /*void CrySkinFull::computeBoneBBoxes(CryBBoxA16* pBBoxes)
 {

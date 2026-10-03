@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <utility>
 #include <chrono>
 #if defined(__ANDROID__)
@@ -653,6 +654,12 @@ bool VulkanFrameRenderer::Initialize(Runtime& runtime, VulkanContext& context)
         Shutdown();
         return false;
     }
+    if (!m_gpuSkinning.Initialize(context, *m_resources))
+    {
+        SetError("GPU skinning pipeline initialization failed");
+        Shutdown();
+        return false;
+    }
     if (!CreateRenderTargets())
     {
         Shutdown();
@@ -673,7 +680,7 @@ bool VulkanFrameRenderer::Initialize(Runtime& runtime, VulkanContext& context)
         const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         const bool vertexBufferCreated = m_resources->CreateBuffer(
-            8ull * 1024ull * 1024ull, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            8ull * 1024ull * 1024ull, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             hostMemory, m_dynamicVertexBuffer);
         const bool indexBufferCreated = m_resources->CreateBuffer(
             4ull * 1024ull * 1024ull, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
@@ -2181,7 +2188,8 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                                                         float lightmapEncodeScale,
                                                         const float* reflectionModelView,
                                                         const float* reflectionClipPlane,
-                                                        const VulkanWaterReflectionUpdate* reflectionUpdate)
+                                                        const VulkanWaterReflectionUpdate* reflectionUpdate,
+                                                        const void* gpuSkinIdentity)
 {
     static uint32_t clientDrawAuditCount = 0;
     const auto auditFailure = [&](const char* reason) -> bool
@@ -2211,7 +2219,12 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
     // contributions from the same DrawBuffer call. Its vertex, index and
     // optional lightmap-UV arrays remain alive and unchanged through that
     // loop, so reuse the first contribution's GPU copies as one unit.
+    if (!gpuSkinIdentity) gpuSkinIdentity = m_stockGpuSkinIdentity;
+    const bool gpuSkinned = m_gpuSkinning.HasPose(gpuSkinIdentity);
+    const VulkanBuffer* effectiveTangents = gpuSkinned && (vertexFormat == 9 || vertexFormat == 10 || vertexFormat == 13) ?
+        &m_dynamicVertexBuffer : tangentBuffer;
     if (reusePreviousClientGeometry && sourceIndices && m_reusableClientGeometry.valid &&
+        m_reusableClientGeometry.skinIdentity == gpuSkinIdentity &&
         vertices == m_reusableClientGeometry.sourceVertices &&
         sourceIndices == m_reusableClientGeometry.sourceIndices &&
         lightmapTexCoords == m_reusableClientGeometry.sourceLightmapTexCoords &&
@@ -2232,7 +2245,7 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                                   stencilState, stencilRef, stencilMask,
                                   modelView, textureMatrix0, textureMatrix1,
                                   m_reusableClientGeometry.vertexOffset, materialLighting,
-                                  globalOpacity, alphaTestRef, tangentBuffer, normalMapTextureId,
+                                  globalOpacity, alphaTestRef, gpuSkinned ? &m_reusableClientGeometry.vertexBuffer : tangentBuffer, normalMapTextureId,
                                   primaryColor, primaryColorMask, colorWriteMaskOverride,
                                   textureStage0LodBias, textureStage1LodBias, textureStage2, textureStage3,
                                   polygonOffset, polygonOffsetFactor, polygonOffsetUnits, clipPlane,
@@ -2251,6 +2264,8 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                                   lightmapEncodeScale,
                                   reflectionModelView, reflectionClipPlane))
         {
+            if (gpuSkinned && !m_stockDraws.empty())
+                m_stockDraws.back().tangentBufferOffset = m_reusableClientGeometry.tangentBufferOffset;
             if (reflectionUpdate && !m_stockDraws.empty())
             {
                 m_stockDraws.back().waterReflectionUpdate = *reflectionUpdate;
@@ -2300,7 +2315,7 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
     // Leaf/material chunks often reference a small part of a shared mesh.
     // Keep original indices and compensate with baseVertex, uploading only
     // that range. Separate tangent streams retain their existing full layout.
-    const bool separateTangents = tangentBuffer && tangentBuffer->buffer &&
+    const bool separateTangents = effectiveTangents && effectiveTangents->buffer &&
         (vertexFormat == 9 || vertexFormat == 10 || vertexFormat == 13);
     const uint32_t uploadFirstVertex = separateTangents ? 0 : minimumVertex;
     const uint32_t uploadVertexCount = separateTangents ? vertexCount :
@@ -2315,12 +2330,16 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
         return auditFailure("dynamic buffer size overflow");
     const VkDeviceSize lightmapOffset = lightmapTexCoords ?
         (m_dynamicVertexUsed + vertexBytes + 7u) & ~static_cast<VkDeviceSize>(7u) : 0;
-    const VkDeviceSize dynamicVertexEnd = lightmapTexCoords ?
+    VkDeviceSize dynamicVertexEnd = lightmapTexCoords ?
         lightmapOffset + lightmapBytes : m_dynamicVertexUsed + vertexBytes;
+    const VkDeviceSize tangentOffset = gpuSkinned && separateTangents ?
+        (dynamicVertexEnd + 3u) & ~VkDeviceSize(3u) : VK_WHOLE_SIZE;
+    if (tangentOffset != VK_WHOLE_SIZE)
+        dynamicVertexEnd = tangentOffset + VkDeviceSize(uploadVertexCount) * 36;
     if (lightmapTexCoords && lightmapBytes > std::numeric_limits<VkDeviceSize>::max() - lightmapOffset)
         return auditFailure("lightmap buffer size overflow");
     if (!EnsureDynamicBufferCapacity(m_dynamicVertexBuffer, m_previousDynamicVertexBuffers,
-                                    dynamicVertexEnd, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT))
+                                    dynamicVertexEnd, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT))
         return auditFailure("vertex buffer capacity growth failed");
     if (!EnsureDynamicBufferCapacity(m_dynamicIndexBuffer, m_previousDynamicIndexBuffers,
                                     m_dynamicIndexUsed + indexBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT))
@@ -2338,6 +2357,14 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
     if (!m_resources->UploadBuffer(m_dynamicIndexBuffer, indices, indexBytes, m_dynamicIndexUsed))
         return auditFailure("index upload failed");
     const uint32_t firstIndex = static_cast<uint32_t>(m_dynamicIndexUsed / sizeof(uint16_t));
+    if (gpuSkinned) {
+        uint32_t normalOffset = UINT32_MAX;
+        for (uint32_t i=0; i<format.attributeCount; ++i)
+            if (format.attributes[i].location == 1) normalOffset = format.attributes[i].offset;
+        if (!m_gpuSkinning.AddPatch(gpuSkinIdentity, m_dynamicVertexBuffer.buffer, uploadFirstVertex,
+                uploadVertexCount, vertexBufferOffset, format.stride, normalOffset, tangentOffset))
+            return auditFailure("GPU deformation range invalid");
+    }
     if (!QueueStockIndexedDraw(&m_dynamicVertexBuffer, &m_dynamicIndexBuffer, vertexFormat,
                                indexCount, firstIndex, primitiveMode, renderState, cullMode,
                                textureId, textureId1, textureStage0ColorOp, textureStage0AlphaOp,
@@ -2347,7 +2374,7 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                                stencilState, stencilRef, stencilMask,
                                modelView, textureMatrix0, textureMatrix1, uploadBaseVertex,
                                materialLighting, globalOpacity, alphaTestRef,
-                               tangentBuffer, normalMapTextureId, primaryColor, primaryColorMask,
+                               effectiveTangents, normalMapTextureId, primaryColor, primaryColorMask,
                                colorWriteMaskOverride, textureStage0LodBias, textureStage1LodBias,
                                textureStage2, textureStage3, polygonOffset, polygonOffsetFactor, polygonOffsetUnits,
                                clipPlane, vertexBufferOffset,
@@ -2365,6 +2392,10 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                                lightmapEncodeScale,
                                reflectionModelView, reflectionClipPlane))
         return auditFailure("indexed draw queue rejected");
+    if (tangentOffset != VK_WHOLE_SIZE && !m_stockDraws.empty()) {
+        m_stockDraws.back().tangentBuffer = m_dynamicVertexBuffer.buffer;
+        m_stockDraws.back().tangentBufferOffset = tangentOffset;
+    }
     if (terrainProjection && terrainProjection[31] == -13.0f && !m_stockDraws.empty() &&
         m_dynamicVertexBuffer.mappedData && m_dynamicIndexBuffer.mappedData)
     {
@@ -2531,6 +2562,8 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
     {
         m_reusableClientGeometry.valid = true;
         m_reusableClientGeometry.sourceVertices = vertices;
+        m_reusableClientGeometry.skinIdentity = gpuSkinIdentity;
+        m_reusableClientGeometry.tangentBufferOffset = tangentOffset == VK_WHOLE_SIZE ? 0 : tangentOffset;
         m_reusableClientGeometry.sourceIndices = sourceIndices;
         m_reusableClientGeometry.sourceLightmapTexCoords = lightmapTexCoords;
         m_reusableClientGeometry.vertexCount = vertexCount;
@@ -2571,6 +2604,7 @@ bool VulkanFrameRenderer::EnsureDynamicBufferCapacity(VulkanBuffer& buffer,
     const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     VulkanBuffer grownBuffer;
+    if (usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     if (!m_resources->CreateBuffer(capacity, usage, hostMemory, grownBuffer))
         return false;
 
@@ -4205,6 +4239,7 @@ bool VulkanFrameRenderer::CompletePendingSubmission()
         return false;
     }
     m_frameSubmissionPending = false;
+    m_gpuSkinning.Complete(m_pendingUniformFrameSlot);
     m_pendingReadBuffers.clear();
 #if defined(__ANDROID__)
     const bool profiledSubmission = !m_pendingGpuProfiles.empty();
@@ -4362,7 +4397,7 @@ bool VulkanFrameRenderer::BeginFrame()
     // synchronized later, immediately before recording the next submission.
     if (!m_spareDynamicVertexBuffer.buffer &&
         !m_resources->CreateBuffer(m_dynamicVertexBuffer.size,
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
             m_spareDynamicVertexBuffer)) return false;
     if (!m_spareDynamicIndexBuffer.buffer &&
@@ -4481,6 +4516,8 @@ bool VulkanFrameRenderer::BeginFrame()
             auditCall, m_frameActive ? 1u : 0u, m_frame.shouldRender ? 1u : 0u,
             m_frame.viewsValid ? 1u : 0u, m_frame.viewCount);
     m_stockDraws.clear();
+    m_gpuSkinning.BeginFrame();
+    m_stockGpuSkinIdentity = nullptr;
     m_stockDrawAux.clear();
     m_stockShadowMapTextureId = 0;
     std::memset(m_stockShadowProjection, 0, sizeof(m_stockShadowProjection));
@@ -4814,20 +4851,31 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
                 }
             }
             const VkDeviceSize transformOffset = draw.textureTransformOffset;
-            SceneUniformBlock eyeBlock{};
-            std::memcpy(eyeBlock.rows, draw.textureTransformRows, sizeof(eyeBlock.rows));
-            std::memcpy(eyeBlock.fog, draw.fogConstants, sizeof(eyeBlock.fog));
-            std::memcpy(eyeBlock.lighting, draw.lightingConstants, sizeof(eyeBlock.lighting));
-            fillShadowTransforms(eyeBlock, draw);
-            fillLinearTexgen(eyeBlock, draw);
-            std::memcpy(eyeBlock.terrainProjection, draw.terrainProjectionRows,
-                        sizeof(eyeBlock.terrainProjection));
             const uint32_t uniformEyeCount = m_multiview && !draw.hasWaterReflectionTransform ? 1u : 2u;
+            const bool singleSharedEyeBlock = uniformEyeCount == 1u;
+            SceneUniformBlock eyeBlockStorage;
+            SceneUniformBlock* eyeBlock = &eyeBlockStorage;
+            if (singleSharedEyeBlock)
+            {
+                // Multiview's ordinary draws use the same scene block for
+                // both eyes. Construct it in its final mapped location to
+                // avoid building a large temporary and copying it again.
+                eyeBlock = ::new (destination + transformOffset) SceneUniformBlock{};
+            }
+            else
+                std::memset(&eyeBlockStorage, 0, sizeof(eyeBlockStorage));
+            std::memcpy(eyeBlock->rows, draw.textureTransformRows, sizeof(eyeBlock->rows));
+            std::memcpy(eyeBlock->fog, draw.fogConstants, sizeof(eyeBlock->fog));
+            std::memcpy(eyeBlock->lighting, draw.lightingConstants, sizeof(eyeBlock->lighting));
+            fillShadowTransforms(*eyeBlock, draw);
+            fillLinearTexgen(*eyeBlock, draw);
+            std::memcpy(eyeBlock->terrainProjection, draw.terrainProjectionRows,
+                        sizeof(eyeBlock->terrainProjection));
             for (uint32_t eye = 0; eye < uniformEyeCount; ++eye)
             {
                 // Restore the ordinary clip plane after writing the reflected block.
-                std::memcpy(eyeBlock.fog + 28, draw.clipPlane, sizeof(draw.clipPlane));
-                auto& eyeRows = eyeBlock.rows;
+                std::memcpy(eyeBlock->fog + 28, draw.clipPlane, sizeof(draw.clipPlane));
+                auto& eyeRows = eyeBlock->rows;
                 if (radialFog && eye < m_frame.viewCount)
                 {
                     eyeRows[0][0][3] = eyeTangents[eye][0];
@@ -4838,13 +4886,16 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
                 eyeRows[2][0][3] = draw.viewport.width;
                 eyeRows[2][1][3] = draw.viewport.height;
                 if (!m_multiview || eye == 0)
-                    std::memcpy(destination + transformOffset + eye * m_textureTransformStride,
-                                &eyeBlock, sizeof(eyeBlock));
+                {
+                    if (!singleSharedEyeBlock)
+                        std::memcpy(destination + transformOffset + eye * m_textureTransformStride,
+                                    eyeBlock, sizeof(*eyeBlock));
+                }
                 if (!draw.hasWaterReflectionTransform) continue;
-                std::memcpy(eyeBlock.fog + 28, draw.reflectionClipPlane,
+                std::memcpy(eyeBlock->fog + 28, draw.reflectionClipPlane,
                             sizeof(draw.reflectionClipPlane));
                 std::memcpy(destination + transformOffset + (2 + eye) * m_textureTransformStride,
-                            &eyeBlock, sizeof(eyeBlock));
+                            eyeBlock, sizeof(*eyeBlock));
             }
         }
     };
@@ -5100,7 +5151,7 @@ bool VulkanFrameRenderer::RecordShadowMapDraws(VkCommandBuffer commandBuffer,
                            VK_SHADER_STAGE_VERTEX_BIT, 0,
                            sizeof(pushConstants), pushConstants);
         const VkDeviceSize offsets[3] = {
-            draw.vertexBufferOffset, 0, draw.lightmapTexCoordOffset
+            draw.vertexBufferOffset, draw.tangentBufferOffset, draw.lightmapTexCoordOffset
         };
         if (draw.tangentBuffer || draw.lightmapTexCoordBuffer)
         {
@@ -5287,7 +5338,7 @@ bool VulkanFrameRenderer::RecordWaterReflectionDraws(VkCommandBuffer commandBuff
         m_cmdPushConstants(commandBuffer, m_scenePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
                            0, sizeof(pushConstants), pushConstants);
         const VkDeviceSize bufferOffsets[3] = {
-            draw.vertexBufferOffset, 0, draw.lightmapTexCoordOffset
+            draw.vertexBufferOffset, draw.tangentBufferOffset, draw.lightmapTexCoordOffset
         };
         if (draw.tangentBuffer || draw.lightmapTexCoordBuffer)
         {
@@ -5314,6 +5365,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     if (m_beginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS)
         return false;
+    if (viewIndex == 0) m_gpuSkinning.Record(commandBuffer);
     if (viewIndex == 0)
     {
         m_recordedAbMode = m_recordedAbSkipped = 0;
@@ -6357,7 +6409,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
             m_cmdPushConstants(commandBuffer, m_scenePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
                                0, sizeof(pushConstants), pushConstants);
             const VkDeviceSize offsets[3] = {
-                draw.vertexBufferOffset, 0, draw.lightmapTexCoordOffset
+                draw.vertexBufferOffset, draw.tangentBufferOffset, draw.lightmapTexCoordOffset
             };
             VkBuffer vertexBuffers[3] = {};
             uint32_t vertexBindingCount = 1;
@@ -6748,6 +6800,10 @@ bool VulkanFrameRenderer::EndFrame()
             SetError("preparing scene uniform buffers failed");
             result = false;
         }
+        if (result && !m_gpuSkinning.Prepare(m_uniformFrameSlot)) {
+            SetError("preparing GPU skinning resources failed");
+            result = false;
+        }
         uniformPrepareMs = FrameClockMs() - cpuRecordStartMs;
         for (std::map<int, LegacyTexture>::iterator it = m_legacyTextures.begin();
              it != m_legacyTextures.end(); ++it)
@@ -6786,6 +6842,7 @@ bool VulkanFrameRenderer::EndFrame()
             // Collect timestamps and recycle the single submission fence only
             // after recording, overlapping that CPU work with the previous GPU frame.
             if (!CompletePendingSubmission()) result = false;
+            if (result) m_gpuSkinning.CollectUnused();
             gpuWaitMs = m_cpuResourceWaitMs;
             VkSubmitInfo submit{};
             submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -6992,6 +7049,7 @@ void VulkanFrameRenderer::Shutdown()
     {
         if (m_frameSubmissionPending && m_frameFence && m_waitForFences)
             m_waitForFences(m_context->GetDevice(), 1, &m_frameFence, VK_TRUE, UINT64_MAX);
+        m_gpuSkinning.Shutdown();
         CollectDeferredLegacyTextureReleases();
         if (m_visibilityQueryPool && m_destroyQueryPool)
             m_destroyQueryPool(m_context->GetDevice(), m_visibilityQueryPool, nullptr);

@@ -83,6 +83,22 @@ public:
 class CStencilShadowConnectivity : public IStencilShadowConnectivity
 {
 public:
+    bool ExportGpuTopology(std::vector<unsigned>& faces, std::vector<unsigned>& edges) const override {
+        faces.clear(); edges.clear();
+        for (unsigned i=0; i<numFaces(); ++i)
+            for (unsigned v=0; v<3; ++v) faces.push_back(getFace(i).getVertex(v));
+        for (unsigned i=0; i<numEdges(); ++i) {
+            const Edge& edge=getEdge(i);
+            edges.push_back(edge[0]); edges.push_back(edge[1]);
+            edges.push_back(edge.getFace(0).getFaceIndex()); edges.push_back(edge.getFace(1).getFaceIndex());
+        }
+        for (unsigned i=0; i<numOrphanEdges(); ++i) {
+            const OrphanEdge& edge=getOrphanEdge(i);
+            edges.push_back(edge[0]); edges.push_back(edge[1]);
+            edges.push_back(edge.getFace().getFaceIndex()); edges.push_back(~0u);
+        }
+        return true;
+    }
 
 	//! number of vertices in the array referenced by the mesh
 	//! /return vertex count

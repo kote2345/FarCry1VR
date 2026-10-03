@@ -84,6 +84,8 @@ protected:
 
 	// the skinner for the tangent bases
 	CrySkinRigidBasis m_TangSkin;
+    SGpuSkinningData m_gpuSkinningData;
+    SGpuSkinShadowData m_gpuShadowData;
 
 	// array of vertices
 	typedef TFixedArray<Vec3> Vec3dArray;
@@ -149,6 +151,8 @@ public:
 	bool hasGeomSkin()const;
 	class CrySkinFull* getGeomSkin();
 	class CrySkinFull* getNormalSkin();
+    const SGpuSkinningData& getGpuSkinningData();
+    const SGpuSkinShadowData& getGpuShadowData(const IStencilShadowConnectivity* connectivity);
 	void buildGeomSkins(const class CryBoneInfo* pBoneInfo, unsigned numBoneInfos);
 	bool loadVertexSkin (const void* pData, unsigned nSize);
 	bool loadNormalSkin (const void* pData, unsigned nSize);

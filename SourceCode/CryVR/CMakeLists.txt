@@ -328,11 +328,33 @@ add_custom_command(
         shaders/scene_stereo.glsl shaders/scene_water.glsl shaders/scene_alpha_test.glsl cmake/EmbedSpirv.cmake VERBATIM)
 add_custom_target(CryVRStockPrograms DEPENDS "${CRYVR_STOCK_PROGRAM_HEADER}")
 
+set(CRYVR_SKIN_HEADER "${CRYVR_GENERATED_DIR}/VulkanSkinShaders.h")
+add_custom_command(OUTPUT "${CRYVR_SKIN_HEADER}"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_skin.comp" -o "${CRYVR_GENERATED_DIR}/skin.comp.spv"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_skin_patch.comp" -o "${CRYVR_GENERATED_DIR}/skin_patch.comp.spv"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O -DSKIN_MORPH=1 "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_skin.comp" -o "${CRYVR_GENERATED_DIR}/skin_morph.comp.spv"
+    COMMAND "${CRYVR_GLSLC}" --target-env=vulkan1.0 -O "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vr_skin_shadow.comp" -o "${CRYVR_GENERATED_DIR}/skin_shadow.comp.spv"
+    COMMAND "${CMAKE_COMMAND}"
+        "-DVERTEX_SPV=${CRYVR_GENERATED_DIR}/skin.comp.spv"
+        "-DFRAGMENT_SPV=${CRYVR_GENERATED_DIR}/skin_patch.comp.spv"
+        "-DVERTEX_ARRAY_NAME=kVrSkinComputeSpirv"
+        "-DFRAGMENT_ARRAY_NAME=kVrSkinPatchComputeSpirv"
+        "-DEXTRA_VERTEX_SPV=${CRYVR_GENERATED_DIR}/skin_morph.comp.spv"
+        "-DEXTRA_VERTEX_ARRAY_NAME=kVrSkinMorphComputeSpirv"
+        "-DTHIRD_VERTEX_SPV=${CRYVR_GENERATED_DIR}/skin_shadow.comp.spv"
+        "-DTHIRD_VERTEX_ARRAY_NAME=kVrSkinShadowComputeSpirv"
+        "-DOUTPUT_HEADER=${CRYVR_SKIN_HEADER}"
+        -DHEADER_GUARD=CRY_VULKAN_SKIN_SHADERS_H
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
+    DEPENDS shaders/vr_skin.comp shaders/vr_skin_patch.comp shaders/vr_skin_shadow.comp cmake/EmbedSpirv.cmake VERBATIM)
+add_custom_target(CryVRSkinShaders DEPENDS "${CRYVR_SKIN_HEADER}")
+
 add_library(${PROJECT_NAME} STATIC
     CryVR.cpp
     OpenXRPlatform.cpp
     VulkanContext.cpp
     VulkanFrameRenderer.cpp
+    VulkanGpuSkinning.cpp
     VulkanGeometryBuffer.cpp
     VulkanPipelineFactory.cpp
     VulkanPipelineState.cpp
@@ -346,7 +368,7 @@ add_library(${PROJECT_NAME} STATIC
     "${CRYVR_GENERATED_TEXGEN_HEADER}"
     "${CRYVR_LIT_SHADER_HEADER}"
 )
-add_dependencies(${PROJECT_NAME} CryVRPanelShaders CryVRSceneShaders CryVRLitSceneShaders CryVRMultiTextureLitShaders CryVRWaterShaders CryVRStockPrograms)
+add_dependencies(${PROJECT_NAME} CryVRPanelShaders CryVRSceneShaders CryVRLitSceneShaders CryVRMultiTextureLitShaders CryVRWaterShaders CryVRStockPrograms CryVRSkinShaders)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_11)

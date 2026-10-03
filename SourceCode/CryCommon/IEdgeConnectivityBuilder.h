@@ -14,6 +14,7 @@
 ////////////////////////////////////////////////////////////////////////////
 
 #pragma once
+#include <vector>
 #ifndef __IEDGE_CONNECTIVITYBUILDER_H
 #define __IEDGE_CONNECTIVITYBUILDER_H
 
@@ -63,6 +64,7 @@ public:
 	//! number of orphaned (open) edges
 	//! /return orphaned (open) count
 	virtual unsigned numOrphanEdges() const = 0;
+    virtual bool ExportGpuTopology(std::vector<unsigned>& faces, std::vector<unsigned>& edges) const { return false; }
 };
 
 // (don't copy the interface pointer and don't forget to call Release)

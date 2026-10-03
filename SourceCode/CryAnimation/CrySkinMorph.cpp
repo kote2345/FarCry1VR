@@ -1,6 +1,35 @@
 #include "StdAfx.h"
 #include "CrySkinMorph.h"
 
+const SGpuSkinningData& CrySkinMorph::getGpuSkinningData(const unsigned* mapping, unsigned count) const
+{
+    if (!m_gpuData.vertices.empty()) return m_gpuData;
+    m_gpuData.key = AllocateGpuSkinningKey();
+    std::vector<std::vector<SGpuSkinInfluence> > links(m_numDests);
+    unsigned aux=0, vertex=0;
+    for (unsigned bone=m_numSkipBones; bone<m_numBones; ++bone)
+        for (unsigned group=0; group<2; ++group) {
+            const unsigned groupCount=m_arrAux[aux++];
+            for (unsigned i=0; i<groupCount; ++i,++vertex) {
+                const Vertex& source=m_arrVertices[vertex];
+                SGpuSkinInfluence link={};
+                link.pointWeight[0]=source.pt.x; link.pointWeight[1]=source.pt.y; link.pointWeight[2]=source.pt.z;
+                link.pointWeight[3]=group==0 ? 1.0f : source.fWeight; link.bone=bone;
+                links[group==0 ? source.nDest : m_arrAux[aux++]].push_back(link);
+            }
+        }
+    m_gpuData.vertices.resize(count);
+    for (unsigned i=0; i<count; ++i) {
+        SGpuSkinVertex& vertexData=m_gpuData.vertices[i];
+        vertexData.positionFirst=(unsigned)m_gpuData.influences.size();
+        if (mapping[i]<links.size()) {
+            vertexData.positionCount=(unsigned)links[mapping[i]].size();
+            m_gpuData.influences.insert(m_gpuData.influences.end(),links[mapping[i]].begin(),links[mapping[i]].end());
+        }
+    }
+    return m_gpuData;
+}
+
 //////////////////////////////////////////////////////////////////////////
 // does the skinning out of the given array of global matrices
 void CrySkinMorph::skin (const Matrix44* pBones, float fWeight, Vec3d* pDest)const

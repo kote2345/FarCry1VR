@@ -46,6 +46,67 @@ CryGeometryInfo::CryGeometryInfo():
 }
 
 
+uint64_t AllocateGpuSkinningKey()
+{
+    static uint64_t nextKey = 0;
+    return ++nextKey;
+}
+
+const SGpuSkinningData& CryGeometryInfo::getGpuSkinningData()
+{
+    if (!m_gpuSkinningData.vertices.empty()) return m_gpuSkinningData;
+    m_gpuSkinningData.key = AllocateGpuSkinningKey();
+    std::vector<std::vector<SGpuSkinInfluence> > positions, normals;
+    m_SkinGeom.exportGpuInfluences(positions);
+    if (!m_SkinNormal.empty()) m_SkinNormal.exportGpuInfluences(normals);
+    m_gpuSkinningData.vertices.resize(numExtToIntMapEntries());
+    m_gpuSkinningData.internalToExternal.resize(numUsedVertices(), UINT32_MAX);
+    for (unsigned i = 0; i < m_gpuSkinningData.vertices.size(); ++i) {
+        SGpuSkinVertex& vertex = m_gpuSkinningData.vertices[i];
+        const unsigned internal = m_arrExtToIntMap[i];
+        m_gpuSkinningData.internalToExternal[internal] = i;
+        vertex.positionFirst = (unsigned)m_gpuSkinningData.influences.size();
+        vertex.positionCount = (unsigned)positions[internal].size();
+        m_gpuSkinningData.influences.insert(m_gpuSkinningData.influences.end(), positions[internal].begin(), positions[internal].end());
+        vertex.normalFirst = (unsigned)m_gpuSkinningData.influences.size();
+        vertex.normalCount = normals.empty() ? 0 : (unsigned)normals[internal].size();
+        if (vertex.normalCount) m_gpuSkinningData.influences.insert(m_gpuSkinningData.influences.end(), normals[internal].begin(), normals[internal].end());
+        vertex.tangentBone = UINT32_MAX;
+        if (i < numExtTangents()) {
+            const TangData& basis = m_arrExtTangents[i];
+            vertex.tangent[0] = basis.tangent.x; vertex.tangent[1] = basis.tangent.y; vertex.tangent[2] = basis.tangent.z;
+            vertex.binormal[0] = basis.binormal.x; vertex.binormal[1] = basis.binormal.y; vertex.binormal[2] = basis.binormal.z;
+            vertex.flipped = ((basis.tangent ^ basis.binormal) * basis.tnormal) < 0;
+        }
+    }
+    if (!m_TangSkin.empty()) m_TangSkin.exportGpuBasis(m_gpuSkinningData.vertices);
+    return m_gpuSkinningData;
+}
+
+const SGpuSkinShadowData& CryGeometryInfo::getGpuShadowData(const IStencilShadowConnectivity* connectivity)
+{
+    if (m_gpuShadowData.key) return m_gpuShadowData;
+    const SGpuSkinningData& skin=getGpuSkinningData();
+    if (!connectivity->ExportGpuTopology(m_gpuShadowData.faces,m_gpuShadowData.edges)) return m_gpuShadowData;
+    for (unsigned i=0; i<m_gpuShadowData.faces.size(); ++i) {
+        unsigned internal=m_gpuShadowData.faces[i];
+        if (internal>=skin.internalToExternal.size() || skin.internalToExternal[internal]==UINT32_MAX) {
+            m_gpuShadowData.faces.clear(); m_gpuShadowData.edges.clear(); return m_gpuShadowData;
+        }
+        m_gpuShadowData.faces[i]=skin.internalToExternal[internal];
+    }
+    for (unsigned i=0; i<m_gpuShadowData.edges.size(); i+=4) {
+        if (m_gpuShadowData.edges[i]>=skin.internalToExternal.size() || m_gpuShadowData.edges[i+1]>=skin.internalToExternal.size() ||
+            skin.internalToExternal[m_gpuShadowData.edges[i]]==UINT32_MAX || skin.internalToExternal[m_gpuShadowData.edges[i+1]]==UINT32_MAX) {
+            m_gpuShadowData.faces.clear(); m_gpuShadowData.edges.clear(); return m_gpuShadowData;
+        }
+        m_gpuShadowData.edges[i]=skin.internalToExternal[m_gpuShadowData.edges[i]];
+        m_gpuShadowData.edges[i+1]=skin.internalToExternal[m_gpuShadowData.edges[i+1]];
+    }
+    m_gpuShadowData.key=AllocateGpuSkinningKey();
+    return m_gpuShadowData;
+}
+
 CryGeometryInfo::~CryGeometryInfo() 
 {
 	if (m_pStencilShadowConnectivity)

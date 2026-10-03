@@ -1,0 +1,24 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(set=0, binding=0, std430) readonly buffer Results { uint result[]; };
+layout(set=0, binding=1, std430) buffer Destination { uint destination[]; };
+layout(set=0, binding=2, std430) readonly buffer Mapping { uint mapping[]; };
+layout(push_constant) uniform Parameters {
+    uint resultOffset, firstVertex, vertexCount, destinationOffset;
+    uint stride, normalOffset, tangentOffset, reserved;
+} params;
+void main() {
+    uint vertex = gl_GlobalInvocationID.x;
+    if (vertex >= params.vertexCount) return;
+    uint sourceVertex = params.firstVertex+vertex;
+    if (params.reserved != 0xffffffffu) sourceVertex=mapping[params.reserved+sourceVertex];
+    uint sourceOffset = params.resultOffset+sourceVertex*20;
+    uint targetOffset = params.destinationOffset+vertex*params.stride;
+    for (uint axis=0; axis<3; ++axis) destination[targetOffset+axis] = result[sourceOffset+axis];
+    if (params.normalOffset != 0xffffffffu && result[sourceOffset+7] != 0)
+        for (uint axis=0; axis<3; ++axis) destination[targetOffset+params.normalOffset+axis] = result[sourceOffset+4+axis];
+    if (params.tangentOffset != 0xffffffffu)
+        for (uint vector=0; vector<3; ++vector)
+            for (uint axis=0; axis<3; ++axis)
+                destination[params.tangentOffset+vertex*9+vector*3+axis] = result[sourceOffset+8+vector*4+axis];
+}

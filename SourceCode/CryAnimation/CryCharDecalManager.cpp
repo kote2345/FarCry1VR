@@ -30,10 +30,12 @@ CryCharDecalManager::CryCharDecalManager (class CryGeometryInfo* pGeomInfo):
 	m_bNeedUpdateIndices (false)
 {
 	m_pShader = g_GetIRenderer()->EF_LoadShader("DecalCharacter", eSH_World, EF_SYSTEM);
+    m_gpuLifetime=std::make_shared<GpuLifetime>(this);
 }
 
 CryCharDecalManager::~CryCharDecalManager ()
 {
+    m_gpuLifetime->manager=nullptr;
 	DeleteLeafBuffer();
 	DeleteOldRenderElements();
 	
@@ -134,6 +136,8 @@ void CryCharDecalManager::Add (CryEngineDecalInfo& Decal)
 // discards the decal request queue (not yet realized decals added through Add())
 void CryCharDecalManager::DiscardRequests()
 {
+    m_gpuLifetime->manager=nullptr;
+    m_gpuLifetime=std::make_shared<GpuLifetime>(this);
 	m_arrDecalRequests.clear();
 }
 
@@ -141,6 +145,8 @@ void CryCharDecalManager::DiscardRequests()
 // cleans up all decals, destroys the vertex buffer
 void CryCharDecalManager::clear()
 {
+    m_gpuLifetime->manager=nullptr;
+    m_gpuLifetime=std::make_shared<GpuLifetime>(this);
 	m_arrDecalRequests.clear();
 	m_arrDecals.clear();
 	DeleteLeafBuffer();
@@ -182,6 +188,47 @@ void CryCharDecalManager::DeleteOldDecals()
 //////////////////////////////////////////////////////////////////////////
 // realizes (creates geometry for) unrealized(requested) decals
 // NOTE: this also fills  the UVs in for the vertex stream
+bool CryCharDecalManager::RealizeGpu(CVertexBuffer* source)
+{
+#if DECAL_USE_HELPERS
+    return false;
+#else
+    // New bullet footprints need the instantaneous hit pose for projection.
+    // Existing decal positions follow the shared GPU character result.
+    if (!m_arrDecalRequests.empty()) {
+        const std::shared_ptr<GpuLifetime> lifetime=m_gpuLifetime;
+        const std::vector<uint32_t> mapping=m_pGeometry->getGpuSkinningData().internalToExternal;
+        const std::vector<CryEngineDecalInfo> requests=m_arrDecalRequests;
+        if (!g_GetIRenderer()->QueueGpuSkinReadback(source,[lifetime,mapping,requests](const float* gpu, uint32_t count) {
+            CryCharDecalManager* manager=lifetime->manager;
+            if (!manager) return;
+            std::vector<Vec3> positions(mapping.size(),Vec3(zero));
+            for (unsigned i=0; i<mapping.size(); ++i)
+                if (mapping[i]<count) memcpy(&positions[i],gpu+mapping[i]*20,sizeof(Vec3));
+            manager->m_arrDecalRequests.insert(manager->m_arrDecalRequests.end(),requests.begin(),requests.end());
+            manager->RealizeNewDecalRequests(positions.data());
+        })) return false;
+        m_arrDecalRequests.clear();
+    }
+    DeleteOldRenderElements();
+    RefreshVertexBufferVertices(nullptr);
+    if (m_bNeedUpdateIndices) RefreshVertexBufferIndices();
+    CLeafBuffer* leaf = m_RE.getLeafBuffer();
+    bool queued = !leaf;
+    if (leaf && leaf->GetVertexContainer() && leaf->GetVertexContainer()->m_pVertexBuffer) {
+        std::vector<unsigned> mapping;
+        const std::vector<uint32_t>& internal = m_pGeometry->getGpuSkinningData().internalToExternal;
+        for (CDecalArray::const_iterator decal=m_arrDecals.begin(); decal!=m_arrDecals.end(); ++decal)
+            for (unsigned i=0; i<decal->numVertices(); ++i)
+                mapping.push_back(internal[decal->getVertex(i).nVertex]);
+        queued = mapping.empty() || g_GetIRenderer()->QueueGpuSkinningRemap(
+            leaf->GetVertexContainer()->m_pVertexBuffer, source, mapping.data(), (unsigned)mapping.size());
+    }
+    DeleteOldDecals();
+    return queued;
+#endif
+}
+
 void CryCharDecalManager::Realize (const Vec3d* pPositions)
 {
 	DeleteOldRenderElements();
@@ -294,8 +341,7 @@ void CryCharDecalManager::RefreshVertexBufferVertices (const Vec3d* pInPositions
 		for (unsigned nDecalVertex = 0; nDecalVertex < numDecalVertices; ++nDecalVertex)
 		{
 			const CryCharDecalVertex& rDecalVertex = itDecal->getVertex(nDecalVertex);
-			const Vec3d& vCharPosition = pInPositions[rDecalVertex.nVertex];
-			pDst->xyz = vCharPosition;
+			if (pInPositions) pDst->xyz = pInPositions[rDecalVertex.nVertex];
 			pDst->st[0] = rDecalVertex.uvNew.u;
 			pDst->st[1] = rDecalVertex.uvNew.v;
 			++pDst;
@@ -335,8 +381,7 @@ void CryCharDecalManager::RefreshVertexBufferVertices (const Vec3d* pInPositions
 		for (unsigned nDecalVertex = 0; nDecalVertex < numDecalVertices; ++nDecalVertex)
 		{
 			const CryCharDecalVertex& rDecalVertex = itDecal->getVertex(nDecalVertex);
-			const Vec3d& vCharPosition = pInPositions[rDecalVertex.nVertex];
-			pDst->xyz = vCharPosition;
+			if (pInPositions) pDst->xyz = pInPositions[rDecalVertex.nVertex];
 			pDst->color.dcolor = dwColor;
 			pDst->st[0] = (rDecalVertex.uvNew.u-0.5f) / fIntensity + 0.5f;
 			pDst->st[1] = (rDecalVertex.uvNew.v-0.5f) / fIntensity + 0.5f;

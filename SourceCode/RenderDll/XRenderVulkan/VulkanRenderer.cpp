@@ -722,6 +722,31 @@ private:
 class CVulkanRenderer final : public CNULLRenderer
 {
 public:
+    bool QueueGpuSkinning(CVertexBuffer* vertices, const SGpuSkinningData& mesh,
+                          const Matrix44* bones, unsigned count) override {
+        return m_frameRenderer && bones && m_frameRenderer->QueueGpuSkinning(vertices, mesh, bones->GetData(), count);
+    }
+    bool SupportsGpuSkinning() const override { return m_frameRenderer && m_frameRenderer->IsInitialized(); }
+    bool QueueGpuMorph(const void* vertices, const SGpuSkinningData& mesh, float weight, float normalAmplify) override {
+        return m_frameRenderer && m_frameRenderer->QueueGpuMorph(vertices, mesh, weight, normalAmplify);
+    }
+    bool QueueGpuSkinShadow(const void* identity, const void* source, const SGpuSkinningData& mesh,
+        const SGpuSkinShadowData& topology, const Matrix44* bones, unsigned count, const Vec3& light, float extent, unsigned first = 0) override {
+        return m_frameRenderer && m_frameRenderer->QueueGpuSkinShadow(identity,source,mesh,topology,bones->GetData(),count,&light.x,extent,first);
+    }
+    bool QueueGpuSkinReadback(const void* identity, const GpuSkinReadback& callback) override {
+        return m_frameRenderer && m_frameRenderer->QueueGpuSkinReadback(identity,callback);
+    }
+    void ClearGpuSkinning(const void* vertices) override {
+        if (m_frameRenderer) m_frameRenderer->ClearGpuSkinning(vertices);
+    }
+    bool QueueGpuSkinningRemap(CVertexBuffer* vertices, CVertexBuffer* source, const unsigned* map, unsigned count) override {
+        return m_frameRenderer && m_frameRenderer->QueueGpuSkinningRemap(vertices, source, map, count);
+    }
+    void ReleaseBuffer(CVertexBuffer* vertices) override {
+        ClearGpuSkinning(vertices);
+        CNULLRenderer::ReleaseBuffer(vertices);
+    }
     explicit CVulkanRenderer(CryVR::VulkanFrameRenderer* frameRenderer)
         : m_frameRenderer(frameRenderer)
     {
@@ -8609,7 +8634,7 @@ public:
                 4.0f,
                 hasWaterReflectionTransform ? waterReflectionModelView : nullptr,
                 hasWaterReflectionTransform ? waterReflectionClipPlane : nullptr,
-                waterReflectionUpdatePtr);
+                waterReflectionUpdatePtr, vertices);
             // Auxiliary and subsequent material draws must not inherit this array.
             m_frameRenderer->SetStockProfilePlants(false);
             m_frameRenderer->SetStockDecalDraw(false);
@@ -11385,6 +11410,7 @@ private:
                 break;
             }
         }
+        m_frameRenderer->SetStockGpuSkinIdentity(shadow);
         const bool queued = m_frameRenderer->QueueStockClientIndexedDraw(
             vertices->m_VS[VSF_GENERAL].m_VData,
             static_cast<uint32_t>(vertices->m_NumVerts),
@@ -11395,6 +11421,7 @@ private:
             DEF_TEXARG0, DEF_TEXARG0, 0xffffffffu,
             DEF_TEXARG0, DEF_TEXARG0, 0xffffffffu,
             stencilState, 0, 0xffffffffu, modelView, identity, identity);
+        m_frameRenderer->SetStockGpuSkinIdentity(nullptr);
         shadow->m_nCurrInst = -1;
         return queued;
     }

@@ -21,6 +21,7 @@ CryCharReShadowVolume::~CryCharReShadowVolume()
 
 void CryCharReShadowVolume::clear()
 {
+    m_gpuChildren.clear();
 	if (m_pLeafBuffer)
 	{
 		g_GetIRenderer()->DeleteLeafBuffer (m_pLeafBuffer);
@@ -41,6 +42,8 @@ void CryCharReShadowVolume::clear()
 // numIndices is the minimal length of the index buffer
 void CryCharReShadowVolume::prepare (unsigned numIndices, unsigned numVertices)
 {
+    m_gpuSubmission = false;
+    m_gpuChildren.clear();
 	bool bRecreate = false;
 
 	m_nUsedMeshVertices = numVertices;
@@ -88,8 +91,41 @@ void CryCharReShadowVolume::prepare (unsigned numIndices, unsigned numVertices)
 
 
 // assuming the calculation of the shadow volume is finished, submits it to the renderer
+bool CryCharReShadowVolume::prepareGpu(unsigned count)
+{
+    if (!count) return false;
+    // Keep each 16-bit indexed draw on whole triangles. Large volumes remain
+    // GPU generated rather than dropping back to CPU silhouette/deformation.
+    if (count>65532) {
+        const unsigned parts=(count+65531)/65532;
+        if (m_gpuChildren.size()!=parts) {
+            m_gpuChildren.clear();
+            for (unsigned i=0;i<parts;++i) m_gpuChildren.emplace_back(new CryCharReShadowVolume);
+        }
+        for (unsigned i=0;i<parts;++i)
+            if (!m_gpuChildren[i]->prepareGpu(std::min(65532u,count-i*65532))) return false;
+        m_gpuCount=count; m_gpuSubmission=true; return true;
+    }
+    prepare(count,count);
+    if (!m_pLeafBuffer || !m_pMesh) return false;
+    if (m_gpuCount != count || !m_pLeafBuffer->m_Indices.m_VData) {
+        for (unsigned i=0; i<count; ++i) { m_arrVertices[i]=Vec3(zero); m_arrIndices[i]=(unsigned short)i; }
+        m_pLeafBuffer->UpdateSysVertices(&m_arrVertices[0],count);
+        m_pLeafBuffer->UpdateSysIndices(&m_arrIndices[0],count);
+        m_gpuCount=count;
+    }
+    m_gpuSubmission=true;
+    return true;
+}
+
 void CryCharReShadowVolume::submit (const SRendParams *rParams, IShader* pShadowCull)
 {
+    if (m_gpuSubmission && !m_gpuChildren.empty()) {
+        for (auto& child : m_gpuChildren) child->submit(rParams,pShadowCull);
+        m_nLastFrameSubmitted=g_GetIRenderer()->GetFrameID();
+        m_fLastTimeSubmitted=g_GetTimer()->GetCurrTime();
+        return;
+    }
 #ifdef _DEBUG
 	{
 		for (int i = 0; i < m_pLeafBuffer->m_Indices.m_nItems; ++i)
@@ -119,8 +155,11 @@ void CryCharReShadowVolume::submit (const SRendParams *rParams, IShader* pShadow
   // update verts in system buffer
   // it's better to make call back function and write directly into video memory
   // indices are passed to CRETriMeshShadow by pointer as before
-  m_pLeafBuffer->UpdateSysVertices(&m_arrVertices[0],numMeshVertices());
-  m_pLeafBuffer->UpdateSysIndices(&m_arrIndices[0],m_pMesh->m_nRendIndices);
+  if (!m_gpuSubmission) {
+      m_gpuCount=0;
+      m_pLeafBuffer->UpdateSysVertices(&m_arrVertices[0],numMeshVertices());
+      m_pLeafBuffer->UpdateSysIndices(&m_arrIndices[0],m_pMesh->m_nRendIndices);
+  }
 
 	IShader * pSHStencil = g_GetIRenderer()->EF_LoadShader("<Stencil>", eSH_World, EF_SYSTEM);
 	g_GetIRenderer()->EF_AddEf(0, (CRendElement *)m_pMesh , pSHStencil, NULL, pObj, -1, pShadowCull, rParams->nSortValue);		
@@ -135,6 +174,7 @@ void CryCharReShadowVolume::GetMemoryUsage (ICrySizer* pSizer)
 	pSizer->Add(*this);
 	pSizer->AddContainer(m_arrIndices);
 	pSizer->AddContainer(m_arrVertices);
+    for (auto& child : m_gpuChildren) child->GetMemoryUsage(pSizer);
 }
 
 

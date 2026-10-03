@@ -65,6 +65,25 @@ void CrySkinRigidBasis::CStatistics::addDest(unsigned nDest)
 
 // does the skinning out of the given array of global matrices:
 // calculates the bases and fills the PipVertices in
+void CrySkinRigidBasis::exportGpuBasis(std::vector<SGpuSkinVertex>& output) const
+{
+    unsigned vertex = 0, aux = 0;
+    for (unsigned bone = m_numSkipBones; bone < m_numBones; ++bone)
+        for (unsigned flipped = 0; flipped < 2; ++flipped) {
+            const unsigned count = m_arrAux[aux++];
+            for (unsigned i = 0; i < count; ++i, vertex += 2) {
+                const unsigned destination = (m_arrVertices[vertex].nDest & 0xFFFFFF) / sizeof(SPipTangentsA);
+                assert(destination < output.size());
+                SGpuSkinVertex& result = output[destination];
+                const Vec3& tangent = m_arrVertices[vertex].pt;
+                const Vec3& binormal = m_arrVertices[vertex + 1].pt;
+                result.tangent[0] = tangent.x; result.tangent[1] = tangent.y; result.tangent[2] = tangent.z;
+                result.binormal[0] = binormal.x; result.binormal[1] = binormal.y; result.binormal[2] = binormal.z;
+                result.tangentBone = bone; result.flipped = flipped;
+            }
+        }
+}
+
 void CrySkinRigidBasis::skin (const Matrix44* pBones, SPipTangentsA* pDest)const
 {
 #ifdef DEFINE_PROFILER_FUNCTION

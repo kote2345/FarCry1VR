@@ -224,15 +224,17 @@ bool VulkanContext::Initialize(const Runtime& runtime)
     m_getPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &queueFamilyCount, queueFamilies.data());
     for (uint32_t i = 0; i < queueFamilyCount; ++i)
     {
-        if ((queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0 && queueFamilies[i].queueCount > 0)
+        if ((queueFamilies[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
+            (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT) && queueFamilies[i].queueCount > 0)
         {
             m_graphicsQueueFamily = i;
             break;
         }
     }
-    if ((queueFamilies[m_graphicsQueueFamily].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0)
+    if ((queueFamilies[m_graphicsQueueFamily].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) !=
+        (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
     {
-        SetError("Vulkan device has no graphics queue");
+        SetError("Vulkan device has no graphics/compute queue");
         Shutdown();
         return false;
     }

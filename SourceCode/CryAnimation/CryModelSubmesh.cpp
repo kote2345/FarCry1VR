@@ -565,6 +565,25 @@ void CryModelSubmesh::Deform( int nLodToDeform, unsigned nDeformFlags)
 	// get vertices of selected lod
 	CryGeometryInfo * pGeomInfo = m_pMesh->getGeometryInfo(nLodToDeform);
 
+    // Pose capture has no GPU fence/readback. All material passes consume the
+    // same GPU deformation, including normals and tangent handedness.
+    bool gpuSkinned = g_GetIRenderer()->SupportsGpuSkinning() && m_pMesh->numBoneInfos() &&
+        !g_GetCVars()->r_ShowNormals() && !g_GetCVars()->r_ShowTangents() &&
+        g_GetIRenderer()->QueueGpuSkinning(pRenderVertexBuffer, pGeomInfo->getGpuSkinningData(),
+            m_pParent->getBoneGlobalMatrices(), m_pMesh->numBoneInfos());
+    if (gpuSkinned && nLodToDeform == 0 && NeedMorph() && !g_GetCVars()->ca_NoMorph())
+        for (unsigned i=0; i<m_arrMorphEffectors.size(); ++i) {
+            const CryModEffMorph& effector=m_arrMorphEffectors[i];
+            if (effector.getMorphTargetId()<0) continue;
+            const CrySkinMorph& morph=m_pMesh->getMorphSkin(0,effector.getMorphTargetId());
+            if (!g_GetIRenderer()->QueueGpuMorph(pRenderVertexBuffer,
+                morph.getGpuSkinningData(pGeomInfo->getExtToIntMapEntries(),pGeomInfo->numExtToIntMapEntries()),
+                effector.getBlending(), float(g_GetCVars()->ca_MorphNormals()))) { gpuSkinned=false; break; }
+        }
+    if (!gpuSkinned) g_GetIRenderer()->ClearGpuSkinning(pRenderVertexBuffer);
+    if (gpuSkinned && bRealizeDecals && m_pDecalManager->RealizeGpu(pRenderVertexBuffer))
+        bRealizeDecals = false;
+
 	const CryUV* pExtUVs = pGeomInfo->getExtUVs();
 
 	TangData * pExtTangents = pGeomInfo->getExtTangents();
@@ -574,6 +593,18 @@ void CryModelSubmesh::Deform( int nLodToDeform, unsigned nDeformFlags)
 	CrySkinRigidBasis* pTangSkin = NULL;
 
 	bool bSpawnParticles = !m_pParent->m_ParticleManager.empty() && m_nLastSkinnedFrameID[nLodToDeform] < nFrameId;
+    if (gpuSkinned && bSpawnParticles) {
+        CryCharParticleManager::SpawnParams params;
+        params.setVertices(nullptr,pGeomInfo->numUsedVertices());
+        params.setFaces(pGeomInfo->getFaces(),pGeomInfo->numFaces());
+        params.pModelMatrix=&m_pParent->m_ModelMatrix44;
+        params.pNormalsA16=nullptr;
+        params.pBoneGlobalMatrices=m_pParent->getBoneGlobalMatrices();
+        params.numBoneMatrices=m_pMesh->numBoneInfos();
+        if (m_pParent->m_ParticleManager.spawnGpu(params,pRenderVertexBuffer,pGeomInfo->getGpuSkinningData()))
+            bSpawnParticles=false;
+    }
+    if (gpuSkinned && !bRealizeDecals && !bSpawnParticles) return;
 
 	// the tangents will be skinned here; if it remains NULL, they won't be skinned at all
 	SPipTangentsA* pTangentBases = NULL;
@@ -612,14 +643,14 @@ void CryModelSubmesh::Deform( int nLodToDeform, unsigned nDeformFlags)
 	//----------------------------------------------------------------
 
 	Vec3dA16* pNormals = NULL;
-	if ((nDeformFlags&FLAG_DEFORM_UPDATE_NORMALS))
+	if ((nDeformFlags&FLAG_DEFORM_UPDATE_NORMALS) && (!gpuSkinned || bSpawnParticles))
 		pNormals = SelfNormalSkin (nLodToDeform, (((Vec3dA16*)g_Temp.data())+pGeomInfo->numUsedVertices()));
 
 	// most probably we'll skin here; sometimes we don't skin and just change the pointer tothe original geometry data
 	// so, get the pointer to the skin. SelfSkin can also modify normals according to morph targets
 	const Vec3d* pVertices = NULL;
 
-	if ((nDeformFlags&FLAG_DEFORM_UPDATE_VERTICES) || bRealizeDecals || bSpawnParticles)
+	if ((!gpuSkinned && (nDeformFlags&FLAG_DEFORM_UPDATE_VERTICES)) || bRealizeDecals || bSpawnParticles)
 		pVertices = SelfSkin(nLodToDeform, (Vec3d*)g_Temp.data(), pNormals);
 
 	if (bRealizeDecals)
@@ -640,10 +671,11 @@ void CryModelSubmesh::Deform( int nLodToDeform, unsigned nDeformFlags)
 		m_pParent->m_ParticleManager.spawn (params);
 	}
 
-//----------------------------------------------------------------------------------
+	//----------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------
 
+    if (gpuSkinned) return;
 	Vec3d* pVideobuffer = (Vec3d*)pRenderVertexBuffer->m_VS[VSF_GENERAL].m_VData;
 	
 	unsigned numVerts = (unsigned)lb->m_SecVertCount;
@@ -998,7 +1030,6 @@ void CryModelSubmesh::RenderShadowVolumes (const SRendParams *rParams, int nLimi
 
 	unsigned numVertices = m_pMesh->getGeometryInfo(nShadowLOD)->numUsedVertices();
 	// compute the deformed character vertices; the character will keep the allocated buffer itself (it won't be allocated)
-	const Vec3d* pModelVerts = DeformForShadowVolume(nShadowLOD);
 
 //	Vec3d vLightPos = rParams->lSource->m_Origin;
 	Vec3d vLightPos = rParams->pShadowVolumeLightSource->m_Origin;
@@ -1026,6 +1057,39 @@ void CryModelSubmesh::RenderShadowVolumes (const SRendParams *rParams, int nLimi
 		vLightTrans.z);
 
 	if(!pConnectivity)return;		// nothing more to do
+
+    if (g_GetIRenderer()->SupportsGpuSkinning() && m_pMesh->numBoneInfos()) {
+        CryGeometryInfo* geometry=m_pMesh->getGeometryInfo(nShadowLOD);
+        const SGpuSkinShadowData& topology=geometry->getGpuShadowData(pConnectivity);
+        unsigned count=6u*(unsigned)(topology.faces.size()/3+topology.edges.size()/4);
+        bool queued=topology.key && pReShadowVolume->prepareGpu(count);
+        unsigned first=0;
+        if (queued) for (unsigned part=0;part<pReShadowVolume->getGpuPartCount();++part) {
+            CryCharReShadowVolume* volume=pReShadowVolume->getGpuPart(part);
+            queued=g_GetIRenderer()->QueueGpuSkinShadow(volume->getRenderIdentity(),m_pLeafBuffers[nShadowLOD],
+                geometry->getGpuSkinningData(),topology,m_pParent->getBoneGlobalMatrices(),
+                m_pMesh->numBoneInfos(),vLSourcePos,fShadowVolumeExtent,first);
+            if (!queued) break;
+            first+=volume->getGpuVertexCount();
+        }
+        if (queued) {
+            if (nShadowLOD==0 && !g_GetCVars()->ca_NoMorph())
+                for (unsigned i=0; i<m_arrMorphEffectors.size(); ++i) {
+                    const CryModEffMorph& effector=m_arrMorphEffectors[i];
+                    if (effector.getMorphTargetId()<0) continue;
+                    if (!g_GetIRenderer()->QueueGpuMorph(m_pLeafBuffers[nShadowLOD],
+                        m_pMesh->getMorphSkin(0,effector.getMorphTargetId()).getGpuSkinningData(
+                            geometry->getExtToIntMapEntries(),geometry->numExtToIntMapEntries()),effector.getBlending(),float(g_GetCVars()->ca_MorphNormals()))) { queued=false; break; }
+                }
+            if (queued) {
+                pReShadowVolume->submit(rParams,m_pParent->m_pShaderStateShadowCull);
+                return;
+            }
+            for (unsigned part=0;part<pReShadowVolume->getGpuPartCount();++part)
+                g_GetIRenderer()->ClearGpuSkinning(pReShadowVolume->getGpuPart(part)->getRenderIdentity());
+        }
+    }
+    const Vec3d* pModelVerts = DeformForShadowVolume(nShadowLOD);
 
 	// deformed model vertices
 	iEdgeDetector->BuildSilhuetteFromPos (pConnectivity, vLSourcePos, pModelVerts);

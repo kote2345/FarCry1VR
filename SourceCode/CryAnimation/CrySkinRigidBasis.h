@@ -2,6 +2,7 @@
 #define _CRY_ANIMATION_CRY_SKIN_RIGID_BASIS_HDR_
 
 #include "CrySkinBase.h"
+#include "GpuSkinning.h"
 
 
 //////////////////////////////////////////////////////////////////////////
@@ -17,6 +18,7 @@
 class CrySkinRigidBasis: public CrySkinBase
 {
 public:
+    void exportGpuBasis(std::vector<SGpuSkinVertex>& output) const;
 	// returns the size of the skin, the number of bases being calculated
 	// by this skin. The bases are calculated into a 0-base continuous array
 	// tangents may be divided into subskins, each having different number of bases
