@@ -37,9 +37,11 @@ void main() {
     tangentLight=vec3(0.0,0.0,1.0);
     tangentView=vec3(0.0,0.0,1.0);
     if ((mask&0x1001u)!=0u) {
-        vec3 normal=length(inNormal)>1.e-6 ? normalize(inNormal) : vec3(0.0,0.0,1.0);
+        float normalLengthSquared=dot(inNormal,inNormal);
+        vec3 normal=normalLengthSquared>1.e-12 ? inNormal*inversesqrt(normalLengthSquared) : vec3(0.0,0.0,1.0);
         vec3 binormal=cross(vec3(0.0,1.0,0.0),normal);
-        binormal=length(binormal)>1.e-6 ? normalize(binormal) : vec3(1.0,0.0,0.0);
+        float binormalLengthSquared=dot(binormal,binormal);
+        binormal=binormalLengthSquared>1.e-12 ? binormal*inversesqrt(binormalLengthSquared) : vec3(1.0,0.0,0.0);
         vec3 tangent=cross(normal,binormal);
         if ((mask&1u)!=0u) {
             vec3 light=scene.terrainProjectionS[4].xyz;

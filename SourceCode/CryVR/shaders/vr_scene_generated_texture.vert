@@ -48,6 +48,7 @@ layout(push_constant) uniform SceneTransform {
 } transformData;
 #include "scene_stereo.glsl"
 #include "scene_vertex_lighting.glsl"
+layout(constant_id = 79) const bool stockNativeTerrain = false;
 void main() {
     gl_Position = stockStereoMvp() * vec4(inPosition, 1.0);
     clipPosition = objectPosition = inPosition;
@@ -70,7 +71,7 @@ void main() {
     stockSeparateSpecular = vec3(0.0);
 #ifdef VR_GENERATED_NORMAL
     objectNormal = inNormal;
-    bool vertexLighting = textureStageTransforms.materialAmbient.w > 1.5;
+    bool vertexLighting = stockVertexLightingMode() > 1.5;
     hasMaterialLighting = vertexLighting ? 0u : 1u;
     if (vertexLighting) {
         vertexColor.rgb = evaluateStockVertexLighting(inPosition, inNormal, stockSeparateSpecular);
@@ -79,5 +80,26 @@ void main() {
 #else
     objectNormal = vec3(0.0);
     hasMaterialLighting = 2u;
+#endif
+#if defined(VR_GENERATED_NORMAL) && defined(VR_GENERATED_SECONDARY)
+    if (stockNativeTerrain) {
+        texCoord = vec2(dot(textureStageTransforms.terrainProjectionS[0], vec4(inPosition, 1.0)),
+                        dot(textureStageTransforms.terrainProjectionT[0], vec4(inPosition, 1.0)));
+        vec4 cameraFade = textureStageTransforms.fixedMatrices[1][0];
+        uint mode = uint(textureStageTransforms.fixedMatrices[1][1].x);
+        if (mode == 2u || mode == 3u) vertexColor.rgb = inColor.aaa;
+        if (mode == 3u || mode == 4u) {
+            vec3 delta = cameraFade.xyz - inPosition;
+            float fade = min(dot(delta, delta) / (cameraFade.w * cameraFade.w), 1.0);
+            fade *= fade;
+            // Match the previous byte conversion before UNORM interpolation.
+            if (mode == 3u) secondaryColor.rgb = floor(inColor.rgb * (255.0 * fade)) / 255.0;
+            else {
+                vec4 weights = floor(inSecondaryColor * (255.0 * fade)) / 255.0;
+                vertexColor.ba = weights.ra;
+                secondaryColor.bg = weights.gb;
+            }
+        }
+    }
 #endif
 }

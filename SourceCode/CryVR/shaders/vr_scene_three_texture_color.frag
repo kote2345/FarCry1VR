@@ -142,7 +142,7 @@ void main() {
     }
     if (stockFragmentDiscardEnabled && dot(vec4(clipPosition, 1.0), textureStageTransforms.clipPlane) < 0.0) discard;
     vec4 generatedVertexColor = vertexColor;
-    if (textureStageTransforms.materialParams.w > 0.5 && textureStageTransforms.materialParams.w < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
+    if (stockMaterialColorMode() > 0.5 && stockMaterialColorMode() < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
     vec4 primaryColor = mix(generatedVertexColor, textureStageTransforms.primaryColor, textureStageTransforms.primaryColorMask);
     if (!stockFeatureDisabled(STOCK_NO_FRAGMENT_LIGHTING))
         primaryColor.rgb *= evaluateStockLighting(objectPosition, objectNormal,
@@ -220,7 +220,7 @@ void main() {
         vec3 detail2 = mix(vec3(0.5), tertiary.rgb, secondaryColor.g);
         color = vec4(detail0 * detail1 * detail2 * 4.0, 1.0);
     }
-    if (!stockFeatureDisabled(STOCK_NO_TERRAIN) && textureStageTransforms.materialParams.w > 2.5 && stockTerrainOnlyCount() == 0) {
+    if (!stockFeatureDisabled(STOCK_NO_TERRAIN) && stockMaterialColorMode() > 2.5 && stockTerrainOnlyCount() == 0) {
         vec3 detail0 = mix(vec3(0.5), base.rgb, secondaryColor.r);
         vec3 detail1 = mix(vec3(0.5), layer.rgb, secondaryColor.g);
         vec3 detail2 = mix(vec3(0.5), tertiary.rgb, secondaryColor.b);
@@ -238,7 +238,7 @@ void main() {
     color = applyMaterialOverrides(color);
     if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(color.a, textureStageTransforms.materialParams.y, alphaTestMode)) discard;
     color.rgb += stockSeparateSpecular;
-    if (textureStageTransforms.materialAmbient.w > 1.5)
+    if (stockMaterialLightingMode() > 1.5)
         color.rgb = clamp(color.rgb, 0.0, 1.0);
     outColor = applySceneFog(color);
 }

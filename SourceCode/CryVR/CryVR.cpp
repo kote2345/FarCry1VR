@@ -572,7 +572,7 @@ bool Runtime::CreateVulkanSwapchain(int64_t format, uint32_t width, uint32_t hei
         return false;
     XrSwapchainCreateInfo createInfo{};
     createInfo.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
-    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
     createInfo.format = format;
     createInfo.sampleCount = 1;
     createInfo.width = width;
@@ -580,8 +580,16 @@ bool Runtime::CreateVulkanSwapchain(int64_t format, uint32_t width, uint32_t hei
     createInfo.faceCount = 1;
     createInfo.arraySize = arraySize;
     createInfo.mipCount = 1;
-    if (!Check(m_createSwapchain(m_session, &createInfo, &swapchain.handle), "xrCreateSwapchain"))
-        return false;
+    // Prefer a bit-exact image transfer over a full-screen texture pass. A
+    // runtime that rejects this usage retains the original rendering path.
+    XrResult created = m_createSwapchain(m_session, &createInfo, &swapchain.handle);
+    swapchain.transferDestination = created == XR_SUCCESS;
+    if (created != XR_SUCCESS)
+    {
+        createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        created = m_createSwapchain(m_session, &createInfo, &swapchain.handle);
+    }
+    if (!Check(created, "xrCreateSwapchain")) return false;
 
     uint32_t imageCount = 0;
     if (!Check(m_enumerateSwapchainImages(swapchain.handle, 0, &imageCount, nullptr), "xrEnumerateSwapchainImages"))

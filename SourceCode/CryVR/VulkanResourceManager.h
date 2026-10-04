@@ -15,6 +15,7 @@ struct VulkanBuffer
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
+    VkDeviceSize uploadedEnd = 0;
     VkMemoryPropertyFlags memoryProperties = 0;
     void* mappedData = nullptr;
 };
@@ -55,7 +56,7 @@ public:
     bool CreateBufferWithData(const void* data, VkDeviceSize size,
                               VkBufferUsageFlags usage, VulkanBuffer& buffer);
     bool UploadBuffer(VulkanBuffer& buffer, const void* data, VkDeviceSize size,
-                      VkDeviceSize offset = 0);
+                      VkDeviceSize offset = 0, bool appendOnly = false);
     void DestroyBuffer(VulkanBuffer& buffer);
 
     bool CreateTextureRGBA8(const void* rgbaData, uint32_t width, uint32_t height,

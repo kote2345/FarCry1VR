@@ -141,19 +141,29 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = desc.fragmentShader;
     stages[1].pName = desc.fragmentEntry;
-    const uint32_t vertexSpecializationData[3] = {
-        desc.multiview ? 1u : 0u, desc.stockWaterProgram, desc.stockTerrainLayerMask
+    uint32_t vertexSpecializationData[9] = {
+        desc.multiview ? 1u : 0u, desc.stockWaterProgram, desc.stockTerrainLayerMask,
+        desc.stockFogMode, 0, desc.stockFixedLightCount, 0, desc.stockEnhancedSurfaces ? 1u : 0u,
+        desc.stockNativeTerrain ? 1u : 0u
     };
-    VkSpecializationMapEntry vertexEntries[3] = {
+    std::memcpy(&vertexSpecializationData[4], &desc.stockMaterialLightingMode, sizeof(float));
+    std::memcpy(&vertexSpecializationData[6], &desc.stockTerrainMarker, sizeof(float));
+    VkSpecializationMapEntry vertexEntries[9] = {
         {63, 0, sizeof(uint32_t)}, {67, sizeof(uint32_t), sizeof(uint32_t)},
-        {68, 2 * sizeof(uint32_t), sizeof(uint32_t)}
+        {68, 2 * sizeof(uint32_t), sizeof(uint32_t)},
+        {69, 3 * sizeof(uint32_t), sizeof(uint32_t)},
+        {72, 4 * sizeof(uint32_t), sizeof(uint32_t)},
+        {76, 5 * sizeof(uint32_t), sizeof(uint32_t)},
+        {71, 6 * sizeof(uint32_t), sizeof(uint32_t)},
+        {77, 7 * sizeof(uint32_t), sizeof(uint32_t)},
+        {79, 8 * sizeof(uint32_t), sizeof(uint32_t)}
     };
     VkSpecializationInfo stereoSpecialization{
-        3, vertexEntries, sizeof(vertexSpecializationData), vertexSpecializationData
+        9, vertexEntries, sizeof(vertexSpecializationData), vertexSpecializationData
     };
     if (desc.supportsStereoTransform)
         stages[0].pSpecializationInfo = &stereoSpecialization;
-    uint32_t specializationData[75] = {
+    uint32_t specializationData[79] = {
         static_cast<uint32_t>(legacyState.alphaTest), desc.stage0ColorMode, desc.stage0AlphaMode,
         desc.stage1ColorMode, desc.stage1AlphaMode, desc.stage0ColorArg, desc.stage0AlphaArg,
         desc.stage0Constant, desc.stage1ColorArg, desc.stage1AlphaArg, desc.stage1Constant,
@@ -206,7 +216,10 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
     std::memcpy(&specializationData[72], &desc.stockMaterialLightingMode, sizeof(float));
     std::memcpy(&specializationData[73], &desc.stockMaterialColorMode, sizeof(float));
     specializationData[74] = desc.stockMaterialNormalMode;
-    VkSpecializationMapEntry specializationEntries[75]{};
+    specializationData[75] = desc.stockTextureTransformFlags;
+    specializationData[77] = desc.stockEnhancedSurfaces ? 1u : 0u;
+    specializationData[78] = desc.stockPlantImplicitLod ? 1u : 0u;
+    VkSpecializationMapEntry specializationEntries[79]{};
     VkSpecializationInfo alphaTestSpecialization{};
     uint32_t specializationCount = 0;
     if (desc.supportsDiscardSpecialization || desc.supportsAlphaTest || desc.supportsStage0Combine || desc.supportsStage1Combine ||
@@ -229,6 +242,9 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
             addSpecialization(72, 72);
             addSpecialization(73, 73);
             addSpecialization(74, 74);
+            addSpecialization(75, 75);
+            addSpecialization(77, 77);
+            addSpecialization(78, 78);
         }
         if (desc.supportsStage0Combine)
         {
@@ -457,6 +473,11 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
     colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     colorBlend.attachmentCount = 1;
     colorBlend.pAttachments = &blendAttachment;
+    // Stock scene shaders have no storage side effects or depth output.
+    // With color writes masked and no alpha/clip discard, depth/stencil work
+    // needs no fragment stage, texture fetches, lighting or fog at all.
+    const bool depthStencilOnly = desc.supportsDiscardSpecialization &&
+        !desc.fragmentDiscardEnabled && blendAttachment.colorWriteMask == 0;
 
     VkPipelineDynamicStateCreateInfo dynamic{};
     VkDynamicState dynamicStates[5];
@@ -481,7 +502,7 @@ bool VulkanPipelineFactory::CreateGraphicsPipeline(const VulkanGraphicsPipelineD
 
     VkGraphicsPipelineCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    createInfo.stageCount = 2;
+    createInfo.stageCount = depthStencilOnly ? 1u : 2u;
     createInfo.pStages = stages;
     createInfo.pVertexInputState = &vertexInput;
     createInfo.pInputAssemblyState = &inputAssembly;

@@ -1,4 +1,5 @@
 #include "VulkanFrameRenderer.h"
+#include "VulkanRenderQuality.h"
 #include "VulkanPanelShaders.h"
 #include "VulkanSceneShaders.h"
 #include "VulkanGeneratedTexgenShaders.h"
@@ -34,6 +35,8 @@ namespace
 constexpr uint32_t kGpuTimestampQueriesPerView = 4;
 constexpr uint32_t kGpuTimingPhases = 3;
 constexpr uint32_t kGpuProfileMaxDraws = 4096;
+constexpr uint32_t kGpuAbGroupCount = 12;
+constexpr uint32_t kGpuAbPairCount = kGpuAbGroupCount * 2;
 struct StockStereoTransform {
     float mvp[2][16]; float reflectionMvp[2][16];
     float plantsAmbient[4]; float plantsBend[4];
@@ -625,6 +628,37 @@ bool VulkanFrameRenderer::Initialize(Runtime& runtime, VulkanContext& context)
         renderPassInfo.pNext = nullptr;
     }
 
+    m_initialClearPasses[0] = m_loadRenderPass;
+    m_initialClearPasses[7] = m_renderPass;
+    m_multiviewInitialClearPasses[0] = m_multiviewLoadRenderPass;
+    m_multiviewInitialClearPasses[7] = m_multiviewRenderPass;
+    for (uint32_t mask = 1; mask < 7; ++mask)
+    {
+        // Clearing color/depth must not require clearing stencil as well.
+        // Keeping LOAD for the whole attachment followed by ClearAttachments
+        // needlessly imports the preceding frame into mobile tile memory.
+        VkAttachmentDescription partial[2] = {loadAttachments[0], loadAttachments[1]};
+        partial[0].loadOp = mask & 1u ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        partial[1].loadOp = mask & 2u ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        partial[1].stencilLoadOp = hasStencil ?
+            (mask & 4u ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD) : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        // Depth and stencil share an image layout. Preserve its defined layout
+        // even when only one of these two aspects is being cleared.
+        renderPassInfo.pAttachments = partial;
+        if (m_createRenderPass(context.GetDevice(), &renderPassInfo, nullptr,
+                              &m_initialClearPasses[mask]) != VK_SUCCESS)
+        { SetError("partial scene clear render pass creation failed"); Shutdown(); return false; }
+        if (m_multiview)
+        {
+            renderPassInfo.pNext = &multiviewInfo;
+            const VkResult result = m_createRenderPass(context.GetDevice(), &renderPassInfo, nullptr,
+                                                       &m_multiviewInitialClearPasses[mask]);
+            renderPassInfo.pNext = nullptr;
+            if (result != VK_SUCCESS)
+            { SetError("multiview partial scene clear creation failed"); Shutdown(); return false; }
+        }
+    }
+
     VkAttachmentDescription outputAttachment{};
     outputAttachment.format = m_format;
     outputAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -710,6 +744,8 @@ bool VulkanFrameRenderer::Initialize(Runtime& runtime, VulkanContext& context)
         {
             m_resources->DestroyBuffer(m_dynamicVertexBuffer);
             m_resources->DestroyBuffer(m_dynamicIndexBuffer);
+            m_resources->DestroyBuffer(m_staticVertexArena);
+            m_resources->DestroyBuffer(m_staticIndexArena);
         }
     }
     m_referenceHeadPoseValid = false;
@@ -1123,7 +1159,8 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
     // the same attribute-safe variant instead of a shader reading location 3.
     const bool externalStage0Uv = textureStage0UsesTexCoord1 &&
         lightmapTexCoordBuffer && lightmapTexCoordBuffer->buffer;
-    const bool useGeneratedNoUv = (hasLinearTexgen || externalStage0Uv) &&
+    const bool useGeneratedNoUv = (hasLinearTexgen || externalStage0Uv ||
+        (terrainProjection && m_stockNativeTerrainMode)) &&
         !HasVulkanTextureCoordinate(vertexFormat) && !waterEffect;
     const bool textureExpected = (programmableMaterial || useGeneratedNoUv || HasVulkanTextureCoordinate(vertexFormat)) && textureId > 0;
     // An unsupported legacy image format must not discard the entire world
@@ -1526,8 +1563,11 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         if (stockLightingMode < 0.5f ||
             (stockLightingMode > 1.5f && HasVulkanVertexNormal(vertexFormat) && !useNormalMap))
             stockShaderDisabledFeatures |= 1u;
-        // Specular programs also use the terrain payload for CameraPos/LightPos.
-        if (!terrainProjection && stockLightingMode < 0.5f)
+        // Specular stores CameraPos/LightPos in the same UBO payload, but
+        // accesses those rows directly. It is not terrain: interpreting its
+        // light radius as a terrain marker both retains expensive branches
+        // and misclassifies lights with radii near 100/200/300/400.
+        if (!terrainProjection)
             stockShaderDisabledFeatures |= 2u;
         if (!hasLinearTexgen) stockShaderDisabledFeatures |= 4u;
         if (!m_stockShadowStageMask) stockShaderDisabledFeatures |= 8u;
@@ -1536,7 +1576,7 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
             m_legacyTextures.find(m_stockProjectorTextureId) == m_legacyTextures.end())
             stockShaderDisabledFeatures |= 32u;
         if (directionalLightmap && (stockShaderDisabledFeatures & 2u) &&
-            !useFifthToEighthTexture)
+            !useFifthToEighthTexture && !m_stockShadowStageMask)
             stockShaderDisabledFeatures |= 64u;
     }
     if (m_stockFarSprites) stockShaderDisabledFeatures |= 128u;
@@ -1552,8 +1592,8 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
     pipelineKey[7] = pipelineKey[10] = pipelineKey[18] = pipelineKey[24] = 0;
     // Lighting programs can repurpose T[7].w below for specular data.
     // Specialize only the unchanged terrain/base-pass payload.
-    const float stockTerrainMarker = stockLightingMode < 0.5f ?
-        (terrainProjection ? terrainProjection[63] : 0.0f) : -1.0e30f;
+    const float stockTerrainMarker = !terrainProjection ? 0.0f :
+        (stockLightingMode < 0.5f ? terrainProjection[63] : -1.0e30f);
     std::memcpy(&pipelineKey[7], &stockTerrainMarker, sizeof(float));
     std::memcpy(&pipelineKey[10], &stockLightingMode, sizeof(float));
     const float stockMaterialColorMode = terrainProjection ?
@@ -1561,7 +1601,38 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
     std::memcpy(&pipelineKey[18], &stockMaterialColorMode, sizeof(float));
     const uint32_t stockMaterialNormalMode = HasVulkanVertexNormal(vertexFormat) ?
         (stockLightingMode > 1.5f ? 0u : 1u) : 2u;
-    pipelineKey[24] = stockMaterialNormalMode;
+    // Ordinary material UVs are affine, usually identity. Preserve arbitrary
+    // OpenGL projective matrices, but do not divide by uniform Q=1 per texel.
+    uint32_t stockTextureTransformFlags = 0;
+    const auto classifyUvTransform = [&](uint32_t stage, const float* m) {
+        if (m[6] == 0.0f && m[7] == 0.0f && m[8] == 1.0f) {
+            stockTextureTransformFlags |= 1u << stage;
+            if (m[0] == 1.0f && m[1] == 0.0f && m[2] == 0.0f &&
+                m[3] == 0.0f && m[4] == 1.0f && m[5] == 0.0f)
+                stockTextureTransformFlags |= 1u << (stage + 8u);
+        }
+    };
+    const float uvMatrix0[] = {textureMatrix0[0], textureMatrix0[4], textureMatrix0[12],
+        textureMatrix0[1], textureMatrix0[5], textureMatrix0[13],
+        textureMatrix0[3], textureMatrix0[7], textureMatrix0[15]};
+    const float uvMatrix1[] = {textureMatrix1[0], textureMatrix1[4], textureMatrix1[12],
+        textureMatrix1[1], textureMatrix1[5], textureMatrix1[13],
+        textureMatrix1[3], textureMatrix1[7], textureMatrix1[15]};
+    classifyUvTransform(0, uvMatrix0);
+    classifyUvTransform(1, uvMatrix1);
+    const float identityUv[] = {1,0,0,0,1,0,0,0,1};
+    classifyUvTransform(2, useThirdTexture && textureStage2 ? textureStage2->uvTransform : identityUv);
+    classifyUvTransform(3, useFourthTexture && textureStage3 ? textureStage3->uvTransform : identityUv);
+    for (uint32_t stage = 0; stage < 4; ++stage)
+        classifyUvTransform(stage + 4, useTextureStages4To7[stage] && textureStages4To7 ?
+            textureStages4To7[stage].uvTransform : identityUv);
+    for (uint32_t stage = 0; stage < 8; ++stage)
+        if (m_stockLinearTexgen[stage].enabled)
+            stockTextureTransformFlags |= 1u << (stage + 16u);
+    pipelineKey[24] = stockMaterialNormalMode | (m_stockFixedLightCount << 2) |
+        (kVulkanBasicRenderTest ? 1u << 6 : 0u) |
+        (plantsProgram && textureStage0LodBias == 0.0f ? 1u << 7 : 0u) |
+        (stockTextureTransformFlags << 8);
     for (uint32_t stage = 0; stage < 4; ++stage)
         pipelineKey[29 + stage * 7 + 4] = 0;
     pipelineKey[62] = waterEffect && terrainProjection ? static_cast<uint32_t>(terrainProjection[31]) : 0u;
@@ -1574,7 +1645,7 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         useTexture && useSecondTexture && !useThirdTexture && !useFourthTexture &&
         !useFifthToEighthTexture && !directionalLightmap && !useNormalMap &&
         !waterEffect && !terrainProjection && !terrainLayerProgram &&
-        !causticsProgram && !plantsProgram && stockLightingMode == 0.0f;
+        !causticsProgram && !plantsProgram && !m_stockShadowStageMask && stockLightingMode == 0.0f;
     if (bakedLightmapFastPath) pipelineKey[62] |= 0x20000000u;
     const bool simpleDecalMode = m_stockDecalDraw && vertexFormat == 4 && useTexture &&
         !useSecondTexture && !useThirdTexture && !useFourthTexture &&
@@ -1586,11 +1657,11 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
     const bool regularClipEnabled = clipPlane &&
         (clipPlane[0] != 0.0f || clipPlane[1] != 0.0f ||
          clipPlane[2] != 0.0f || clipPlane[3] != 0.0f);
-    const bool reflectionClipEnabled = reflectionModelView && reflectionClipPlane;
     // CGRCPlants often combines GL_GREATER,0 with SRC_ALPHA / ONE_MINUS_SRC_ALPHA
     // and no depth writes. For alpha == 0, blending is exactly a no-op, so the
-    // discard is redundant. Omitting it lets the GPU reject occluded fragments
-    // in early depth testing without changing color, depth, or stencil results.
+    // alpha-test coverage is redundant. The plant shader forces early fragment
+    // tests for this read-only depth/stencil variant, then discards empty texels
+    // to avoid unnecessary blending without sacrificing early depth rejection.
     const bool plantZeroAlphaBlendNoOp = plantsProgram && alphaTestRef <= 0.0f &&
         decodedState.alphaTest == LegacyAlphaTestGreaterZero && decodedState.blendEnable &&
         decodedState.srcColorBlendFactor == VK_BLEND_FACTOR_SRC_ALPHA &&
@@ -1599,17 +1670,36 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         decodedState.dstAlphaBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
         decodedState.colorBlendOp == VK_BLEND_OP_ADD && decodedState.alphaBlendOp == VK_BLEND_OP_ADD &&
         !decodedState.depthWriteEnable && !decodedState.stencilTestEnable &&
-        !regularClipEnabled && !reflectionClipEnabled;
+        !regularClipEnabled;
     if (plantZeroAlphaBlendNoOp) pipelineKey[61] |= 0x08000000u;
     // Keep alpha discard everywhere it affects coverage. Clip planes always
     // retain discard, including on otherwise eligible blended plant draws.
     const bool alphaTestDiscardEnabled = (alphaTestRef > 0.0f ||
         static_cast<uint32_t>(decodedState.alphaTest) != 0u) && !plantZeroAlphaBlendNoOp;
-    const bool fragmentDiscardEnabled = alphaTestDiscardEnabled ||
-        regularClipEnabled || reflectionClipEnabled;
+    // An ocean reflection clip plane is not used by the ordinary scene pass.
+    // Specializing discard on every world surface prevented the fully opaque
+    // variants from dropping it and using the simplest early-depth path.
+    const bool fragmentDiscardEnabled = alphaTestDiscardEnabled || regularClipEnabled;
     if (fragmentDiscardEnabled) pipelineKey[62] |= 0x80000000u;
     const bool stereoDraw = m_multiview && m_stockShadowMapTextureId <= 0;
-    pipelineKey[63] = stereoDraw ? 1u : 0u;
+    pipelineKey[63] = (stereoDraw ? 1u : 0u) | (m_stockNativeTerrainMode ? 2u : 0u);
+    if (plantsProgram)
+    {
+        // CGRCPlants does not evaluate the legacy texture combiners, fixed
+        // lights, terrain projections or UV matrices. Those per-object values
+        // must not generate additional copies of exactly the same plant shader.
+        const auto originalKey = pipelineKey;
+        pipelineKey.fill(0);
+        pipelineKey[0] = originalKey[0] & ~0x80u;
+        pipelineKey[1] = (originalKey[1] & 0x00ffffffu) | 0x80000000u;
+        pipelineKey[2] = originalKey[2]; // stencil state
+        pipelineKey[13] = originalKey[13]; // color write mask
+        for (uint32_t word = 26; word <= 28; ++word) pipelineKey[word] = originalKey[word];
+        pipelineKey[24] = originalKey[24] & (1u << 7); // implicit versus biased sampling
+        pipelineKey[61] = originalKey[61] & (0x07000000u | 0x08000000u); // fog, zero-alpha no-op
+        pipelineKey[62] = originalKey[62]; // plant program, discard
+        pipelineKey[63] = originalKey[63] & 1u; // stereo
+    }
     VkPipeline pipeline = VK_NULL_HANDLE;
     VulkanGraphicsPipelineDesc pipelineDesc{};
     if (m_lastScenePipelineValid &&
@@ -1617,10 +1707,11 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         pipeline = m_lastScenePipeline;
     else
     {
-        const auto cachedMain = m_scenePipelineCache.find(pipelineKey);
-        if (cachedMain != m_scenePipelineCache.end())
+        // Most materials recur throughout the frame. A bounded flat lookup
+        // avoids revisiting hash-map nodes for every object/material chunk.
+        pipeline = FindCachedScenePipeline(pipelineKey);
+        if (pipeline)
         {
-            pipeline = cachedMain->second;
             m_lastScenePipelineKey = pipelineKey;
             m_lastScenePipeline = pipeline;
             m_lastScenePipelineValid = true;
@@ -1628,19 +1719,21 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
     }
     bool needsReflectionDescription = false;
     VkPipeline cachedReflectionPipeline = VK_NULL_HANDLE;
-    if (reflectionModelView && reflectionClipPlane && !waterEffect && (cullMode != 0 || stereoDraw))
+    if (reflectionModelView && reflectionClipPlane && !waterEffect &&
+        (cullMode != 0 || stereoDraw || !fragmentDiscardEnabled))
     {
         auto reflectionKey = pipelineKey;
         reflectionKey[0] &= ~0x3u;
-        reflectionKey[63] = 0;
-        const auto cachedReflection = m_scenePipelineCache.find(reflectionKey);
-        if (cachedReflection != m_scenePipelineCache.end()) cachedReflectionPipeline = cachedReflection->second;
-        needsReflectionDescription = !cachedReflectionPipeline &&
-            m_pendingScenePipelines.find(reflectionKey) == m_pendingScenePipelines.end();
+        reflectionKey[63] &= ~1u;
+        reflectionKey[62] |= 0x80000000u;
+        cachedReflectionPipeline = FindCachedScenePipeline(reflectionKey);
+        const uint8_t reflectionQueueState = GetScenePipelineQueueState(reflectionKey);
+        needsReflectionDescription = !cachedReflectionPipeline && reflectionQueueState == 0;
     }
     // Descriptions are only consumed by pipeline creation. Cached ordinary
     // and reflected variants do not need this per-draw reconstruction.
-    if ((!pipeline && m_pendingScenePipelines.find(pipelineKey) == m_pendingScenePipelines.end()) || needsReflectionDescription)
+    const uint8_t pipelineQueueState = !pipeline ? GetScenePipelineQueueState(pipelineKey) : 0;
+    if ((!pipeline && (pipelineQueueState & 1u) == 0) || needsReflectionDescription)
     {
         const bool hasNormal = HasVulkanVertexNormal(vertexFormat);
         const bool hasColor = HasVulkanVertexColor(vertexFormat);
@@ -1713,10 +1806,10 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
             desc.vertexShader = m_causticsVertexShader;
             desc.fragmentShader = m_causticsFragmentShader;
         }
-        desc.hasTangents = tangentBuffer && tangentBuffer->buffer &&
+        desc.hasTangents = !plantsProgram && tangentBuffer && tangentBuffer->buffer &&
                            (vertexFormat == 9 || vertexFormat == 10 || vertexFormat == 13);
-        desc.hasLightmapTexCoords = lightmapTexCoordBuffer && lightmapTexCoordBuffer->buffer;
-        desc.hasNormalMap = useNormalMap;
+        desc.hasLightmapTexCoords = !plantsProgram && lightmapTexCoordBuffer && lightmapTexCoordBuffer->buffer;
+        desc.hasNormalMap = !plantsProgram && useNormalMap;
         desc.topology = topologyIndex == 0 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST :
                         topologyIndex == 1 ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP :
                                              VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
@@ -1773,6 +1866,11 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
         desc.stockTerrainMarker = stockTerrainMarker;
         desc.stockMaterialLightingMode = stockLightingMode;
         desc.stockMaterialColorMode = stockMaterialColorMode;
+        desc.stockTextureTransformFlags = stockTextureTransformFlags;
+        desc.stockFixedLightCount = m_stockFixedLightCount;
+        desc.stockEnhancedSurfaces = !kVulkanBasicRenderTest;
+        desc.stockPlantImplicitLod = plantsProgram && textureStage0LodBias == 0.0f;
+        desc.stockNativeTerrain = m_stockNativeTerrainMode != 0;
         desc.stockMaterialNormalMode = stockMaterialNormalMode;
         if (useFourthTexture)
         {
@@ -1796,30 +1894,49 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
                 pipelineStage.lodBias = textureStages4To7[stageIndex].lodBias;
             }
         }
-        if (!pipeline && m_pendingScenePipelines.find(pipelineKey) == m_pendingScenePipelines.end())
+        if (!pipeline && (pipelineQueueState & 1u) == 0)
+        {
             m_pendingScenePipelines.emplace(pipelineKey, m_pipelineFactory.EnqueueGraphicsPipeline(desc));
+            SetScenePipelineQueueState(pipelineKey, pipelineQueueState | 1u);
+        }
     }
     VkPipeline reflectionPipeline = pipeline;
     const bool separateReflectionPipeline = reflectionModelView && reflectionClipPlane &&
-        !waterEffect && (cullMode != 0 || stereoDraw);
+        !waterEffect && (cullMode != 0 || stereoDraw || !fragmentDiscardEnabled);
     if (separateReflectionPipeline)
     {
         std::array<uint32_t, 64> reflectionKey = pipelineKey;
         reflectionKey[0] &= ~0x3u;
-        reflectionKey[63] = 0;
+        reflectionKey[63] &= ~1u;
+        reflectionKey[62] |= 0x80000000u;
         if (cachedReflectionPipeline)
             reflectionPipeline = cachedReflectionPipeline;
         else
         {
             reflectionPipeline = VK_NULL_HANDLE;
-            if (m_pendingScenePipelines.find(reflectionKey) == m_pendingScenePipelines.end())
+            const uint8_t reflectionQueueState = GetScenePipelineQueueState(reflectionKey);
+            if (reflectionQueueState == 0)
             {
                 VulkanGraphicsPipelineDesc reflectionDesc = pipelineDesc;
                 reflectionDesc.cullMode = 0;
                 reflectionDesc.multiview = false;
+                reflectionDesc.fragmentDiscardEnabled = true;
                 reflectionDesc.renderPass = m_renderPass;
-                m_pendingScenePipelines.emplace(reflectionKey,
-                    m_pipelineFactory.EnqueueGraphicsPipeline(reflectionDesc));
+                // Most world draws carry an ocean reflection transform even
+                // in the bunker or while the ocean image is retained. Compile
+                // this variant only when the reflection pass actually uses it.
+                // Bound retained descriptions; overflow keeps the old behavior.
+                if (m_deferredReflectionPipelines.size() < 1024)
+                {
+                    m_deferredReflectionPipelines.emplace(reflectionKey, reflectionDesc);
+                    SetScenePipelineQueueState(reflectionKey, 2u);
+                }
+                else
+                {
+                    m_pendingScenePipelines.emplace(reflectionKey,
+                        m_pipelineFactory.EnqueueGraphicsPipeline(reflectionDesc));
+                    SetScenePipelineQueueState(reflectionKey, 1u);
+                }
             }
         }
     }
@@ -1831,17 +1948,23 @@ bool VulkanFrameRenderer::QueueStockIndexedDraw(const VulkanBuffer* vertexBuffer
     // all material matrices and lights; copying a temporary duplicates that
     // snapshot for every material pass.
     m_stockDraws.emplace_back();
+    if (!fragmentDiscardEnabled && !decodedState.blendEnable && m_stockShadowMapTextureId <= 0)
+        ++m_sceneDiagnostics.opaqueNoDiscardDraws;
     StockDraw& draw = m_stockDraws.back();
     draw.profilePlants = m_stockProfilePlants;
     m_stockProfilePlants = false;
     draw.decalDraw = m_stockDecalDraw;
     m_stockDecalDraw = false;
     draw.terrainDraw = m_stockTerrainDraw;
+    draw.grassDraw = m_stockGrassDraw;
     draw.waterDraw = m_stockWaterDraw;
     draw.characterDraw = m_stockCharacterDraw;
-    m_stockTerrainDraw = m_stockWaterDraw = m_stockCharacterDraw = false;
+    m_stockTerrainDraw = m_stockWaterDraw = m_stockCharacterDraw = m_stockGrassDraw = false;
     draw.simpleDecalMode = simpleDecalMode;
     draw.fixedLightCount = m_stockFixedLightCount;
+    draw.nativeTerrainMode = m_stockNativeTerrainMode;
+    if (draw.nativeTerrainMode)
+        draw.nativeTerrainParameters = m_stockNativeTerrainParameters;
     if (hasLinearTexgen || m_stockFixedLightCount || m_stockShadowStageMask)
     {
         draw.auxiliaryIndex = static_cast<uint32_t>(m_stockDrawAux.size());
@@ -2332,23 +2455,18 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
     const VulkanBuffer* effectiveTangents = (gpuSkinned || uploadCpuTangents) && (vertexFormat == 9 || vertexFormat == 10 || vertexFormat == 13) ?
         &m_dynamicVertexBuffer : tangentBuffer;
     const bool cacheImmutableGeometry = immutableGeometryRevision && sourceIndices &&
-        !gpuSkinned && !lightmapTexCoords && !m_stockDecalDraw;
+        !gpuSkinned && !m_stockDecalDraw;
     const std::array<uint64_t, 8> geometryKey{{reinterpret_cast<uint64_t>(vertices),
         reinterpret_cast<uint64_t>(sourceIndices), uint64_t(vertexCount) << 32 | indexCount,
         uint64_t(uint32_t(vertexFormat)) << 32 | uint32_t(primitiveMode), immutableGeometryRevision,
         reinterpret_cast<uint64_t>(gpuSkinIdentity),
-        effectiveTangents ? reinterpret_cast<uint64_t>(effectiveTangents->buffer) : 0,
+        !uploadCpuTangents && effectiveTangents ? reinterpret_cast<uint64_t>(effectiveTangents->buffer) : 0,
         reinterpret_cast<uint64_t>(cpuTangents)}};
-    if (cacheImmutableGeometry)
-    {
-        const auto found = m_frameGeometryUploads.find(geometryKey);
-        if (found != m_frameGeometryUploads.end())
-        {
-            m_reusableClientGeometry = found->second;
-            reusePreviousClientGeometry = true;
-        }
-    }
-    if (reusePreviousClientGeometry && sourceIndices && m_reusableClientGeometry.valid &&
+    // Additional hardware-light passes for the same object use identical
+    // source streams. Reuse the immediately preceding upload before consulting
+    // the persistent mesh maps; otherwise each light recopies the lightmap UVs.
+    bool reusablePreviousGeometry = reusePreviousClientGeometry && sourceIndices &&
+        m_reusableClientGeometry.valid &&
         m_reusableClientGeometry.skinIdentity == gpuSkinIdentity &&
         m_reusableClientGeometry.sourceTangents == cpuTangents &&
         vertices == m_reusableClientGeometry.sourceVertices &&
@@ -2357,7 +2475,59 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
         vertexCount == m_reusableClientGeometry.vertexCount &&
         indexCount == m_reusableClientGeometry.indexCount &&
         vertexFormat == m_reusableClientGeometry.vertexFormat &&
-        primitiveMode == m_reusableClientGeometry.primitiveMode)
+        primitiveMode == m_reusableClientGeometry.primitiveMode;
+    bool cachedGeometryHit = false;
+    if (cacheImmutableGeometry)
+    {
+        ++m_sceneDiagnostics.geometryCacheEligible;
+        if (reusablePreviousGeometry)
+            ++m_sceneDiagnostics.geometryCacheHits;
+        else
+        {
+            const auto persistent = m_staticGeometryUploads.find(geometryKey);
+            if (persistent != m_staticGeometryUploads.end())
+            {
+                m_reusableClientGeometry = persistent->second;
+                reusePreviousClientGeometry = true;
+                cachedGeometryHit = true;
+            }
+            const auto found = cachedGeometryHit ? m_frameGeometryUploads.end() :
+                m_frameGeometryUploads.find(geometryKey);
+            if (found != m_frameGeometryUploads.end())
+            {
+                m_reusableClientGeometry = found->second;
+                reusePreviousClientGeometry = true;
+                cachedGeometryHit = true;
+            }
+        }
+    }
+    if (cachedGeometryHit)
+    {
+        ++m_sceneDiagnostics.geometryCacheHits;
+        reusablePreviousGeometry = true;
+        // Geometry belongs to the mesh, UVs may belong to a different object
+        // sharing that mesh. Keep their upload and lifetime independent.
+        m_reusableClientGeometry.sourceLightmapTexCoords = lightmapTexCoords;
+        if (lightmapTexCoords)
+        {
+            VulkanVertexFormat cachedFormat{};
+            if (!GetVulkanVertexFormat(uint32_t(vertexFormat), cachedFormat))
+                return auditFailure("cached geometry format invalid");
+            const uint32_t first = uint32_t(-m_reusableClientGeometry.vertexOffset);
+            const VkDeviceSize bytes = m_reusableClientGeometry.vertexBytes /
+                cachedFormat.stride * sizeof(float) * 2;
+            const VkDeviceSize offset = (m_dynamicVertexUsed + 7u) & ~VkDeviceSize(7u);
+            if (!EnsureDynamicBufferCapacity(m_dynamicVertexBuffer, m_previousDynamicVertexBuffers,
+                    offset + bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
+                !m_resources->UploadBuffer(m_dynamicVertexBuffer,
+                    static_cast<const float*>(lightmapTexCoords) + size_t(first) * 2, bytes, offset))
+                return auditFailure("cached geometry lightmap upload failed");
+            m_dynamicVertexUsed = offset + bytes;
+            m_reusableClientGeometry.lightmapBuffer = m_dynamicVertexBuffer;
+            m_reusableClientGeometry.lightmapTexCoordOffset = offset;
+        }
+    }
+    if (reusablePreviousGeometry)
     {
         if (QueueStockIndexedDraw(&m_reusableClientGeometry.vertexBuffer,
                                   &m_reusableClientGeometry.indexBuffer,
@@ -2378,7 +2548,7 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                                   m_reusableClientGeometry.vertexBufferOffset,
                                   textureWrapMode0, textureWrapMode1, textureWrapMode2, textureWrapMode3,
                                   textureStages4To7,
-                                  lightmapTexCoords ? &m_reusableClientGeometry.vertexBuffer : nullptr,
+                                  lightmapTexCoords ? &m_reusableClientGeometry.lightmapBuffer : nullptr,
                                   lightmapTexCoords ? m_reusableClientGeometry.lightmapTexCoordOffset : 0,
                                   textureStage1UsesTexCoord1,
                                   textureStage0UsesTexCoord1,
@@ -2390,7 +2560,7 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
                                   lightmapEncodeScale,
                                   reflectionModelView, reflectionClipPlane))
         {
-            if ((gpuSkinned || uploadCpuTangents) && !m_stockDraws.empty())
+            if (effectiveTangents && effectiveTangents->buffer && !m_stockDraws.empty())
                 m_stockDraws.back().tangentBufferOffset = m_reusableClientGeometry.tangentBufferOffset;
             if (terrainProjection && terrainProjection[31] == -13.0f && !m_stockDraws.empty() &&
                 m_reusableClientGeometry.vertexBuffer.mappedData &&
@@ -2459,15 +2629,17 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
         return auditFailure("unsupported vertex format");
     // Leaf/material chunks often reference a small part of a shared mesh.
     // Keep original indices and compensate with baseVertex, uploading only
-    // that range. Separate tangent streams retain their existing full layout.
+    // that range. CPU tangent streams are sliced by the same range; external
+    // tangent streams compensate their binding offset for the base vertex.
     const bool separateTangents = effectiveTangents && effectiveTangents->buffer &&
         (vertexFormat == 9 || vertexFormat == 10 || vertexFormat == 13);
-    const uint32_t uploadFirstVertex = separateTangents ? 0 : minimumVertex;
-    const uint32_t uploadVertexCount = separateTangents ? vertexCount :
+    const uint32_t uploadFirstVertex = gpuSkinned ? 0 : minimumVertex;
+    const uint32_t uploadVertexCount = gpuSkinned ? vertexCount :
         maximumVertex - minimumVertex + 1;
     const int32_t uploadBaseVertex = -static_cast<int32_t>(uploadFirstVertex);
     const VkDeviceSize vertexBytes = static_cast<VkDeviceSize>(uploadVertexCount) * format.stride;
     const VkDeviceSize indexBytes = static_cast<VkDeviceSize>(indexCount) * sizeof(uint16_t);
+    m_sceneDiagnostics.transientGeometryBytes += vertexBytes + indexBytes;
     const VkDeviceSize lightmapBytes = lightmapTexCoords ?
         static_cast<VkDeviceSize>(uploadVertexCount) * sizeof(float) * 2 : 0;
     if (vertexBytes > std::numeric_limits<VkDeviceSize>::max() - m_dynamicVertexUsed ||
@@ -2504,7 +2676,8 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
     // SPipTangents is three float3 vectors, matching the Vulkan tangent
     // stream. Upload once with the geometry and reuse it for later lights.
     if (uploadCpuTangents && !m_resources->UploadBuffer(m_dynamicVertexBuffer,
-            cpuTangents, VkDeviceSize(uploadVertexCount) * 36, tangentOffset))
+            static_cast<const uint8_t*>(cpuTangents) + size_t(uploadFirstVertex) * 36,
+            VkDeviceSize(uploadVertexCount) * 36, tangentOffset))
         return auditFailure("tangent upload failed");
     const uint32_t firstIndex = static_cast<uint32_t>(m_dynamicIndexUsed / sizeof(uint16_t));
     if (gpuSkinned) {
@@ -2546,6 +2719,8 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
         m_stockDraws.back().tangentBuffer = m_dynamicVertexBuffer.buffer;
         m_stockDraws.back().tangentBufferOffset = tangentOffset;
     }
+    else if (separateTangents && !m_stockDraws.empty())
+        m_stockDraws.back().tangentBufferOffset = VkDeviceSize(uploadFirstVertex) * 36;
     if (terrainProjection && terrainProjection[31] == -13.0f && !m_stockDraws.empty() &&
         m_dynamicVertexBuffer.mappedData && m_dynamicIndexBuffer.mappedData)
     {
@@ -2718,7 +2893,8 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
         m_reusableClientGeometry.sourceVertices = vertices;
         m_reusableClientGeometry.skinIdentity = gpuSkinIdentity;
         m_reusableClientGeometry.sourceTangents = cpuTangents;
-        m_reusableClientGeometry.tangentBufferOffset = tangentOffset == VK_WHOLE_SIZE ? 0 : tangentOffset;
+        m_reusableClientGeometry.tangentBufferOffset = tangentOffset == VK_WHOLE_SIZE ?
+            VkDeviceSize(uploadFirstVertex) * 36 : tangentOffset;
         m_reusableClientGeometry.sourceIndices = sourceIndices;
         m_reusableClientGeometry.sourceLightmapTexCoords = lightmapTexCoords;
         m_reusableClientGeometry.vertexCount = vertexCount;
@@ -2727,13 +2903,59 @@ bool VulkanFrameRenderer::QueueStockClientIndexedDraw(const void* vertices, uint
         m_reusableClientGeometry.primitiveMode = primitiveMode;
         m_reusableClientGeometry.vertexBuffer = m_dynamicVertexBuffer;
         m_reusableClientGeometry.indexBuffer = m_dynamicIndexBuffer;
+        m_reusableClientGeometry.lightmapBuffer = m_dynamicVertexBuffer;
         m_reusableClientGeometry.firstIndex = firstIndex;
         m_reusableClientGeometry.vertexOffset = uploadBaseVertex;
         m_reusableClientGeometry.vertexBufferOffset = vertexBufferOffset;
         m_reusableClientGeometry.lightmapTexCoordOffset = lightmapOffset;
         m_reusableClientGeometry.vertexBytes = vertexBytes;
         if (cacheImmutableGeometry && m_frameGeometryUploads.size() < 4096)
-            m_frameGeometryUploads.emplace(geometryKey, m_reusableClientGeometry);
+        {
+            ReusableClientGeometry cached = m_reusableClientGeometry;
+            constexpr VkDeviceSize vertexBudget = 32u * 1024u * 1024u;
+            constexpr VkDeviceSize indexBudget = 8u * 1024u * 1024u;
+            const VkDeviceSize cachedVertexOffset = (m_staticVertexUsed + 15u) & ~VkDeviceSize(15u);
+            const VkDeviceSize cachedTangentOffset = uploadCpuTangents ?
+                (cachedVertexOffset + vertexBytes + 3u) & ~VkDeviceSize(3u) : 0;
+            const VkDeviceSize cachedVertexEnd = uploadCpuTangents ?
+                cachedTangentOffset + VkDeviceSize(uploadVertexCount) * 36 : cachedVertexOffset + vertexBytes;
+            const VkDeviceSize cachedIndexOffset = (m_staticIndexUsed + 3u) & ~VkDeviceSize(3u);
+            if (m_staticGeometryUploads.size() < 8192 && cachedVertexEnd <= vertexBudget &&
+                cachedIndexOffset + indexBytes <= indexBudget)
+            {
+                const VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                if ((!m_staticVertexArena.buffer && !m_resources->CreateBuffer(vertexBudget,
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, properties, m_staticVertexArena)) ||
+                    (!m_staticIndexArena.buffer && !m_resources->CreateBuffer(indexBudget,
+                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT, properties, m_staticIndexArena)))
+                {
+                    // The existing transient upload remains valid on allocation failure.
+                }
+                else if (m_resources->UploadBuffer(m_staticVertexArena, uploadVertices,
+                             vertexBytes, cachedVertexOffset, true) &&
+                         (!uploadCpuTangents || m_resources->UploadBuffer(m_staticVertexArena,
+                             static_cast<const uint8_t*>(cpuTangents) + size_t(uploadFirstVertex) * 36,
+                             VkDeviceSize(uploadVertexCount) * 36, cachedTangentOffset, true)) &&
+                         m_resources->UploadBuffer(m_staticIndexArena, indices,
+                             indexBytes, cachedIndexOffset, true))
+                {
+                    cached.vertexBuffer = m_staticVertexArena;
+                    cached.indexBuffer = m_staticIndexArena;
+                    cached.vertexBufferOffset = cachedVertexOffset;
+                    cached.firstIndex = static_cast<uint32_t>(cachedIndexOffset / sizeof(uint16_t));
+                    if (uploadCpuTangents) cached.tangentBufferOffset = cachedTangentOffset;
+                    // Never retain a frame's UV allocation in the persistent cache.
+                    cached.lightmapBuffer = {};
+                    cached.sourceLightmapTexCoords = nullptr;
+                    m_staticGeometryUploads.emplace(geometryKey, cached);
+                }
+                // Never retry writes to a partially uploaded range.
+                m_staticVertexUsed = std::max(cachedVertexEnd, m_staticVertexArena.uploadedEnd);
+                m_staticIndexUsed = std::max(cachedIndexOffset + indexBytes, m_staticIndexArena.uploadedEnd);
+            }
+            m_frameGeometryUploads.emplace(geometryKey, cached);
+        }
     }
     return true;
 }
@@ -4580,7 +4802,7 @@ bool VulkanFrameRenderer::CompletePendingSubmission()
                 {
                     if (m_gpuAbPairs == 0 && m_pendingAbMode == 1)
                         fprintf(file, "frame,pair,group,mode,queued,skipped,simple_decals,draw_hash,setup_ms,scene_ms,output_ms\n");
-                    const char* groups[] = { "blended_plants", "alpha_test", "terrain", "water", "decals", "opaque", "opaque_character", "opaque_lightmap", "opaque_bump", "opaque_other" };
+                    const char* groups[] = { "blended_plants", "alpha_test", "terrain", "water", "decals", "opaque", "opaque_character", "opaque_lightmap", "opaque_bump", "opaque_other", "terrain_grass", "plants_without_grass" };
                     fprintf(file, "%u,%u,%s,%s,%zu,%u,%u,%llu,%.6f,%.6f,%.6f\n", m_pendingFrameNumber,
                         m_gpuAbPairs, groups[m_pendingAbGroup], m_pendingAbMode == 1 ? "baseline" : "omit",
                         m_pendingDrawCount, m_pendingAbSkipped, m_pendingSimpleDecalDraws,
@@ -4588,7 +4810,7 @@ bool VulkanFrameRenderer::CompletePendingSubmission()
                         frameElapsed[0], frameElapsed[1], frameElapsed[2]);
                     fclose(file);
                 }
-                if (m_pendingAbMode == 2 && ++m_gpuAbPairs >= 20) m_gpuAbArmed = false;
+                if (m_pendingAbMode == 2 && ++m_gpuAbPairs >= kGpuAbPairCount) m_gpuAbArmed = false;
             }
             if (!m_pendingAbMode && ++samples == 120 && reports < 128)
             {
@@ -4953,17 +5175,116 @@ XrView VulkanFrameRenderer::GetSceneCameraView(uint32_t eye) const
     return view;
 }
 
+void VulkanFrameRenderer::PlanSceneReflections()
+{
+    m_updateOceanReflection = {};
+    m_oceanReflectionDrawIndex = UINT32_MAX;
+    if (m_imageIndex >= m_targets.size()) return;
+    Target& frameTarget = m_targets[m_imageIndex];
+    const StockDraw* oceanReflectionDraw = nullptr;
+    for (size_t index = 0; index < m_stockDraws.size(); ++index)
+    {
+        const StockDraw& draw = m_stockDraws[index];
+        if (draw.waterEffect && draw.hasWaterReflectionTransform &&
+            static_cast<int>(draw.terrainProjectionRows[0][7][3] + 0.5f) == 6)
+        {
+            m_oceanReflectionDrawIndex = static_cast<uint32_t>(index);
+            oceanReflectionDraw = &draw;
+            break;
+        }
+    }
+    for (uint32_t reflectionEye = 0; reflectionEye < m_viewCount && reflectionEye < 2; ++reflectionEye)
+    {
+        bool updateOceanReflection = oceanReflectionDraw != nullptr &&
+            !frameTarget.waterReflectionInitialized[reflectionEye];
+        if (oceanReflectionDraw && frameTarget.waterReflectionInitialized[reflectionEye])
+        {
+            const VulkanWaterReflectionUpdate& update =
+                oceanReflectionDraw->waterReflectionUpdate;
+            if (oceanReflectionDraw->hasWaterReflectionUpdate)
+            {
+                float lastUpdateTime = frameTarget.waterReflectionLastUpdateTime[reflectionEye];
+                if (lastUpdateTime - 1.0f > update.realTime)
+                {
+                    lastUpdateTime = update.realTime;
+                    frameTarget.waterReflectionLastUpdateTime[reflectionEye] = lastUpdateTime;
+                }
+                const float dx = update.cameraPosition[0] -
+                    frameTarget.waterReflectionLastPosition[reflectionEye][0];
+                const float dy = update.cameraPosition[1] -
+                    frameTarget.waterReflectionLastPosition[reflectionEye][1];
+                const float dz = update.cameraPosition[2] -
+                    frameTarget.waterReflectionLastPosition[reflectionEye][2];
+                const float da = update.cameraAngles[0] -
+                    frameTarget.waterReflectionLastAngles[reflectionEye][0];
+                const float db = update.cameraAngles[1] -
+                    frameTarget.waterReflectionLastAngles[reflectionEye][1];
+                const float dc = update.cameraAngles[2] -
+                    frameTarget.waterReflectionLastAngles[reflectionEye][2];
+                updateOceanReflection =
+                    update.realTime - lastUpdateTime > update.updateInterval ||
+                    std::sqrt(dx * dx + dy * dy + dz * dz) > update.cameraDistanceThreshold ||
+                    std::sqrt(da * da + db * db + dc * dc) > update.cameraAngleThreshold ||
+                    update.fieldOfView != frameTarget.waterReflectionLastFov[reflectionEye];
+            }
+            else
+            {
+                // Keep a bounded fallback for callers without OpenGL's update
+                // inputs; the Vulkan renderer supplies them for stock ocean draws.
+                updateOceanReflection = m_frameBeginSuccesses -
+                    frameTarget.waterReflectionLastFrame[reflectionEye] >= 20u;
+            }
+        }
+        m_updateOceanReflection[reflectionEye] = updateOceanReflection;
+    }
+}
+
+bool VulkanFrameRenderer::CanInstancePlants(const StockDraw& a, const StockDraw& b, uint32_t* failures) const
+{
+    const auto reject = [failures](unsigned reason) {
+        if (failures) ++failures[reason];
+        return false;
+    };
+    if ((a.pipelineKey[62] & 0x7fffffffu) != 13u ||
+        (b.pipelineKey[62] & 0x7fffffffu) != 13u) return reject(0);
+    if (!a.plantsVertexData || !b.plantsVertexData ||
+        !a.plantsIndexData || !b.plantsIndexData) return reject(1);
+    if (a.pipeline != b.pipeline) return reject(2);
+    if (b.clearColor || b.clearDepth || b.clearStencil || b.shadowMapTextureId ||
+        a.visibilityQueryIndex != UINT32_MAX || b.visibilityQueryIndex != UINT32_MAX ||
+        a.visibilityCoverageQueryIndex != UINT32_MAX || b.visibilityCoverageQueryIndex != UINT32_MAX ||
+        a.indexCount != b.indexCount || a.vertexOffset != b.vertexOffset ||
+        a.plantsVertexBytes != b.plantsVertexBytes || a.textureId != b.textureId ||
+        a.textureWrapMode[0] != b.textureWrapMode[0] ||
+        a.stencilRef != b.stencilRef || a.stencilMask != b.stencilMask ||
+        a.nearestObject != b.nearestObject || a.scissorEnabled != b.scissorEnabled ||
+        a.alphaTestRef != b.alphaTestRef || a.textureLodBias[0] != b.textureLodBias[0] ||
+        std::memcmp(&a.viewport, &b.viewport, sizeof(a.viewport)) ||
+        (a.scissorEnabled && std::memcmp(&a.scissor, &b.scissor, sizeof(a.scissor))) ||
+        std::memcmp(a.fogConstants, b.fogConstants, sizeof(float) * 12) ||
+        std::memcmp(a.clipPlane, b.clipPlane, sizeof(a.clipPlane))) return reject(3);
+    // Pointer identity is insufficient for generated/scratch meshes. Their
+    // uploaded coherent bytes live until submission retirement.
+    const bool identical = (a.plantsVertexData == b.plantsVertexData &&
+        a.plantsIndexData == b.plantsIndexData) ||
+        (!std::memcmp(a.plantsVertexData, b.plantsVertexData, static_cast<size_t>(a.plantsVertexBytes)) &&
+         !std::memcmp(a.plantsIndexData, b.plantsIndexData, static_cast<size_t>(a.indexCount) * sizeof(uint16_t)));
+    return identical || reject(4);
+}
+
 bool VulkanFrameRenderer::PrepareSceneUniforms()
 {
-    if (m_stockDraws.empty()) return true;
-    // Opaque instances of the same plant mesh can be drawn near to far.
-    // Earlier depth coverage rejects hidden foliage before texture/fog work.
-    // Keep blending, multipass boundaries, queries and reflection draws ordered.
-    const auto sortablePlant = [](const StockDraw& draw) {
-        if ((draw.pipelineKey[62] & 0x7fffffffu) != 13u || draw.clearDepth ||
-            draw.clearColor || draw.clearStencil || draw.stencilState ||
-            draw.nearestObject || draw.hasWaterReflectionTransform ||
-            draw.hasWaterReflectionUpdate || draw.shadowMapTextureId > 0 ||
+    if (m_stockDraws.empty()) { PlanSceneReflections(); return true; }
+    // Order opaque alpha-tested pass segments near to far across materials.
+    // Keep whole adjacent instance batches together, so better depth rejection
+    // does not turn one plant batch into many individual submissions.
+    // Transparent draws and multipass/query/depth-range boundaries stay ordered.
+    const auto sortableAlphaSurface = [](const StockDraw& draw) {
+        if (draw.clearDepth || draw.clearColor || draw.clearStencil ||
+            draw.polygonOffset || (draw.pipelineKey[13] != 0xffffffffu && draw.pipelineKey[13] != 0xfu) ||
+            draw.waterEffect || draw.decalDraw || draw.terrainDraw || draw.stencilState ||
+            draw.nearestObject ||
+            draw.shadowMapTextureId > 0 ||
             draw.visibilityQueryIndex != UINT32_MAX ||
             draw.visibilityCoverageQueryIndex != UINT32_MAX || draw.scissorEnabled)
             return false;
@@ -4971,6 +5292,7 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
             (uint64_t(draw.pipelineKey[1]) << 32);
         VulkanPipelineState state{};
         return DecodeLegacyPipelineState(uint32_t(packed >> 24), 0, false, 0, state) &&
+            (draw.profilePlants || draw.alphaTestRef > 0.0f || state.alphaTest != LegacyAlphaTestNone) &&
             state.depthTestEnable && state.depthWriteEnable && !state.blendEnable &&
             (state.depthCompareOp == VK_COMPARE_OP_LESS ||
              state.depthCompareOp == VK_COMPARE_OP_LESS_OR_EQUAL) &&
@@ -4978,29 +5300,87 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
     };
     for (size_t first = 0; first < m_stockDraws.size();)
     {
-        if (!sortablePlant(m_stockDraws[first])) { ++first; continue; }
+        if (!sortableAlphaSurface(m_stockDraws[first])) { ++first; continue; }
         const StockDraw& base = m_stockDraws[first];
+        const uint32_t baseState = (base.pipelineKey[0] >> 24) | (base.pipelineKey[1] << 8);
         size_t end = first + 1;
         for (; end < m_stockDraws.size(); ++end)
         {
             const StockDraw& next = m_stockDraws[end];
-            if (!sortablePlant(next) || next.pipelineKey != base.pipelineKey ||
-                next.textureId != base.textureId || next.vertexBuffer != base.vertexBuffer ||
-                next.vertexBufferOffset != base.vertexBufferOffset ||
-                next.indexBuffer != base.indexBuffer || next.firstIndex != base.firstIndex ||
-                next.indexCount != base.indexCount || next.vertexOffset != base.vertexOffset)
+            const uint32_t nextState = (next.pipelineKey[0] >> 24) | (next.pipelineKey[1] << 8);
+            if (!sortableAlphaSurface(next) || nextState != baseState ||
+                next.nearPlane != base.nearPlane || next.farPlane != base.farPlane ||
+                std::memcmp(&next.viewport, &base.viewport, sizeof(base.viewport)))
                 break;
         }
         if (end - first > 1)
-            std::stable_sort(m_stockDraws.begin()+first, m_stockDraws.begin()+end,
-                [](const StockDraw& a, const StockDraw& b) {
-                    return std::fabs(a.modelView[14]) < std::fabs(b.modelView[14]);
-                });
+        {
+            // Sort small indices, then move each large material snapshot once.
+            // Sorting StockDraw directly copied kilobytes per comparison level.
+            const size_t count = end - first;
+            m_depthSortGroups.clear();
+            for (size_t groupFirst = first; groupFirst < end;)
+            {
+                size_t groupEnd = groupFirst + 1;
+                float depth = std::fabs(m_stockDraws[groupFirst].modelView[14]);
+                while (m_multiview && groupEnd < end &&
+                    CanInstancePlants(m_stockDraws[groupFirst], m_stockDraws[groupEnd]))
+                {
+                    depth = std::min(depth, std::fabs(m_stockDraws[groupEnd].modelView[14]));
+                    ++groupEnd;
+                }
+                m_depthSortGroups.push_back({groupFirst - first, groupEnd - groupFirst, depth});
+                groupFirst = groupEnd;
+            }
+            m_depthSortGroupOrder.resize(m_depthSortGroups.size());
+            for (size_t group = 0; group < m_depthSortGroups.size(); ++group)
+                m_depthSortGroupOrder[group] = group;
+            // Stable tie breaking preserves submission order at identical depth.
+            std::stable_sort(m_depthSortGroupOrder.begin(), m_depthSortGroupOrder.end(),
+                [&](size_t a, size_t b) { return m_depthSortGroups[a].depth < m_depthSortGroups[b].depth; });
+            m_depthSortOrder.resize(count);
+            size_t destination = 0;
+            for (size_t groupIndex : m_depthSortGroupOrder)
+            {
+                const auto& group = m_depthSortGroups[groupIndex];
+                for (size_t index = 0; index < group.count; ++index)
+                {
+                    const size_t source = group.first + index;
+                    if (destination != source) ++m_sceneDiagnostics.depthSortedDraws;
+                    m_depthSortOrder[destination++] = source;
+                }
+            }
+            for (size_t start = 0; start < count; ++start)
+            {
+                if (m_depthSortOrder[start] == start) continue;
+                StockDraw saved = std::move(m_stockDraws[first+start]);
+                size_t current = start;
+                for (;;)
+                {
+                    const size_t source = m_depthSortOrder[current];
+                    m_depthSortOrder[current] = current;
+                    if (source == start)
+                    {
+                        m_stockDraws[first+current] = std::move(saved);
+                        break;
+                    }
+                    m_stockDraws[first+current] = std::move(m_stockDraws[first+source]);
+                    current = source;
+                }
+            }
+        }
         first = end;
     }
+    // Use precisely the same update decision as reflection recording. Retained
+    // ocean images need no reflected object UBOs in the current frame.
+    PlanSceneReflections();
+    const bool reflectionUpdate = m_updateOceanReflection[0] || m_updateOceanReflection[1];
     size_t uniformBlockCount = 0;
-    for (const StockDraw& draw : m_stockDraws)
-        uniformBlockCount += draw.hasWaterReflectionTransform ? 4u : (m_multiview ? 1u : 2u);
+    for (StockDraw& draw : m_stockDraws)
+    {
+        draw.reflectionUniforms = reflectionUpdate && draw.hasWaterReflectionTransform && !draw.waterEffect;
+        uniformBlockCount += draw.reflectionUniforms ? 4u : (m_multiview ? 1u : 2u);
+    }
     // Two disjoint ranges keep descriptors stable while the previous frame
     // reads its uniforms. Only allocation growth needs to drain that frame.
     if (m_stockDraws.size() > m_uniformDrawCapacity || uniformBlockCount > m_uniformBlockCapacity)
@@ -5035,11 +5415,45 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
     if (previousBuffer != m_textureTransformBuffer.buffer && !UpdateTextureTransformDescriptors())
         return false;
     VkDeviceSize nextUniformOffset = frameUniformBase;
-    for (StockDraw& draw : m_stockDraws)
+    struct PlantUniformEntry {
+        std::array<uint32_t, 20> key{};
+        uint32_t source = UINT32_MAX;
+    };
+    std::array<PlantUniformEntry, 256> plantUniforms;
+    for (size_t index = 0; index < m_stockDraws.size(); ++index)
     {
+        StockDraw& draw = m_stockDraws[index];
+        draw.uniformSourceIndex = UINT32_MAX;
+        if (m_multiview && draw.indexCount && !draw.clearDepth && !draw.clearColor && !draw.clearStencil &&
+            (draw.pipelineKey[62] & 0x7fffffffu) == 13u &&
+            !draw.reflectionUniforms)
+        {
+            // Plant instance transforms, bend and ambient already live in the
+            // stereo SSBO. Its UBO contains only shared material/fog data.
+            std::array<uint32_t, 20> key;
+            std::memcpy(key.data(), draw.fogConstants, sizeof(float) * 9);
+            std::memcpy(key.data() + 9, &draw.alphaTestRef, sizeof(float));
+            std::memcpy(key.data() + 10, &draw.textureLodBias[0], sizeof(float));
+            std::memcpy(key.data() + 11, draw.clipPlane, sizeof(draw.clipPlane));
+            std::memcpy(key.data() + 15, &draw.viewport, sizeof(float) * 5);
+            // maxDepth is not read by the plant program's radial-fog path.
+            size_t hash = 1469598103934665603ull;
+            for (uint32_t word : key) hash = (hash ^ word) * 1099511628211ull;
+            hash ^= hash >> 32;
+            PlantUniformEntry& entry = plantUniforms[hash & 255u];
+            if (entry.source != UINT32_MAX && entry.key == key)
+            {
+                draw.uniformSourceIndex = entry.source;
+                draw.textureTransformOffset = m_stockDraws[entry.source].textureTransformOffset;
+                ++m_sceneDiagnostics.sharedPlantUniforms;
+                continue;
+            }
+            entry.key = key;
+            entry.source = static_cast<uint32_t>(index);
+        }
         draw.textureTransformOffset = static_cast<uint32_t>(nextUniformOffset);
         nextUniformOffset += m_textureTransformStride *
-            (draw.hasWaterReflectionTransform ? 4u : (m_multiview ? 1u : 2u));
+            (draw.reflectionUniforms ? 4u : (m_multiview ? 1u : 2u));
     }
     // Already mapped coherent allocations: writes stay inside the free range.
     const uint8_t zero = 0;
@@ -5081,6 +5495,13 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
         block.linearControls[1][3] = source.viewport.maxDepth;
         block.linearControls[2][3] = source.viewport.x;
         block.linearControls[3][3] = source.viewport.y;
+        // Native terrain has no fixed-function light list. Reuse its otherwise
+        // inactive matrix payload for the original Cg per-vertex fade inputs.
+        if (source.nativeTerrainMode)
+        {
+            std::memcpy(block.fixedMatrices[1], source.nativeTerrainParameters.data(), 16);
+            block.fixedMatrices[1][4] = float(source.nativeTerrainMode);
+        }
         if (source.auxiliaryIndex == UINT32_MAX) return;
         const StockDrawAux& auxiliary = m_stockDrawAux[source.auxiliaryIndex];
         for (uint32_t light = 0; light < source.fixedLightCount; ++light)
@@ -5133,7 +5554,8 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
             eyeTangents[eye][2] = std::tan(fov.angleUp);
             eyeTangents[eye][3] = std::tan(fov.angleDown);
         }
-    const auto prepareRange = [&](size_t first, size_t last)
+    // Own the snapshot helpers/eye arrays: this job outlives the setup call.
+    const auto prepareRange = [=](size_t first, size_t last)
     {
         float cachedNear = -1.0f, cachedFar = -1.0f;
         bool cachedNearest = false;
@@ -5167,8 +5589,11 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
                                     stereoTransforms[index].mvp[eye], 64);
                 }
             }
+            // Still generate the per-instance matrices and bending above.
+            // The shared plant material UBO is filled once by its source draw.
+            if (draw.uniformSourceIndex != UINT32_MAX) continue;
             const VkDeviceSize transformOffset = draw.textureTransformOffset;
-            const uint32_t uniformEyeCount = m_multiview && !draw.hasWaterReflectionTransform ? 1u : 2u;
+            const uint32_t uniformEyeCount = m_multiview && !draw.reflectionUniforms ? 1u : 2u;
             const bool singleSharedEyeBlock = uniformEyeCount == 1u;
             SceneUniformBlock eyeBlockStorage;
             SceneUniformBlock* eyeBlock;
@@ -5245,7 +5670,7 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
                         std::memcpy(destination + transformOffset + eye * m_textureTransformStride,
                                     eyeBlock, sizeof(*eyeBlock));
                 }
-                if (!draw.hasWaterReflectionTransform) continue;
+                if (!draw.reflectionUniforms) continue;
                 std::memcpy(eyeBlock->fog + 28, draw.reflectionClipPlane,
                             sizeof(draw.reflectionClipPlane));
                 std::memcpy(destination + transformOffset + (2 + eye) * m_textureTransformStride,
@@ -5255,10 +5680,10 @@ bool VulkanFrameRenderer::PrepareSceneUniforms()
     };
     if (m_stockDraws.size() >= 256)
     {
-        const size_t middle = m_stockDraws.size() / 2;
-        m_uniformWorker.Run([&] { prepareRange(0, middle); });
-        prepareRange(middle, m_stockDraws.size());
-        m_uniformWorker.Wait();
+        const size_t count = m_stockDraws.size();
+        // Recording uses offsets and immutable snapshots, not the UBO bytes.
+        // Prepare all bytes on the worker while the render thread records.
+        m_uniformWorker.Run([prepareRange, count] { prepareRange(0, count); });
     }
     else prepareRange(0, m_stockDraws.size());
     return true;
@@ -5745,7 +6170,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 m_gpuAbBaselineReady = false;
             }
         }
-        if (m_gpuAbArmed && m_gpuAbPairs < 20 && m_stockDraws.size() >= 256)
+        if (m_gpuAbArmed && m_gpuAbPairs < kGpuAbPairCount && m_stockDraws.size() >= 256)
         {
             if (m_frameBeginSuccesses % 120 == 119)
             {
@@ -5771,7 +6196,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
     const bool timeGpu = m_timingQueryPool && (m_frameBeginSuccesses <= 15360 || m_gpuAbArmed);
     // Arm only after the user reaches the scene: loading and cutscenes must
     // not consume the bounded profiling budget before the requested location.
-    if (viewIndex == 0 && m_gpuProfileQueryPool && !m_gpuProfileArmed &&
+    if (viewIndex == 0 && m_gpuProfileQueryPool &&
         m_frameBeginSuccesses % 120 == 0)
     {
         FILE* arm = fopen("/sdcard/FarCry/vulkan_gpu_profile.arm", "rb");
@@ -5780,6 +6205,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
             fclose(arm);
             std::remove("/sdcard/FarCry/vulkan_gpu_profile.arm");
             m_gpuProfileArmed = true;
+            m_gpuProfileReports = 0;
         }
     }
     const bool profileGpu = !m_gpuAbArmed && m_gpuProfileArmed && m_gpuProfileQueryPool && m_multiview && viewIndex == 0 &&
@@ -5964,56 +6390,9 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
          reflectionEye < (m_multiview ? (viewIndex == 0 ? m_viewCount : 0u) : viewIndex + 1);
          ++reflectionEye)
     {
-    const StockDraw* oceanReflectionDraw = nullptr;
-    for (const StockDraw& draw : m_stockDraws)
-    {
-        if (draw.waterEffect && draw.hasWaterReflectionTransform &&
-            static_cast<int>(draw.terrainProjectionRows[0][7][3] + 0.5f) == 6)
-        {
-            oceanReflectionDraw = &draw;
-            break;
-        }
-    }
-    bool updateOceanReflection = oceanReflectionDraw != nullptr &&
-        !frameTarget.waterReflectionInitialized[reflectionEye];
-    if (oceanReflectionDraw && frameTarget.waterReflectionInitialized[reflectionEye])
-    {
-        const VulkanWaterReflectionUpdate& update =
-            oceanReflectionDraw->waterReflectionUpdate;
-        if (oceanReflectionDraw->hasWaterReflectionUpdate)
-        {
-            float lastUpdateTime = frameTarget.waterReflectionLastUpdateTime[reflectionEye];
-            if (lastUpdateTime - 1.0f > update.realTime)
-            {
-                lastUpdateTime = update.realTime;
-                frameTarget.waterReflectionLastUpdateTime[reflectionEye] = lastUpdateTime;
-            }
-            const float dx = update.cameraPosition[0] -
-                frameTarget.waterReflectionLastPosition[reflectionEye][0];
-            const float dy = update.cameraPosition[1] -
-                frameTarget.waterReflectionLastPosition[reflectionEye][1];
-            const float dz = update.cameraPosition[2] -
-                frameTarget.waterReflectionLastPosition[reflectionEye][2];
-            const float da = update.cameraAngles[0] -
-                frameTarget.waterReflectionLastAngles[reflectionEye][0];
-            const float db = update.cameraAngles[1] -
-                frameTarget.waterReflectionLastAngles[reflectionEye][1];
-            const float dc = update.cameraAngles[2] -
-                frameTarget.waterReflectionLastAngles[reflectionEye][2];
-            updateOceanReflection =
-                update.realTime - lastUpdateTime > update.updateInterval ||
-                std::sqrt(dx * dx + dy * dy + dz * dz) > update.cameraDistanceThreshold ||
-                std::sqrt(da * da + db * db + dc * dc) > update.cameraAngleThreshold ||
-                update.fieldOfView != frameTarget.waterReflectionLastFov[reflectionEye];
-        }
-        else
-        {
-            // Keep a bounded fallback for callers without OpenGL's update
-            // inputs; the Vulkan renderer supplies them for stock ocean draws.
-            updateOceanReflection = m_frameBeginSuccesses -
-                frameTarget.waterReflectionLastFrame[reflectionEye] >= 20u;
-        }
-    }
+    const StockDraw* oceanReflectionDraw = m_oceanReflectionDrawIndex == UINT32_MAX ? nullptr :
+        &m_stockDraws[m_oceanReflectionDrawIndex];
+    const bool updateOceanReflection = m_updateOceanReflection[reflectionEye];
     if (updateOceanReflection)
     {
         VkImageMemoryBarrier barriers[2]{};
@@ -6119,9 +6498,37 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     const bool preserveScene = m_sceneInitialized[viewIndex];
-    barrier.srcAccessMask = preserveScene ? VK_ACCESS_SHADER_READ_BIT : 0;
+    // A full initial engine clear makes the previous attachments unnecessary.
+    // Use loadOp=CLEAR instead of loading both eyes from memory and immediately
+    // clearing them with vkCmdClearAttachments. Partial/in-frame clears retain
+    // their original order, including stencil preservation after shadow maps.
+    size_t initialSceneClearEnd = 0;
+    bool initialColorClear = false, initialDepthClear = false, initialStencilClear = false;
+    float initialClearRgba[4]{};
+    for (size_t i = 0; i < m_stockDraws.size(); ++i)
+    {
+        const StockDraw& draw = m_stockDraws[i];
+        if (draw.shadowMapTextureId > 0) continue;
+        if ((!draw.clearColor && !draw.clearDepth && !draw.clearStencil) || draw.scissorEnabled)
+            break;
+        if (draw.clearColor) {
+            initialColorClear = true;
+            std::memcpy(initialClearRgba, draw.clearRgba, sizeof(initialClearRgba));
+        }
+        initialDepthClear = initialDepthClear || draw.clearDepth;
+        initialStencilClear = initialStencilClear || draw.clearStencil;
+        initialSceneClearEnd = i + 1;
+    }
+    const bool sceneHasStencil = m_depthFormat == VK_FORMAT_D24_UNORM_S8_UINT ||
+                                 m_depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    const uint32_t initialClearMask = uint32_t(initialColorClear) |
+        (uint32_t(initialDepthClear) << 1) |
+        (uint32_t(initialStencilClear && sceneHasStencil) << 2);
+    if (viewIndex == 0) m_sceneDiagnostics.initialClearMask = initialClearMask;
+    const bool preserveColor = preserveScene && !initialColorClear;
+    barrier.srcAccessMask = preserveColor ? VK_ACCESS_SHADER_READ_BIT : 0;
     barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    barrier.oldLayout = preserveScene ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.oldLayout = preserveColor ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
     barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -6130,8 +6537,13 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
     barrier.subresourceRange.levelCount = 1;
     barrier.subresourceRange.baseArrayLayer = m_multiview ? viewIndex : 0u;
     barrier.subresourceRange.layerCount = m_multiview && viewIndex == 0 ? 2u : 1u;
+    // Discarding old color eliminates its load, not the execution dependency:
+    // the preceding frame's output transfer must finish reading this image.
+    const VkPipelineStageFlags priorColorStages = preserveScene ?
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     if (!m_multiview || viewIndex == 0)
-    m_cmdPipelineBarrier(commandBuffer, preserveScene ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    m_cmdPipelineBarrier(commandBuffer, priorColorStages,
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
     VkClearValue clear{};
@@ -6143,6 +6555,8 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
     clear.color.float32[3] = 0.0f;
     VkClearValue clearValues[2]{};
     clearValues[0] = clear;
+    if (initialColorClear)
+        std::memcpy(clearValues[0].color.float32, initialClearRgba, sizeof(initialClearRgba));
     clearValues[1].depthStencil.depth = 1.0f;
     clearValues[1].depthStencil.stencil = 0;
     VkRenderPassBeginInfo renderPassBegin{};
@@ -6151,8 +6565,8 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                             m_timingQueryPool, timingBase + 1);
     renderPassBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     renderPassBegin.renderPass = m_multiview ?
-        (viewIndex == 0 ? (preserveScene ? m_multiviewLoadRenderPass : m_multiviewRenderPass) : m_loadRenderPass) :
-        (preserveScene ? m_loadRenderPass : m_renderPass);
+        (viewIndex == 0 ? (preserveScene ? m_multiviewInitialClearPasses[initialClearMask] : m_multiviewRenderPass) : m_loadRenderPass) :
+        (preserveScene ? m_initialClearPasses[initialClearMask] : m_renderPass);
     renderPassBegin.framebuffer = m_multiview && viewIndex == 0 ? frameTarget.multiviewFramebuffer : frameTarget.framebuffers[viewIndex];
     renderPassBegin.renderArea.extent.width = m_swapchain.width;
     renderPassBegin.renderArea.extent.height = m_swapchain.height;
@@ -6243,45 +6657,20 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
         uint32_t boundVertexBindingCount = 0;
         VkDescriptorSet boundTextureSets[8]{};
         uint32_t boundTextureSetCount = 0;
+        uint32_t boundTransformOffset = UINT32_MAX;
+        struct MaterialBindings {
+            std::array<uint32_t, 20> key;
+            std::array<VkDescriptorSet, 8> sets;
+            bool valid = false;
+        };
+        // Bounded per-recording packets avoid repeated legacy texture-map
+        // lookups. Their lifetime cannot cross texture retirement or UBO growth.
+        std::array<MaterialBindings, 128> materialBindings;
         bool boundStencilValid = false;
         uint32_t boundStencilMask = 0, boundStencilRef = 0;
         bool waterSnapshotTaken = false;
         uint32_t plantsDraws = 0, plantsCalls = 0, plantsMaxInstances = 0;
         uint32_t plantsBatchFailures[5]{};
-        const auto canInstancePlants = [&](const StockDraw& a, const StockDraw& b)
-        {
-            if ((a.pipelineKey[62] & 0x7fffffffu) != 13u ||
-                (b.pipelineKey[62] & 0x7fffffffu) != 13u)
-            { ++plantsBatchFailures[0]; return false; }
-            if (!a.plantsVertexData || !b.plantsVertexData ||
-                !a.plantsIndexData || !b.plantsIndexData)
-            { ++plantsBatchFailures[1]; return false; }
-            if (a.pipeline != b.pipeline)
-            { ++plantsBatchFailures[2]; return false; }
-            if (
-                b.clearColor || b.clearDepth || b.clearStencil || b.shadowMapTextureId ||
-                a.visibilityQueryIndex != UINT32_MAX || b.visibilityQueryIndex != UINT32_MAX ||
-                a.visibilityCoverageQueryIndex != UINT32_MAX || b.visibilityCoverageQueryIndex != UINT32_MAX ||
-                a.indexCount != b.indexCount ||
-                a.vertexOffset != b.vertexOffset || a.plantsVertexBytes != b.plantsVertexBytes ||
-                a.textureId != b.textureId || a.textureWrapMode[0] != b.textureWrapMode[0] ||
-                a.stencilRef != b.stencilRef || a.stencilMask != b.stencilMask ||
-                a.nearestObject != b.nearestObject || a.scissorEnabled != b.scissorEnabled ||
-                a.alphaTestRef != b.alphaTestRef || a.textureLodBias[0] != b.textureLodBias[0] ||
-                std::memcmp(&a.viewport, &b.viewport, sizeof(a.viewport)) ||
-                (a.scissorEnabled && std::memcmp(&a.scissor, &b.scissor, sizeof(a.scissor))) ||
-                std::memcmp(a.fogConstants, b.fogConstants, sizeof(float) * 12) ||
-                std::memcmp(a.clipPlane, b.clipPlane, sizeof(a.clipPlane)))
-            { ++plantsBatchFailures[3]; return false; }
-            // Pointer identity alone is unsafe for scratch/generated vertices.
-            // Compare uploaded bytes; color weights and UVs must match exactly.
-            const bool identical = !std::memcmp(a.plantsVertexData, b.plantsVertexData,
-                                static_cast<size_t>(a.plantsVertexBytes)) &&
-                   !std::memcmp(a.plantsIndexData, b.plantsIndexData,
-                                static_cast<size_t>(a.indexCount) * sizeof(uint16_t));
-            if (!identical) ++plantsBatchFailures[4];
-            return identical;
-        };
         // OpenGL consumes draws in submission order. Preserve that order here:
         // moving water across other passes changes blend destinations and captures.
         for (size_t i = 0; i < m_stockDraws.size(); ++i)
@@ -6299,7 +6688,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                     (terrain > 200.5f && terrain < 204.5f) ||
                     (terrain > 300.5f && terrain < 304.5f) ||
                     (terrain > 399.5f && terrain < 412.5f);
-                const uint32_t group = m_gpuAbPairs % 10;
+                const uint32_t group = m_gpuAbPairs % kGpuAbGroupCount;
                 const bool opaqueDraw = !draw.profilePlants && !draw.terrainDraw &&
                     !draw.waterDraw && !draw.decalDraw && draw.alphaTestRef <= 0.0f &&
                     !(state & 0xf0000000u);
@@ -6318,6 +6707,8 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                     group == 6 ? characterOpaque :
                     group == 7 ? lightmappedOpaque :
                     group == 8 ? bumpOpaque :
+                    group == 10 ? draw.grassDraw :
+                    group == 11 ? draw.profilePlants && !draw.grassDraw :
                     opaqueDraw && !draw.characterDraw && !draw.bakedLightmap &&
                         !draw.directionalLightmap && !draw.useNormalMap &&
                         draw.specularOcclusionTextureId <= 0;
@@ -6325,6 +6716,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
             }
             if (draw.clearColor || draw.clearDepth || draw.clearStencil)
             {
+                if (i < initialSceneClearEnd) continue;
                 if (draw.scissorEnabled &&
                     (draw.scissor.extent.width == 0 || draw.scissor.extent.height == 0))
                     continue;
@@ -6478,139 +6870,187 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
             // Capture already resolved the immutable pipeline handle. Pipeline
             // cache entries live until renderer shutdown; avoid a second lookup.
             const VkPipeline pipeline = draw.pipeline;
+            const bool fastPlants = (draw.pipelineKey[62] & 0x7fffffffu) == 13u;
             VkDescriptorSet textureSets[8]{};
-            for (VkDescriptorSet& textureSet : textureSets)
-                textureSet = m_descriptorSet;
-            if (draw.textureId)
+            const uint32_t textureSetCount = fastPlants ? 1u : 8u;
+            MaterialBindings* bindingPacket = nullptr;
+            std::array<uint32_t, 20> bindingKey{};
+            if (!draw.waterEffect && !waterRefraction && !waterReflection)
             {
-                textureSets[0] = GetLegacyTextureDescriptorSet(
-                    draw.textureId, draw.textureWrapMode[0]);
-                if (!textureSets[0])
+                bindingKey[0] = draw.textureId;
+                bindingKey[8] = draw.textureWrapMode[0];
+                bindingKey[16] = uint32_t(fastPlants) << 8;
+                if (!fastPlants)
                 {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    continue;
+                    bindingKey[1] = draw.useNormalMap ? draw.normalMapTextureId : draw.textureId1;
+                    if (draw.useThirdTexture) bindingKey[2] = draw.textureStage2.textureId;
+                    if (draw.useFourthTexture) bindingKey[3] = draw.textureStage3.textureId;
+                    for (uint32_t stage = 0; stage < 4; ++stage)
+                    {
+                        // Disabled stage payloads may be uninitialized.
+                        if (draw.useTextureStages4To7[stage])
+                        {
+                            bindingKey[stage + 4] = draw.textureStages4To7[stage].textureId;
+                            bindingKey[stage + 12] = draw.textureStages4To7[stage].wrapMode;
+                        }
+                        bindingKey[stage + 8] = draw.textureWrapMode[stage];
+                        bindingKey[16] |= uint32_t(draw.useTextureStages4To7[stage]) << (stage + 4);
+                    }
+                    // Only active stages define the material binding packet.
+                    if (!draw.useSecondTexture && !draw.useNormalMap) bindingKey[1] = bindingKey[9] = 0;
+                    if (!draw.useThirdTexture) bindingKey[2] = bindingKey[10] = 0;
+                    if (!draw.useFourthTexture) bindingKey[3] = bindingKey[11] = 0;
+                    bindingKey[16] |= uint32_t(draw.useSecondTexture || draw.useNormalMap) |
+                        (uint32_t(draw.useThirdTexture) << 1) | (uint32_t(draw.useFourthTexture) << 2) |
+                        (uint32_t(draw.projectorCookieEnabled) << 3);
+                    bindingKey[17] = draw.projectorCookieEnabled ? draw.projectorCookieTextureId : 0;
+                    bindingKey[18] = draw.specularGlossTextureId > 0 ? draw.specularGlossTextureId : 0;
+                    bindingKey[19] = draw.specularOcclusionChannel >= 0 && draw.specularOcclusionChannel < 4 &&
+                        draw.specularOcclusionTextureId > 0 ? draw.specularOcclusionTextureId : 0;
                 }
-                textureSets[1] = textureSets[0];
-                textureSets[2] = textureSets[0];
-                textureSets[3] = textureSets[0];
-        for (uint32_t stageIndex = 0; stageIndex < 4; ++stageIndex)
-                    textureSets[stageIndex + 4] = textureSets[0];
+                size_t hash = 1469598103934665603ull;
+                for (uint32_t word : bindingKey) hash = (hash ^ word) * 1099511628211ull;
+                hash ^= hash >> 32;
+                bindingPacket = &materialBindings[hash & 127u];
             }
-            if (draw.useSecondTexture || draw.useNormalMap)
+            if (bindingPacket && bindingPacket->valid && bindingPacket->key == bindingKey)
             {
-                const int secondaryTextureId = draw.useNormalMap ? draw.normalMapTextureId : draw.textureId1;
-                textureSets[1] = GetLegacyTextureDescriptorSet(
-                    secondaryTextureId, draw.textureWrapMode[1]);
-                if (!textureSets[1])
+                std::memcpy(textureSets, bindingPacket->sets.data(), sizeof(textureSets));
+                ++m_sceneDiagnostics.materialBindingHits;
+            }
+            else
+            {
+                for (VkDescriptorSet& textureSet : textureSets)
+                    textureSet = m_descriptorSet;
+                if (draw.textureId)
                 {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    continue;
+                    textureSets[0] = GetLegacyTextureDescriptorSet(
+                        draw.textureId, draw.textureWrapMode[0]);
+                    if (!textureSets[0])
+                    {
+                        ++m_sceneDiagnostics.missingTextureAtRecord;
+                        continue;
+                    }
+                    textureSets[1] = textureSets[0];
+                    textureSets[2] = textureSets[0];
+                    textureSets[3] = textureSets[0];
+                    for (uint32_t stageIndex = 0; stageIndex < 4; ++stageIndex)
+                        textureSets[stageIndex + 4] = textureSets[0];
+                }
+                if (!fastPlants)
+                {
+                    if (draw.useSecondTexture || draw.useNormalMap)
+                    {
+                        const int secondaryTextureId = draw.useNormalMap ? draw.normalMapTextureId : draw.textureId1;
+                        textureSets[1] = GetLegacyTextureDescriptorSet(
+                            secondaryTextureId, draw.textureWrapMode[1]);
+                        if (!textureSets[1])
+                        {
+                            ++m_sceneDiagnostics.missingTextureAtRecord;
+                            continue;
+                        }
+                    }
+                    if (waterRefraction)
+                    {
+                        textureSets[1] = m_targets[m_imageIndex].waterDescriptorSets[viewIndex];
+                        if (!textureSets[1])
+                        {
+                            ++m_sceneDiagnostics.missingTextureAtRecord;
+                            continue;
+                        }
+                    }
+                    else if (waterReflection)
+                    {
+                        // The FFT ocean's CGRCOcean shader samples the mirrored
+                        // WaterMap. Keep it separate from the scene-color snapshot
+                        // used by water-volume refraction passes.
+                        textureSets[1] = m_targets[m_imageIndex].waterReflectionDescriptorSets[viewIndex];
+                        if (!textureSets[1])
+                        {
+                            ++m_sceneDiagnostics.missingTextureAtRecord;
+                            continue;
+                        }
+                    }
+                    if (draw.useThirdTexture)
+                    {
+                        textureSets[2] = GetLegacyTextureDescriptorSet(
+                            draw.textureStage2.textureId, draw.textureWrapMode[2]);
+                        if (!textureSets[2])
+                        {
+                            ++m_sceneDiagnostics.missingTextureAtRecord;
+                            continue;
+                        }
+                    }
+                    if (draw.useFourthTexture)
+                    {
+                        textureSets[3] = GetLegacyTextureDescriptorSet(
+                            draw.textureStage3.textureId, draw.textureWrapMode[3]);
+                        if (!textureSets[3])
+                        {
+                            ++m_sceneDiagnostics.missingTextureAtRecord;
+                            continue;
+                        }
+                    }
+                    bool missingExtraTexture = false;
+                    for (uint32_t stageIndex = 0; stageIndex < 4; ++stageIndex)
+                    {
+                        if (!draw.useTextureStages4To7[stageIndex])
+                            continue;
+                        const StockDrawTextureStage& stage = draw.textureStages4To7[stageIndex];
+                        std::unordered_map<int, LegacyTexture>::const_iterator texture = m_legacyTextures.find(stage.textureId);
+                        if (texture == m_legacyTextures.end())
+                        {
+                            ++m_sceneDiagnostics.missingTextureAtRecord;
+                            missingExtraTexture = true;
+                            break;
+                        }
+                        textureSets[stageIndex + 4] = GetLegacyTextureDescriptorSet(stage.textureId, stage.wrapMode);
+                        if (!textureSets[stageIndex + 4])
+                        {
+                            ++m_sceneDiagnostics.missingTextureAtRecord;
+                            missingExtraTexture = true;
+                            break;
+                        }
+                    }
+                    if (draw.projectorCookieEnabled)
+                    {
+                        textureSets[0] = GetProjectorTextureDescriptorSet(
+                            draw.textureId, draw.projectorCookieTextureId, draw.textureWrapMode[0]);
+                        if (!textureSets[0])
+                        {
+                            ++m_sceneDiagnostics.missingTextureAtRecord;
+                            continue;
+                        }
+                    }
+                    if (missingExtraTexture)
+                        continue;
+                    if (draw.specularGlossTextureId > 0)
+                    {
+                        textureSets[6] = GetLegacyTextureDescriptorSet(draw.specularGlossTextureId, -1);
+                        if (!textureSets[6]) { ++m_sceneDiagnostics.missingTextureAtRecord; continue; }
+                    }
+                    if (draw.specularOcclusionTextureId > 0 &&
+                        draw.specularOcclusionChannel >= 0 && draw.specularOcclusionChannel < 4)
+                    {
+                        textureSets[7] = GetLegacyTextureDescriptorSet(
+                            draw.specularOcclusionTextureId, -1);
+                        if (!textureSets[7])
+                        {
+                            ++m_sceneDiagnostics.missingTextureAtRecord;
+                            continue;
+                        }
+                    }
+                }
+                if (bindingPacket)
+                {
+                    bindingPacket->key = bindingKey;
+                    std::memcpy(bindingPacket->sets.data(), textureSets, sizeof(textureSets));
+                    bindingPacket->valid = true;
                 }
             }
-            if (waterRefraction)
-            {
-                textureSets[1] = m_targets[m_imageIndex].waterDescriptorSets[viewIndex];
-                if (!textureSets[1])
-                {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    continue;
-                }
-            }
-            else if (waterReflection)
-            {
-                // The FFT ocean's CGRCOcean shader samples the mirrored
-                // WaterMap. Keep it separate from the scene-color snapshot
-                // used by water-volume refraction passes.
-                textureSets[1] = m_targets[m_imageIndex].waterReflectionDescriptorSets[viewIndex];
-                if (!textureSets[1])
-                {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    continue;
-                }
-            }
-            if (draw.useThirdTexture)
-            {
-                textureSets[2] = GetLegacyTextureDescriptorSet(
-                    draw.textureStage2.textureId, draw.textureWrapMode[2]);
-                if (!textureSets[2])
-                {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    continue;
-                }
-            }
-            if (draw.useFourthTexture)
-            {
-                textureSets[3] = GetLegacyTextureDescriptorSet(
-                    draw.textureStage3.textureId, draw.textureWrapMode[3]);
-                if (!textureSets[3])
-                {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    continue;
-                }
-            }
-            uint32_t textureSetCount = draw.textureId ? 1u : 0u;
-            const bool usesEightStageShader = draw.useFourthTexture || draw.useTextureStages4To7[0] ||
-                draw.useTextureStages4To7[1] || draw.useTextureStages4To7[2] ||
-                draw.useTextureStages4To7[3];
-            bool missingExtraTexture = false;
-            if (draw.useSecondTexture || draw.useNormalMap) textureSetCount = 2;
-            if (draw.waterEffect) textureSetCount = 2;
-            if (draw.useThirdTexture) textureSetCount = 3;
-            if (draw.useFourthTexture) textureSetCount = 4;
-            for (uint32_t stageIndex = 0; stageIndex < 4; ++stageIndex)
-            {
-                if (!draw.useTextureStages4To7[stageIndex])
-                    continue;
-                const StockDrawTextureStage& stage = draw.textureStages4To7[stageIndex];
-                std::unordered_map<int, LegacyTexture>::const_iterator texture = m_legacyTextures.find(stage.textureId);
-                if (texture == m_legacyTextures.end())
-                {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    missingExtraTexture = true;
-                    break;
-                }
-                textureSets[stageIndex + 4] = GetLegacyTextureDescriptorSet(stage.textureId, stage.wrapMode);
-                if (!textureSets[stageIndex + 4])
-                {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    missingExtraTexture = true;
-                    break;
-                }
-            textureSetCount = stageIndex + 5;
-        }
-            if (draw.projectorCookieEnabled)
-            {
-                textureSets[0] = GetProjectorTextureDescriptorSet(
-                    draw.textureId, draw.projectorCookieTextureId, draw.textureWrapMode[0]);
-                if (!textureSets[0])
-                {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    continue;
-                }
-                if (textureSetCount == 0)
-                    textureSetCount = 1;
-            }
-            if (usesEightStageShader)
-                textureSetCount = 8;
-            if (missingExtraTexture)
-                continue;
-            if (draw.specularGlossTextureId > 0)
-            {
-                textureSets[6] = GetLegacyTextureDescriptorSet(draw.specularGlossTextureId, -1);
-                if (!textureSets[6]) { ++m_sceneDiagnostics.missingTextureAtRecord; continue; }
-            }
-            if (draw.specularOcclusionTextureId > 0 &&
-                draw.specularOcclusionChannel >= 0 && draw.specularOcclusionChannel < 4)
-            {
-                textureSets[7] = GetLegacyTextureDescriptorSet(
-                    draw.specularOcclusionTextureId, -1);
-                if (!textureSets[7])
-                {
-                    ++m_sceneDiagnostics.missingTextureAtRecord;
-                    continue;
-                }
-            }
-            textureSetCount = 8;
+            // CGRCPlants statically uses only set 0: base texture, shared
+            // material UBO and stereo instance SSBO. Do not bind seven unused
+            // legacy TMUs or resolve normal/specular maps the shader never reads.
             float pushConstants[32]{};
             float* mvp = pushConstants;
             float* eyeModelView = pushConstants + 16;
@@ -6731,6 +7171,9 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
             }
             if (m_multiview && waterReflection)
             {
+                // Reflection recording patches the same stereo payload that
+                // the uniform job initializes. Complete that job before patching.
+                m_uniformWorker.Wait();
                 float* transforms = reinterpret_cast<float*>(
                     static_cast<StockStereoTransform*>(m_stereoTransformBuffer.mappedData) + m_stereoDrawBase + i);
                 for (uint32_t eye = 0; eye < 2; ++eye)
@@ -6774,10 +7217,15 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                     extraTexturesUnchanged = extraTexturesUnchanged &&
                         boundTextureSets[setIndex] == textureSets[setIndex];
                 const uint32_t bindCount = extraTexturesUnchanged ? 1u : textureSetCount;
-                m_cmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                        m_scenePipelineLayout, 0,
-                                        bindCount,
-                                        textureSets, bindCount, transformOffsets);
+                if (!extraTexturesUnchanged || boundTextureSets[0] != textureSets[0] ||
+                    boundTransformOffset != transformOffsets[0])
+                {
+                    m_cmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                            m_scenePipelineLayout, 0,
+                                            bindCount,
+                                            textureSets, bindCount, transformOffsets);
+                    boundTransformOffset = transformOffsets[0];
+                }
                 for (uint32_t setIndex = 0; setIndex < textureSetCount; ++setIndex)
                     boundTextureSets[setIndex] = textureSets[setIndex];
                 boundTextureSetCount = textureSetCount;
@@ -6852,6 +7300,7 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 for (bool enabled : draw.useTextureStages4To7) p.textureCount += enabled;
                 const float terrainMarker = draw.terrainProjectionRows[1][7][3];
                 if (draw.decalDraw) p.category = "decal";
+                else if (draw.grassDraw) p.category = "terrain_grass";
                 else if (draw.waterEffect) p.category = "water";
                 else if (p.shaderTag == 11) p.category = "terrain_layer";
                 else if (p.shaderTag == 12) p.category = "caustics";
@@ -6877,13 +7326,12 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
                 m_cmdBeginQuery(commandBuffer, m_visibilityQueryPool,
                                 draw.visibilityCoverageQueryIndex, 0);
             uint32_t plantsInstances = 1;
-            const bool fastPlants = (draw.pipelineKey[62] & 0x7fffffffu) == 13u;
             if (fastPlants && m_multiview && !profileGpu && !collectVisibility && !collectCoverage)
             {
                 // Merge only adjacent submissions. Instance order preserves
                 // CryEngine's alpha-blending order without a material resort.
                 while (plantsInstances < 256u && i + plantsInstances < m_stockDraws.size() &&
-                       canInstancePlants(draw, m_stockDraws[i + plantsInstances]))
+                       CanInstancePlants(draw, m_stockDraws[i + plantsInstances], plantsBatchFailures))
                     ++plantsInstances;
             }
             m_cmdDrawIndexed(commandBuffer, draw.indexCount, plantsInstances, draw.firstIndex, draw.vertexOffset, 0);
@@ -7095,6 +7543,56 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
     if (timeGpu)
         m_cmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                             m_timingQueryPool, timingBase + 2);
+    if (m_swapchain.transferDestination && m_cmdCopyImage)
+    {
+        // Scene and OpenXR images have identical extent, format and sample
+        // count. No filtering/color conversion is needed for this output.
+        VkImageMemoryBarrier before[2]{};
+        for (auto& b : before)
+        {
+            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            b.subresourceRange.levelCount = b.subresourceRange.layerCount = 1;
+        }
+        before[0].image = m_targets[m_imageIndex].color[viewIndex].image;
+        before[0].subresourceRange.baseArrayLayer = m_multiview ? viewIndex : 0u;
+        before[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        before[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        before[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        before[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        before[1].image = m_targets[m_imageIndex].image;
+        before[1].subresourceRange.baseArrayLayer = viewIndex;
+        before[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        before[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        before[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        m_cmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, before);
+        VkImageCopy region{};
+        region.srcSubresource.aspectMask = region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.srcSubresource.baseArrayLayer = m_multiview ? viewIndex : 0u;
+        region.dstSubresource.baseArrayLayer = viewIndex;
+        region.srcSubresource.layerCount = region.dstSubresource.layerCount = 1;
+        region.extent = { m_swapchain.width, m_swapchain.height, 1 };
+        m_cmdCopyImage(commandBuffer, before[0].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            before[1].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        VkImageMemoryBarrier after[2] = { before[0], before[1] };
+        after[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        after[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        after[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        after[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        after[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        // OpenXR requires COLOR_ATTACHMENT_OPTIMAL at release, not PRESENT.
+        after[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        after[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        m_cmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            0, 0, nullptr, 0, nullptr, 2, after);
+        if (timeGpu) m_cmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            m_timingQueryPool, timingBase + 3);
+        return m_endCommandBuffer(commandBuffer) == VK_SUCCESS;
+    }
     VkImageMemoryBarrier sampleBarrier{};
     sampleBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     sampleBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -7156,28 +7654,106 @@ bool VulkanFrameRenderer::RecordAndSubmit(uint32_t viewIndex)
     return m_endCommandBuffer(commandBuffer) == VK_SUCCESS;
 }
 
+VkPipeline VulkanFrameRenderer::FindCachedScenePipeline(const std::array<uint32_t, 64>& key)
+{
+    const size_t bucketIndex = ScenePipelineHash{}(key) & 255u;
+    auto& bucket = m_pipelineLookup[bucketIndex];
+    for (const auto& entry : bucket)
+        if (entry.pipeline && entry.key == key) return entry.pipeline;
+    const auto found = m_scenePipelineCache.find(key);
+    if (found == m_scenePipelineCache.end()) return VK_NULL_HANDLE;
+    // Never cache a missing/pending pipeline: compilation may finish this frame.
+    auto& entry = bucket[m_pipelineLookupNext[bucketIndex]++ & 3u];
+    entry.key = key;
+    entry.pipeline = found->second;
+    return entry.pipeline;
+}
+
+uint8_t VulkanFrameRenderer::GetScenePipelineQueueState(
+    const std::array<uint32_t, 64>& key)
+{
+    const size_t bucketIndex = ScenePipelineHash{}(key) & 255u;
+    auto& bucket = m_pipelineQueueLookup[bucketIndex];
+    for (const auto& entry : bucket)
+        if (entry.valid && entry.frame == m_frameBeginSuccesses && entry.key == key)
+            return entry.state;
+
+    uint8_t state = 0;
+    if (m_pendingScenePipelines.find(key) != m_pendingScenePipelines.end()) state |= 1u;
+    if (m_deferredReflectionPipelines.find(key) != m_deferredReflectionPipelines.end()) state |= 2u;
+    auto& entry = bucket[m_pipelineQueueLookupNext[bucketIndex]++ & 3u];
+    entry.key = key;
+    entry.frame = m_frameBeginSuccesses;
+    entry.state = state;
+    entry.valid = true;
+    return state;
+}
+
+void VulkanFrameRenderer::SetScenePipelineQueueState(
+    const std::array<uint32_t, 64>& key, uint8_t state)
+{
+    const size_t bucketIndex = ScenePipelineHash{}(key) & 255u;
+    auto& bucket = m_pipelineQueueLookup[bucketIndex];
+    for (auto& entry : bucket)
+        if (entry.valid && entry.frame == m_frameBeginSuccesses && entry.key == key)
+        {
+            entry.state = state;
+            return;
+        }
+    auto& entry = bucket[m_pipelineQueueLookupNext[bucketIndex]++ & 3u];
+    entry.key = key;
+    entry.frame = m_frameBeginSuccesses;
+    entry.state = state;
+    entry.valid = true;
+}
+
 bool VulkanFrameRenderer::ResolveScenePipelines()
 {
+    if (m_updateOceanReflection[0] || m_updateOceanReflection[1])
+    {
+        for (const auto& draw : m_stockDraws)
+        {
+            if (!draw.reflectionUniforms || !draw.separateReflectionPipeline || draw.reflectionPipeline)
+                continue;
+            auto key = draw.pipelineKey;
+            key[0] &= ~0x3u;
+            key[63] &= ~1u;
+            key[62] |= 0x80000000u;
+            const auto deferred = m_deferredReflectionPipelines.find(key);
+            if (deferred == m_deferredReflectionPipelines.end()) continue;
+            if (m_pendingScenePipelines.find(key) == m_pendingScenePipelines.end())
+                m_pendingScenePipelines.emplace(key, m_pipelineFactory.EnqueueGraphicsPipeline(deferred->second));
+            m_deferredReflectionPipelines.erase(deferred);
+        }
+    }
     if (m_pendingScenePipelines.empty()) return true;
     bool success = true;
-    for (auto& entry : m_pendingScenePipelines)
+    for (auto entry = m_pendingScenePipelines.begin(); entry != m_pendingScenePipelines.end();)
     {
-        const auto result = entry.second.get();
+        // Pipeline creation runs on a worker, but waiting here made the render
+        // thread block for the full driver compile (occasionally tens of ms).
+        // Keep unfinished variants queued across frames; draws that depend on
+        // them are skipped by RecordAndSubmit until the pipeline is ready.
+        if (entry->second.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        {
+            ++entry;
+            continue;
+        }
+        const auto result = entry->second.get();
         if (result.pipeline)
-            m_scenePipelineCache[entry.first] = result.pipeline;
+            m_scenePipelineCache[entry->first] = result.pipeline;
         else
         {
             ++m_sceneDiagnostics.pipelineCreationFailed;
             success = false;
         }
+        entry = m_pendingScenePipelines.erase(entry);
     }
-    m_pendingScenePipelines.clear();
     for (auto& draw : m_stockDraws)
     {
         if (!draw.pipeline)
         {
-            auto found = m_scenePipelineCache.find(draw.pipelineKey);
-            if (found != m_scenePipelineCache.end()) draw.pipeline = found->second;
+            draw.pipeline = FindCachedScenePipeline(draw.pipelineKey);
         }
         if (!draw.reflectionPipeline)
         {
@@ -7186,9 +7762,9 @@ bool VulkanFrameRenderer::ResolveScenePipelines()
             {
                 auto reflectionKey = draw.pipelineKey;
                 reflectionKey[0] &= ~0x3u;
-                reflectionKey[63] = 0;
-                auto found = m_scenePipelineCache.find(reflectionKey);
-                if (found != m_scenePipelineCache.end()) draw.reflectionPipeline = found->second;
+                reflectionKey[63] &= ~1u;
+                reflectionKey[62] |= 0x80000000u;
+                draw.reflectionPipeline = FindCachedScenePipeline(reflectionKey);
             }
         }
     }
@@ -7271,6 +7847,11 @@ bool VulkanFrameRenderer::EndFrame()
                     firstViewRecorded = true;
             }
         }
+        // Coherent host writes must finish before queue submission. Also drain
+        // on recording failure so no job can access a later frame's snapshots.
+        const double uniformJoinStartMs = FrameClockMs();
+        m_uniformWorker.Wait();
+        uniformPrepareMs += FrameClockMs() - uniformJoinStartMs;
         cpuRecordMs = FrameClockMs() - cpuRecordStartMs;
         if (commandCount)
         {
@@ -7309,7 +7890,7 @@ bool VulkanFrameRenderer::EndFrame()
                 m_pendingDrawCount = m_stockDraws.size();
                 m_pendingAbMode = m_recordedAbMode;
                 m_pendingAbSkipped = m_recordedAbSkipped;
-                m_pendingAbGroup = m_gpuAbPairs % 10;
+                m_pendingAbGroup = m_gpuAbPairs % kGpuAbGroupCount;
                 m_pendingAbHash = m_recordedAbHash;
                 m_pendingSimpleDecalDraws = 0;
                 m_pendingGpuProfiles.swap(m_recordedGpuProfiles);
@@ -7418,9 +7999,39 @@ bool VulkanFrameRenderer::EndFrame()
         static unsigned samples = 0, reports = 0;
         static double sums[8] = {}, maxima[8] = {};
         static uint64_t decalDrawSum = 0, decalMergedSum = 0;
+        static uint64_t geometryEligibleSum = 0, geometryHitSum = 0, geometryByteSum = 0;
+        static uint64_t sharedPlantUniformSum = 0, materialBindingSum = 0, depthSortedSum = 0;
+        static uint64_t opaqueNoDiscardSum = 0;
+        const double cpuEndDuration = FrameClockMs() - cpuEndStartMs;
         const double phases[8] = {m_cpuBeginDurationMs, cpuCaptureMs,
-            cpuRecordMs, gpuWaitMs, FrameClockMs() - cpuEndStartMs,
+            cpuRecordMs, gpuWaitMs, cpuEndDuration,
             m_cpuUpdateDurationMs, uniformPrepareMs, pipelineWaitMs};
+        // Report individual hitches with their frame's workload, rather than
+        // inferring their cause from 120-frame average/max pairs. Limit I/O to
+        // one line per 60 frames and 64 lines for the entire process lifetime.
+        static uint32_t spikeReports = 0, lastSpikeFrame = 0;
+        const double cpuFrame = m_cpuBeginDurationMs + cpuCaptureMs +
+            cpuEndDuration + m_cpuUpdateDurationMs;
+        if (cpuFrame > 20.0 && spikeReports < 64 &&
+            (!spikeReports || m_frameBeginSuccesses - lastSpikeFrame >= 60))
+        {
+            if (FILE* spikes = fopen("/sdcard/FarCry/vulkan_cpu_spikes.csv", spikeReports ? "ab" : "wb"))
+            {
+                if (!spikeReports) fprintf(spikes,
+                    "frame,cpu_ms,capture_ms,record_ms,end_ms,update_ms,gpu_wait_ms,uniform_ms,pipeline_wait_ms,draws,scene_draw_calls,reflection_updates,geometry_upload_bytes,geometry_hits,material_binding_hits,depth_sorted_draws\n");
+                fprintf(spikes, "%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%zu,%u,%u,%llu,%u,%u,%u\n",
+                    m_frameBeginSuccesses, cpuFrame, cpuCaptureMs, cpuRecordMs, cpuEndDuration,
+                    m_cpuUpdateDurationMs, gpuWaitMs, uniformPrepareMs, pipelineWaitMs,
+                    m_stockDraws.size(), m_sceneDiagnostics.recordedEyeDraws,
+                    uint32_t(m_updateOceanReflection[0]) + uint32_t(m_updateOceanReflection[1]),
+                    static_cast<unsigned long long>(m_sceneDiagnostics.transientGeometryBytes),
+                    m_sceneDiagnostics.geometryCacheHits, m_sceneDiagnostics.materialBindingHits,
+                    m_sceneDiagnostics.depthSortedDraws);
+                fclose(spikes);
+            }
+            ++spikeReports;
+            lastSpikeFrame = m_frameBeginSuccesses;
+        }
         if (reports < 128)
         {
             for (unsigned i = 0; i < 8; ++i)
@@ -7430,25 +8041,44 @@ bool VulkanFrameRenderer::EndFrame()
             }
             decalDrawSum += m_sceneDiagnostics.queuedDecalDraws;
             decalMergedSum += m_sceneDiagnostics.mergedDecalDraws;
+            geometryEligibleSum += m_sceneDiagnostics.geometryCacheEligible;
+            geometryHitSum += m_sceneDiagnostics.geometryCacheHits;
+            geometryByteSum += m_sceneDiagnostics.transientGeometryBytes;
+            sharedPlantUniformSum += m_sceneDiagnostics.sharedPlantUniforms;
+            materialBindingSum += m_sceneDiagnostics.materialBindingHits;
+            depthSortedSum += m_sceneDiagnostics.depthSortedDraws;
+            opaqueNoDiscardSum += m_sceneDiagnostics.opaqueNoDiscardDraws;
             if (++samples == 120)
             {
                 FILE* file = fopen("/sdcard/FarCry/vulkan_frame_timings.csv", reports ? "ab" : "wb");
                 if (file)
                 {
-                    if (!reports) fprintf(file, "frame,draws,begin_avg,begin_max,capture_avg,capture_max,record_avg,record_max,gpu_wait_avg,gpu_wait_max,end_avg,end_max,update_gap_avg,update_gap_max,uniform_avg,uniform_max,pipeline_wait_avg,pipeline_wait_max,multiview,scene_draw_calls,decal_draws_avg,decal_merged_avg\n");
+                    if (!reports) fprintf(file, "frame,draws,begin_avg,begin_max,capture_avg,capture_max,record_avg,record_max,gpu_wait_avg,gpu_wait_max,end_avg,end_max,update_gap_avg,update_gap_max,uniform_avg,uniform_max,pipeline_wait_avg,pipeline_wait_max,multiview,scene_draw_calls,decal_draws_avg,decal_merged_avg,geometry_eligible_avg,geometry_hits_avg,geometry_upload_bytes_avg,geometry_vertex_cache_bytes,geometry_index_cache_bytes,shared_plant_uniforms_avg,material_binding_hits_avg,depth_sorted_draws_avg,initial_clear_mask,opaque_no_discard_avg\n");
                     fprintf(file, "%u,%zu", m_frameBeginSuccesses, m_stockDraws.size());
                     for (unsigned i = 0; i < 8; ++i)
                         fprintf(file, ",%.3f,%.3f", sums[i] / samples, maxima[i]);
-                    fprintf(file, ",%u,%u,%.2f,%.2f\n", m_multiview ? 1u : 0u,
+                    fprintf(file, ",%u,%u,%.2f,%.2f,%.2f,%.2f,%.0f,%llu,%llu,%.2f,%.2f,%.2f,%u,%.2f\n", m_multiview ? 1u : 0u,
                         m_sceneDiagnostics.recordedEyeDraws,
                         static_cast<double>(decalDrawSum) / samples,
-                        static_cast<double>(decalMergedSum) / samples);
+                        static_cast<double>(decalMergedSum) / samples,
+                        static_cast<double>(geometryEligibleSum) / samples,
+                        static_cast<double>(geometryHitSum) / samples,
+                        static_cast<double>(geometryByteSum) / samples,
+                        static_cast<unsigned long long>(m_staticVertexUsed),
+                        static_cast<unsigned long long>(m_staticIndexUsed),
+                        static_cast<double>(sharedPlantUniformSum) / samples,
+                        static_cast<double>(materialBindingSum) / samples,
+                        static_cast<double>(depthSortedSum) / samples,
+                        m_sceneDiagnostics.initialClearMask,
+                        static_cast<double>(opaqueNoDiscardSum) / samples);
                     fclose(file);
                 }
                 ++reports;
                 samples = 0;
                 for (unsigned i = 0; i < 8; ++i) sums[i] = maxima[i] = 0.0;
                 decalDrawSum = decalMergedSum = 0;
+                geometryEligibleSum = geometryHitSum = geometryByteSum = 0;
+                sharedPlantUniformSum = materialBindingSum = depthSortedSum = opaqueNoDiscardSum = 0;
             }
         }
     }
@@ -7475,6 +8105,8 @@ void VulkanFrameRenderer::Shutdown()
 {
     m_uniformWorker.Stop();
     // Drain compilation before destroying any referenced modules or layouts.
+    m_updateOceanReflection.fill(false);
+    m_deferredReflectionPipelines.clear();
     m_pipelineFactory.StopCompiler();
     ResolveScenePipelines();
     CompletePendingSubmission();
@@ -7579,6 +8211,8 @@ void VulkanFrameRenderer::Shutdown()
         {
             m_resources->DestroyBuffer(m_dynamicVertexBuffer);
             m_resources->DestroyBuffer(m_dynamicIndexBuffer);
+            m_resources->DestroyBuffer(m_staticVertexArena);
+            m_resources->DestroyBuffer(m_staticIndexArena);
             m_resources->DestroyBuffer(m_textureTransformBuffer);
             m_resources->DestroyBuffer(m_stereoTransformBuffer);
             for (auto& buffer : m_previousStereoTransformBuffers) m_resources->DestroyBuffer(buffer);
@@ -7680,6 +8314,13 @@ void VulkanFrameRenderer::Shutdown()
             m_destroyDescriptorPool(m_context->GetDevice(), m_descriptorPool, nullptr);
         if (m_descriptorSetLayout && m_destroyDescriptorSetLayout)
             m_destroyDescriptorSetLayout(m_context->GetDevice(), m_descriptorSetLayout, nullptr);
+        for (uint32_t mask = 1; mask < 7; ++mask)
+        {
+            if (m_initialClearPasses[mask] && m_destroyRenderPass)
+                m_destroyRenderPass(m_context->GetDevice(), m_initialClearPasses[mask], nullptr);
+            if (m_multiviewInitialClearPasses[mask] && m_destroyRenderPass)
+                m_destroyRenderPass(m_context->GetDevice(), m_multiviewInitialClearPasses[mask], nullptr);
+        }
         if (m_multiviewRenderPass && m_destroyRenderPass)
             m_destroyRenderPass(m_context->GetDevice(), m_multiviewRenderPass, nullptr);
         if (m_multiviewLoadRenderPass && m_destroyRenderPass)
@@ -7705,7 +8346,7 @@ void VulkanFrameRenderer::Shutdown()
     m_gpuProfileReports = 0;
     m_gpuProfileArmed = false;
     m_gpuAbArmed = m_gpuAbBaselineReady = m_stockProfilePlants = m_stockDecalDraw = false;
-    m_stockTerrainDraw = m_stockWaterDraw = m_stockCharacterDraw = false;
+    m_stockTerrainDraw = m_stockWaterDraw = m_stockCharacterDraw = m_stockGrassDraw = false;
     m_gpuAbPairs = m_recordedAbMode = m_pendingAbMode = 0;
     m_recordedGpuProfiles.clear();
     m_pendingGpuProfiles.clear();
@@ -7720,6 +8361,8 @@ void VulkanFrameRenderer::Shutdown()
     m_pendingVisibilityTotalCoverage = false;
     m_renderPass = VK_NULL_HANDLE;
     m_multiviewRenderPass = VK_NULL_HANDLE;
+    m_initialClearPasses.fill(VK_NULL_HANDLE);
+    m_multiviewInitialClearPasses.fill(VK_NULL_HANDLE);
     m_multiviewLoadRenderPass = VK_NULL_HANDLE;
     m_loadRenderPass = VK_NULL_HANDLE;
     m_outputRenderPass = VK_NULL_HANDLE;
@@ -7769,6 +8412,9 @@ void VulkanFrameRenderer::Shutdown()
     for (VkShaderModule& module : m_generatedTextureVertexShaders) module = VK_NULL_HANDLE;
     m_sceneTextureBumpFragmentShader = VK_NULL_HANDLE;
     m_scenePipelineCache.clear();
+    for (auto& bucket : m_pipelineLookup)
+        for (auto& entry : bucket) entry.pipeline = VK_NULL_HANDLE;
+    m_pipelineLookupNext.fill(0);
     m_lastScenePipelineValid = false;
     m_legacyTextures.clear();
     m_shadowMapTargets.clear();
@@ -7790,6 +8436,8 @@ void VulkanFrameRenderer::Shutdown()
     m_dynamicIndexUsed = 0;
     m_previousDynamicVertexBuffers.clear();
     m_previousDynamicIndexBuffers.clear();
+    m_staticGeometryUploads.clear();
+    m_staticVertexUsed = m_staticIndexUsed = 0;
     m_previousTextureTransformBuffers.clear();
     m_frameSubmissionPending = false;
     m_commandPool = VK_NULL_HANDLE;

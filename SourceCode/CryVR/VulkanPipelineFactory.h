@@ -96,6 +96,11 @@ struct VulkanGraphicsPipelineDesc
     float stockMaterialLightingMode = -1.0f;
     float stockMaterialColorMode = -1.0f;
     uint32_t stockMaterialNormalMode = 0xffffffffu;
+    uint32_t stockTextureTransformFlags = 0x00ff0000u;
+    uint32_t stockFixedLightCount = 0xffffffffu;
+    bool stockEnhancedSurfaces = true;
+    bool stockPlantImplicitLod = false;
+    bool stockNativeTerrain = false;
     bool stockZeroAlphaBlendNoOp = false;
     std::array<VulkanPipelineTextureStage, 4> stages4To7{};
     bool supportsWireframe = false;

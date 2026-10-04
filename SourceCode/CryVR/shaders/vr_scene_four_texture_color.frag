@@ -225,7 +225,7 @@ void main() {
     }
     if (stockFragmentDiscardEnabled && dot(vec4(clipPosition, 1.0), textureStageTransforms.clipPlane) < 0.0) discard;
     vec4 generatedVertexColor = vertexColor;
-    if (textureStageTransforms.materialParams.w > 0.5 && textureStageTransforms.materialParams.w < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
+    if (stockMaterialColorMode() > 0.5 && stockMaterialColorMode() < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
     vec4 primaryColor = mix(generatedVertexColor, textureStageTransforms.primaryColor, textureStageTransforms.primaryColorMask);
     if (!stockFeatureDisabled(STOCK_NO_FRAGMENT_LIGHTING))
         primaryColor.rgb *= evaluateStockLighting(objectPosition, objectNormal,
@@ -249,14 +249,26 @@ void main() {
     previous = clamp(previous, 0.0, 1.0);
     vec2 stage1TexCoord = stockTerrainStageTexCoord(1u,
         stage1UsesTexCoord1 != 0u ? texCoord1 : texCoord0, objectPosition);
-    vec4 layer = sampleSecondaryTexture(stage1TexCoord);
     if (stockFeatureDisabled(STOCK_DIRECTIONAL_LIGHTMAP_FAST)) {
         // CGRCAmbientTempl TEMP_DOT3LM replaces all intermediate RGB
         // combiners. Retain stage 0's alpha and the original four samples.
-        vec4 irradiance = sampleTertiaryTexture(transformStageUv(2u,
-            stage2UsesTexCoord1 != 0u ? texCoord1 : texCoord0));
-        vec4 direction = sampleFourthTexture(transformStageUv(3u,
-            stage3UsesTexCoord1 != 0u ? texCoord1 : texCoord0));
+        vec2 irradianceUv = transformStageUv(2u, stage2UsesTexCoord1 != 0u ? texCoord1 : texCoord0);
+        vec2 directionUv = transformStageUv(3u, stage3UsesTexCoord1 != 0u ? texCoord1 : texCoord0);
+        vec2 layerDx = dFdx(stage1TexCoord) * textureStageTransforms.textureLodBias.y;
+        vec2 layerDy = dFdy(stage1TexCoord) * textureStageTransforms.textureLodBias.y;
+        vec2 irradianceDx = dFdx(irradianceUv) * textureStageTransforms.textureLodBias.z;
+        vec2 irradianceDy = dFdy(irradianceUv) * textureStageTransforms.textureLodBias.z;
+        vec2 directionDx = dFdx(directionUv) * textureStageTransforms.textureLodBias.w;
+        vec2 directionDy = dFdy(directionUv) * textureStageTransforms.textureLodBias.w;
+        float alpha = previous.a;
+        if (textureStageTransforms.materialParams.z <= 0.5)
+            alpha *= textureStageTransforms.materialParams.x;
+        if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(alpha,
+            textureStageTransforms.materialParams.y, alphaTestMode)) discard;
+        vec4 layer = stockEnhancedSurfaces ?
+            textureGrad(secondaryTexture, stage1TexCoord, layerDx, layerDy) : vec4(0.5, 0.5, 1.0, 1.0);
+        vec4 irradiance = textureGrad(tertiaryTexture, irradianceUv, irradianceDx, irradianceDy);
+        vec4 direction = textureGrad(fourthTexture, directionUv, directionDx, directionDy);
         float ndotl = clamp(dot(direction.rgb * 2.0 - 1.0, layer.rgb * 2.0 - 1.0), 0.0, 1.0);
         float intensity = ndotl * irradiance.a + (1.0 - irradiance.a);
         vec3 bakedDiffuse = textureStageTransforms.fogEndDepthRange.w > 0.5 ?
@@ -264,14 +276,13 @@ void main() {
         vec4 result = vec4(base.rgb * (textureStageTransforms.materialAmbient.rgb *
             primaryColor.rgb + bakedDiffuse), previous.a);
         result = applyMaterialOverrides(result);
-        if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(result.a,
-            textureStageTransforms.materialParams.y, alphaTestMode)) discard;
         result.rgb += stockSeparateSpecular;
-        if (textureStageTransforms.materialAmbient.w > 1.5)
+        if (stockMaterialLightingMode() > 1.5)
             result.rgb = clamp(result.rgb, 0.0, 1.0);
         outColor = applySceneFog(result);
         return;
     }
+    vec4 layer = sampleSecondaryTexture(stage1TexCoord);
     vec4 env1 = unpackUnorm4x8(stage1Constant);
     vec3 s1a = sourceRgb(stage1ColorArg & 7u, layer, primaryColor, previous, env1);
     vec3 s1b = sourceRgb((stage1ColorArg >> 3) & 7u, layer, primaryColor, previous, env1);
@@ -362,7 +373,7 @@ void main() {
         outColor = applySceneFog(vec4(mix(terrainColor, volumeColor, clamp(fog.a, 0.0, 1.0)), alpha));
         return;
     }
-    if (!stockFeatureDisabled(STOCK_NO_TERRAIN) && textureStageTransforms.materialParams.w > 2.5 && stockTerrainOnlyCount() == 0) {
+    if (!stockFeatureDisabled(STOCK_NO_TERRAIN) && stockMaterialColorMode() > 2.5 && stockTerrainOnlyCount() == 0) {
         vec3 detail0 = mix(vec3(0.5), base.rgb, secondaryColor.r);
         vec3 detail1 = mix(vec3(0.5), layer.rgb, secondaryColor.g);
         vec3 detail2 = mix(vec3(0.5), tertiary.rgb, secondaryColor.b);
@@ -379,7 +390,7 @@ void main() {
         // light direction are both tangent-space vectors. The direction
         // map alpha scales the baked light; the color map alpha controls
         // the directional blend.
-        vec3 bumpNormal = layer.rgb * 2.0 - 1.0;
+        vec3 bumpNormal = stockEnhancedSurfaces ? layer.rgb * 2.0 - 1.0 : vec3(0.0, 0.0, 1.0);
         vec3 lightDirection = fourth.rgb * 2.0 - 1.0;
         float ndotl = clamp(dot(lightDirection, bumpNormal), 0.0, 1.0);
         float lightmapIntensity = ndotl * tertiary.a + (1.0 - tertiary.a);
@@ -440,7 +451,7 @@ void main() {
     color = applyMaterialOverrides(color);
     if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(color.a, textureStageTransforms.materialParams.y, alphaTestMode)) discard;
     color.rgb += stockSeparateSpecular;
-    if (textureStageTransforms.materialAmbient.w > 1.5)
+    if (stockMaterialLightingMode() > 1.5)
         color.rgb = clamp(color.rgb, 0.0, 1.0);
     outColor = applySceneFog(color);
 }

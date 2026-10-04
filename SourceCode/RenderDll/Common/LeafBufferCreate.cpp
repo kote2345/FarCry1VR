@@ -1691,6 +1691,12 @@ void CLeafBuffer::SortTris()
       continue;
 
     IShader *pSH = pMI->shaderItem.m_pShader->GetTemplate(-1);
+    // Opaque cutouts resolve visibility through depth testing. Sorting their
+    // individual triangles by camera distance only rewrites a stable index
+    // stream every frame and invalidates Vulkan's persistent geometry cache.
+    if (rd->GetType() == R_VULKAN_RENDERER && !bGlobalTransp &&
+        (pSH->GetFlags3() & EF3_HASALPHATEST) && !pMI->shaderItem.IsTransparent())
+      continue;
     if (!bGlobalTransp)
     {
       if (!(pSH->GetFlags3() & EF3_HASALPHATEST))
@@ -2020,6 +2026,12 @@ void CLeafBuffer::UpdateVidIndices(const ushort *pNewInds, int nInds)
 }
 void CLeafBuffer::UpdateSysIndices(const ushort *pNewInds, int nInds)
 {
+  // Sector seams are submitted again even when their LOD has not changed.
+  // Preserve the video index stream and its revision for identical data.
+  if (gRenDev->GetType() == R_VULKAN_RENDERER && nInds == m_NumIndices &&
+      m_SecIndices.Num() == nInds && (nInds == 0 ||
+      (pNewInds && !memcmp(&m_SecIndices[0], pNewInds, size_t(nInds) * sizeof(ushort)))))
+    return;
   m_NumIndices = nInds;
   if (m_SecIndices.Num() != nInds)
   {

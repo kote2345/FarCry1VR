@@ -46,14 +46,14 @@ vec4 applyMaterialOverrides(vec4 c) {
 void main() {
     if (stockFragmentDiscardEnabled && dot(vec4(clipPosition, 1.0), textureStageTransforms.clipPlane) < 0.0) discard;
     vec4 generatedVertexColor = vertexColor;
-    if (textureStageTransforms.materialParams.w > 0.5 && textureStageTransforms.materialParams.w < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
+    if (stockMaterialColorMode() > 0.5 && stockMaterialColorMode() < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
     vec4 color = mix(generatedVertexColor, textureStageTransforms.primaryColor, textureStageTransforms.primaryColorMask);
     if (!stockFeatureDisabled(STOCK_NO_FRAGMENT_LIGHTING))
         color.rgb *= evaluateStockLighting(objectPosition, objectNormal, vec2(0.0), hasMaterialLighting);
     color = applyMaterialOverrides(color);
     if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(color.a, textureStageTransforms.materialParams.y, alphaTestMode)) discard;
     color.rgb += stockSeparateSpecular;
-    if (textureStageTransforms.materialAmbient.w > 1.5)
+    if (stockMaterialLightingMode() > 1.5)
         color.rgb = clamp(color.rgb, 0.0, 1.0);
     outColor = applySceneFog(color);
 }

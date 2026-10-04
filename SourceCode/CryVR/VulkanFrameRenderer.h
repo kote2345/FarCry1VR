@@ -16,6 +16,7 @@
 #include <set>
 #include <deque>
 #include <unordered_map>
+#include <cstring>
 
 namespace CryVR
 {
@@ -86,6 +87,11 @@ struct VulkanSceneDiagnostics
     uint32_t nullPipelineAtRecord = 0;
     uint32_t emptyScissor = 0;
     uint32_t recordedEyeDraws = 0;
+    uint32_t geometryCacheEligible = 0, geometryCacheHits = 0;
+    uint64_t transientGeometryBytes = 0;
+    uint32_t sharedPlantUniforms = 0;
+    uint32_t materialBindingHits = 0, depthSortedDraws = 0;
+    uint32_t initialClearMask = 0, opaqueNoDiscardDraws = 0;
 };
 
 // OpenXR projection renderer for native Vulkan scene draws and stereo UI.
@@ -306,11 +312,12 @@ public:
         m_stockSpecularProgramFlags = flags; m_stockSpecularGlossTexture = glossTexture;
     }
     void SetStockDecalDraw(bool value) { m_stockDecalDraw = value; }
-    void SetStockGpuProfileCategories(bool terrain, bool water, bool character)
+    void SetStockGpuProfileCategories(bool terrain, bool water, bool character, bool grass = false)
     {
         m_stockTerrainDraw = terrain;
         m_stockWaterDraw = water;
         m_stockCharacterDraw = character;
+        m_stockGrassDraw = grass;
     }
     void SetStockFixedLights(const std::array<std::array<float, 16>, 8>& lights, uint32_t count,
                             const float* modelView = nullptr, const float* normalMatrix = nullptr)
@@ -324,6 +331,12 @@ public:
             m_stockFixedMatrices[0][i] = modelView ? modelView[i] : (i % 5 == 0 ? 1.0f : 0.0f);
             m_stockFixedMatrices[1][i] = normalMatrix ? normalMatrix[i] : (i % 5 == 0 ? 1.0f : 0.0f);
         }
+    }
+    void SetStockNativeTerrain(const float* cameraAndFade, uint32_t mode)
+    {
+        m_stockNativeTerrainMode = mode;
+        if (mode && cameraAndFade)
+            std::memcpy(m_stockNativeTerrainParameters.data(), cameraAndFade, sizeof(float) * 4);
     }
     void SetStockLinearTexgen(uint32_t stage, const VulkanStockLinearTexgen& value)
     {
@@ -423,6 +436,7 @@ private:
         bool profilePlants = false;
         bool decalDraw = false;
         bool terrainDraw = false;
+        bool grassDraw = false;
         bool waterDraw = false;
         bool characterDraw = false;
         bool simpleDecalMode = false;
@@ -457,6 +471,7 @@ private:
         VkDeviceSize vertexBufferOffset = 0;
         VkDeviceSize lightmapTexCoordOffset = 0;
         uint32_t textureTransformOffset = 0;
+        uint32_t uniformSourceIndex = UINT32_MAX;
         VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         std::array<uint32_t, 64> pipelineKey;
         bool separateReflectionPipeline = false;
@@ -507,13 +522,16 @@ private:
         float reflectionModelView[16];
         float reflectionClipPlane[4];
         bool hasWaterReflectionTransform = false;
+        bool reflectionUniforms = false;
         VulkanWaterReflectionUpdate waterReflectionUpdate{};
         bool hasWaterReflectionUpdate = false;
         float textureMatrix0[16];
         float textureMatrix1[16];
-        float textureTransformRows[3][8][4]{};
+        float textureTransformRows[3][8][4];
         uint32_t fixedLightCount = 0;
-        float terrainProjectionRows[2][8][4]{};
+        uint32_t nativeTerrainMode = 0;
+        std::array<float, 4> nativeTerrainParameters;
+        float terrainProjectionRows[2][8][4];
         float fogConstants[32];
         float lightingConstants[12];
         // object-space light direction/radius, diffuse RGB and opacity,
@@ -605,6 +623,7 @@ private:
         int primitiveMode = 0;
         VulkanBuffer vertexBuffer;
         VulkanBuffer indexBuffer;
+        VulkanBuffer lightmapBuffer;
         uint32_t firstIndex = 0;
         int32_t vertexOffset = 0;
         VkDeviceSize vertexBufferOffset = 0;
@@ -632,6 +651,13 @@ private:
     bool RecordAndSubmit(uint32_t viewIndex);
     bool CompletePendingSubmission();
     bool PrepareSceneUniforms();
+    bool CanInstancePlants(const StockDraw& a, const StockDraw& b, uint32_t* failures = nullptr) const;
+    VkPipeline FindCachedScenePipeline(const std::array<uint32_t, 64>& key);
+    uint8_t GetScenePipelineQueueState(const std::array<uint32_t, 64>& key);
+    void SetScenePipelineQueueState(const std::array<uint32_t, 64>& key, uint8_t state);
+    void PlanSceneReflections();
+    std::array<bool, 2> m_updateOceanReflection{};
+    uint32_t m_oceanReflectionDrawIndex = UINT32_MAX;
     void BindStereoDescriptor(VkDescriptorSet set);
     void WriteDescriptorSets(uint32_t count, const VkWriteDescriptorSet* writes);
     XrView GetSceneCameraView(uint32_t eye) const;
@@ -679,6 +705,10 @@ private:
     std::vector<VkCommandBuffer> m_commandBuffers;
     std::vector<StockDraw> m_stockDraws;
     std::vector<StockDrawAux> m_stockDrawAux;
+    std::vector<size_t> m_depthSortOrder;
+    struct DepthSortGroup { size_t first, count; float depth; };
+    std::vector<DepthSortGroup> m_depthSortGroups;
+    std::vector<size_t> m_depthSortGroupOrder;
     struct VisibilityQuery { uint64_t key; uint32_t index; bool totalCoverage; };
     struct VisibilitySamples
     {
@@ -714,6 +744,7 @@ private:
     int m_stockSpecularGlossTexture = 0;
     bool m_stockDecalDraw = false;
     bool m_stockTerrainDraw = false, m_stockWaterDraw = false, m_stockCharacterDraw = false;
+    bool m_stockGrassDraw = false;
     bool m_gpuAbArmed = false, m_gpuAbBaselineReady = false;
     uint32_t m_gpuAbPairs = 0, m_recordedAbMode = 0, m_pendingAbMode = 0;
     uint32_t m_recordedAbSkipped = 0, m_pendingAbSkipped = 0, m_pendingAbGroup = 0;
@@ -734,8 +765,17 @@ private:
         }
     };
     std::unordered_map<std::array<uint64_t, 8>, ReusableClientGeometry, GeometryUploadHash> m_frameGeometryUploads;
+    // Fixed budgets, append-only storage. Revisions invalidate changed source
+    // data; old ranges remain alive until shutdown, so no frame fence is added.
+    std::unordered_map<std::array<uint64_t, 8>, ReusableClientGeometry, GeometryUploadHash> m_staticGeometryUploads;
+    VulkanBuffer m_staticVertexArena, m_staticIndexArena;
+    VkDeviceSize m_staticVertexUsed = 0, m_staticIndexUsed = 0;
     VkRenderPass m_renderPass = VK_NULL_HANDLE;
     VkRenderPass m_multiviewRenderPass = VK_NULL_HANDLE;
+    // Independent initial color/depth/stencil clear masks; slots 0 and 7
+    // alias the existing load/all-clear passes and are not separately owned.
+    std::array<VkRenderPass, 8> m_initialClearPasses{};
+    std::array<VkRenderPass, 8> m_multiviewInitialClearPasses{};
     VkRenderPass m_multiviewLoadRenderPass = VK_NULL_HANDLE;
     VkRenderPass m_loadRenderPass = VK_NULL_HANDLE;
     VkRenderPass m_outputRenderPass = VK_NULL_HANDLE;
@@ -764,10 +804,35 @@ private:
             size_t hash = 1469598103934665603ull;
             for (unsigned index : {0u, 1u, 2u, 3u, 4u, 7u, 10u, 13u, 14u, 18u, 24u, 61u, 62u, 63u})
                 hash = (hash ^ key[index]) * 1099511628211ull;
+            // UV specialization flags live in high bits. Fold those into the
+            // low bits used by the small direct lookup as well.
+            hash ^= hash >> 32;
+            hash ^= hash >> 16;
             return hash;
         }
     };
     std::unordered_map<std::array<uint32_t, 64>, VkPipeline, ScenePipelineHash> m_scenePipelineCache;
+    std::unordered_map<std::array<uint32_t, 64>, VulkanGraphicsPipelineDesc, ScenePipelineHash> m_deferredReflectionPipelines;
+    struct PipelineLookupEntry
+    {
+        std::array<uint32_t, 64> key;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+    };
+    // Four ways avoid thrashing between recurrent material/reflection variants.
+    std::array<std::array<PipelineLookupEntry, 4>, 256> m_pipelineLookup;
+    std::array<uint8_t, 256> m_pipelineLookupNext{};
+    struct PipelineQueueLookupEntry
+    {
+        std::array<uint32_t, 64> key{};
+        uint32_t frame = 0;
+        uint8_t state = 0;
+        bool valid = false;
+    };
+    // The queue/reflection maps are immutable during most draw captures.
+    // Cache their per-key pending/deferred state for this frame to avoid
+    // repeated tree/hash lookups for every object using the same material.
+    std::array<std::array<PipelineQueueLookupEntry, 4>, 256> m_pipelineQueueLookup;
+    std::array<uint8_t, 256> m_pipelineQueueLookupNext{};
     std::array<uint32_t, 64> m_lastScenePipelineKey{};
     VkPipeline m_lastScenePipeline = VK_NULL_HANDLE;
     bool m_lastScenePipelineValid = false;
@@ -856,6 +921,8 @@ private:
     std::array<VulkanStockLinearTexgen, 8> m_stockLinearTexgen{};
     std::array<std::array<float, 16>, 8> m_stockFixedLights{};
     uint32_t m_stockFixedLightCount = 0;
+    uint32_t m_stockNativeTerrainMode = 0;
+    std::array<float, 4> m_stockNativeTerrainParameters{};
     std::array<std::array<float, 16>, 2> m_stockFixedMatrices{};
     float m_stockMinDepth = 0.0f;
     float m_stockMaxDepth = 1.0f;

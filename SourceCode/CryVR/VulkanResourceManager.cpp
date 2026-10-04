@@ -424,13 +424,17 @@ bool VulkanResourceManager::CreateBufferWithData(const void* data, VkDeviceSize 
 }
 
 bool VulkanResourceManager::UploadBuffer(VulkanBuffer& buffer, const void* data,
-                                         VkDeviceSize size, VkDeviceSize offset)
+                                         VkDeviceSize size, VkDeviceSize offset, bool appendOnly)
 {
     if (!data || !buffer.buffer || !(buffer.memoryProperties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
         offset > buffer.size || size > buffer.size - offset)
         return false;
     // Geometry uploads commonly have arbitrary byte offsets. vkMapMemory's
-    if (m_bufferAccessGuard && !m_bufferAccessGuard(buffer.buffer)) return false;
+    // Append-only coherent arenas never modify bytes referenced by an older
+    // submission. Ordinary uploads retain the conservative buffer fence guard.
+    if (appendOnly && (offset < buffer.uploadedEnd ||
+        !(buffer.memoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))) return false;
+    if (!appendOnly && m_bufferAccessGuard && !m_bufferAccessGuard(buffer.buffer)) return false;
     // offset must satisfy minMemoryMapAlignment, so map the allocation from 0
     // and apply the buffer offset to the CPU pointer instead. Keep that mapping
     // until destruction: uniform and dynamic geometry writes happen thousands
@@ -439,6 +443,7 @@ bool VulkanResourceManager::UploadBuffer(VulkanBuffer& buffer, const void* data,
             0, VK_WHOLE_SIZE, 0, &buffer.mappedData) != VK_SUCCESS)
         return false;
     std::memcpy(static_cast<uint8_t*>(buffer.mappedData) + offset, data, static_cast<size_t>(size));
+    buffer.uploadedEnd = std::max(buffer.uploadedEnd, offset + size);
     if (!(buffer.memoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
     {
         VkMappedMemoryRange range{};

@@ -36,13 +36,13 @@ layout(set = 0, binding = 1, std140) uniform TextureStageTransforms {
 } textureStageTransforms;
 #include "scene_vertex_lighting.glsl"
 vec3 safeNormalize(vec3 value) {
-    float magnitude = length(value);
-    return magnitude > 1.0e-6 ? value / magnitude : vec3(0.0);
+    float lengthSquared = dot(value, value);
+    return lengthSquared > 1.0e-12 ? value * inversesqrt(lengthSquared) : vec3(0.0);
 }
 void main() {
     clipPosition = inPosition;
     objectPosition = inPosition; objectNormal = inNormal;
-    bool vertexLighting = textureStageTransforms.materialAmbient.w > 1.5;
+    bool vertexLighting = stockVertexLightingMode() > 1.5;
     hasMaterialLighting = vertexLighting ? 0u : 1u;
     vec3 toLight = textureStageTransforms.objectLightPositionRadius.xyz;
     float radius = textureStageTransforms.objectLightPositionRadius.w;

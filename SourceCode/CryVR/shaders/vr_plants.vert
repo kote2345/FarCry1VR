@@ -50,12 +50,20 @@ void main() {
             textureStageTransforms.linearControls[7].w);
         if (stockMultiview && gl_ViewIndex == 1) rayCoefficients = textureStageTransforms.fogEye1Ray;
         vec2 ray = pixel * rayCoefficients.xz + rayCoefficients.yw;
-        float distance = max(gl_Position.w, 0.0) * sqrt(1.0 + dot(ray, ray));
         vec4 fog = textureStageTransforms.fogModeDensityStart;
         uint mode = stockFogMode != 0u ? stockFogMode : uint(fog.y + 0.5);
-        float d = fog.z * distance;
-        fogAmount = clamp(mode == 1u ? (distance - fog.w) * fog.z :
-            1.0 - exp(-min(mode == 2u ? d*d : d, 80.0)), 0.0, 1.0);
+        float eyeDepth = max(gl_Position.w, 0.0);
+        float rayLengthSquared = 1.0 + dot(ray, ray);
+        if (mode == 2u) {
+            // EXP2 uses distance squared; avoid sqrt followed by squaring.
+            float d = fog.z * eyeDepth;
+            fogAmount = 1.0 - exp(-min(d*d*rayLengthSquared, 80.0));
+        } else {
+            float distance = eyeDepth * sqrt(rayLengthSquared);
+            fogAmount = mode == 1u ? (distance - fog.w) * fog.z :
+                1.0 - exp(-min(fog.z * distance, 80.0));
+        }
+        fogAmount = clamp(fogAmount, 0.0, 1.0);
     }
     texCoord = inTexCoord;
     vertexColor = vec4(inColor.rgb * ambient.rgb, ambient.a);

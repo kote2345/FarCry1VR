@@ -32,7 +32,7 @@ void main() {
     clipPosition = inPosition;
     objectPosition = inPosition;
     objectNormal = inNormal;
-    bool vertexLighting = textureStageTransforms.materialAmbient.w > 1.5;
+    bool vertexLighting = stockVertexLightingMode() > 1.5;
     hasMaterialLighting = vertexLighting ? 0u : 1u;
     projectorDirection = inPosition - vec3(transformData.modelView[0][3],
                                             transformData.modelView[1][3],

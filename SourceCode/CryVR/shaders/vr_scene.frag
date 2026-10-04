@@ -48,7 +48,7 @@ void main() {
     vec4 color = mix(generatedVertexColor, textureStageTransforms.primaryColor, textureStageTransforms.primaryColorMask);
     float specularOcclusionChannel = textureStageTransforms.fogColor.w;
     bool derivativeSensitiveLighting = !stockFeatureDisabled(STOCK_NO_FRAGMENT_LIGHTING) &&
-        (hasMaterialLighting == 2u ||
+        (stockMaterialNormalMode(hasMaterialLighting) == 2u ||
          (specularOcclusionChannel > 0.5 && specularOcclusionChannel < 4.5));
     bool alphaCheckedEarly = stockFragmentDiscardEnabled && !derivativeSensitiveLighting;
     if (alphaCheckedEarly) {
@@ -65,7 +65,7 @@ void main() {
     float alpha = color.a;
     color.a = alpha;
     color.rgb += stockSeparateSpecular;
-    if (textureStageTransforms.materialAmbient.w > 1.5)
+    if (stockMaterialLightingMode() > 1.5)
         color.rgb = clamp(color.rgb, 0.0, 1.0);
     outColor = applySceneFog(color);
 }

@@ -1153,9 +1153,14 @@ void CShader::mfSetDefaults (void)
 
   mfRegisterDefaultTemplates();
 #else
-  // Vulkan needs the same parsed animation sequence as OpenGL.
+  // Vulkan needs the parsed system templates as well as the animation.
+  // Omitting White/WhiteShadow made callers retry their registration and
+  // emit the same warning every frame instead of drawing the requested pass.
   if (gRenDev->GetType() != R_NULL_RENDERER)
+  {
     m_ShaderFogCaust = mfForName("TemplFogCaustics", eSH_Misc, EF_SYSTEM);
+    mfRegisterDefaultTemplates();
+  }
 #endif
 
   if (!b)

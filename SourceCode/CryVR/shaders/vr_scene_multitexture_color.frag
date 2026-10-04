@@ -128,7 +128,7 @@ void main() {
     }
     if (stockFragmentDiscardEnabled && dot(vec4(clipPosition, 1.0), textureStageTransforms.clipPlane) < 0.0) discard;
     vec4 generatedVertexColor = vertexColor;
-    if (textureStageTransforms.materialParams.w > 0.5 && textureStageTransforms.materialParams.w < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
+    if (stockMaterialColorMode() > 0.5 && stockMaterialColorMode() < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
     vec4 primaryColor = mix(generatedVertexColor, textureStageTransforms.primaryColor, textureStageTransforms.primaryColorMask);
     if (!stockFeatureDisabled(STOCK_NO_FRAGMENT_LIGHTING))
         primaryColor.rgb *= evaluateStockLighting(objectPosition, objectNormal,
@@ -152,20 +152,28 @@ void main() {
     previous = clamp(previous, 0.0, 1.0);
     vec2 stage1TexCoord = stockTerrainStageTexCoord(1u,
         stage1UsesTexCoord1 != 0u ? texCoord1 : texCoord0, objectPosition);
-    vec4 layer = sampleSecondaryTexture(stage1TexCoord);
     if (bakedLightmapFastPath) {
+        // Calculate gradients before rejecting alpha; derivatives after a
+        // nonuniform discard are undefined. Empty texels need no lightmap fetch.
+        vec2 dx = dFdx(stage1TexCoord) * textureStageTransforms.textureLodBias.y;
+        vec2 dy = dFdy(stage1TexCoord) * textureStageTransforms.textureLodBias.y;
+        float alpha = previous.a;
+        if (textureStageTransforms.materialParams.z <= 0.5)
+            alpha *= textureStageTransforms.materialParams.x;
+        if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(alpha,
+            textureStageTransforms.materialParams.y, alphaTestMode)) discard;
+        vec4 layer = textureGrad(secondaryTexture, stage1TexCoord, dx, dy);
         vec4 color = vec4(base.rgb *
             (textureStageTransforms.materialAmbient.rgb * primaryColor.rgb +
              layer.rgb * textureStageTransforms.fogEndDepthRange.w), previous.a);
         color = applyMaterialOverrides(color);
-        if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(color.a,
-            textureStageTransforms.materialParams.y, alphaTestMode)) discard;
         color.rgb += stockSeparateSpecular;
-        if (textureStageTransforms.materialAmbient.w > 1.5)
+        if (stockMaterialLightingMode() > 1.5)
             color.rgb = clamp(color.rgb, 0.0, 1.0);
         outColor = applySceneFog(color);
         return;
     }
+    vec4 layer = sampleSecondaryTexture(stage1TexCoord);
     if (stockTerrainShadowProgram()) {
         // CGRCTerrainShadow: the first sampler is terrain albedo; the second
         // is the projected LEQUAL shadow comparison. OpenGL writes
@@ -209,7 +217,7 @@ void main() {
         vec3 detail1 = mix(vec3(0.5), layer.rgb, secondaryColor.b);
         color = vec4(detail0 * detail1 * 2.0, 1.0);
     }
-    if (!stockFeatureDisabled(STOCK_NO_TERRAIN) && textureStageTransforms.materialParams.w > 2.5 && stockTerrainOnlyCount() == 0) {
+    if (!stockFeatureDisabled(STOCK_NO_TERRAIN) && stockMaterialColorMode() > 2.5 && stockTerrainOnlyCount() == 0) {
         vec3 detail0 = mix(vec3(0.5), base.rgb, secondaryColor.r);
         vec3 detail1 = mix(vec3(0.5), layer.rgb, secondaryColor.g);
         outColor = applySceneFog(vec4(detail0 * detail1 * 2.0, 1.0));
@@ -239,7 +247,7 @@ void main() {
     color = applyMaterialOverrides(color);
     if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(color.a, textureStageTransforms.materialParams.y, alphaTestMode)) discard;
     color.rgb += stockSeparateSpecular;
-    if (textureStageTransforms.materialAmbient.w > 1.5)
+    if (stockMaterialLightingMode() > 1.5)
         color.rgb = clamp(color.rgb, 0.0, 1.0);
     outColor = applySceneFog(color);
 }

@@ -54,14 +54,14 @@ vec4 applyMaterialOverrides(vec4 c) {
 void main() {
     if (stockFragmentDiscardEnabled && dot(vec4(clipPosition, 1.0), textureStageTransforms.clipPlane) < 0.0) discard;
     vec4 generatedVertexColor = vertexColor;
-    if (textureStageTransforms.materialParams.w > 0.5 && textureStageTransforms.materialParams.w < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
+    if (stockMaterialColorMode() > 0.5 && stockMaterialColorMode() < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
     vec4 primaryColor = mix(generatedVertexColor, textureStageTransforms.primaryColor, textureStageTransforms.primaryColorMask);
     vec2 baseTexCoord = stage0UsesTexCoord1 != 0u ? lightmapTexCoord : texCoord;
     baseTexCoord = stockTerrainStageTexCoord(0u, baseTexCoord, objectPosition);
     vec4 texel = sampleBaseTexture(baseTexCoord);
     float specularOcclusionChannel = textureStageTransforms.fogColor.w;
     bool derivativeSensitiveLighting = !stockFeatureDisabled(STOCK_NO_FRAGMENT_LIGHTING) &&
-        (hasMaterialLighting == 2u ||
+        (stockMaterialNormalMode(hasMaterialLighting) == 2u ||
          (specularOcclusionChannel > 0.5 && specularOcclusionChannel < 4.5));
     bool alphaCheckedEarly = stockFragmentDiscardEnabled && !derivativeSensitiveLighting;
     if (alphaCheckedEarly) {
@@ -77,7 +77,7 @@ void main() {
     if (stockFragmentDiscardEnabled && !alphaCheckedEarly &&
         !stockAlphaTestPasses(color.a, textureStageTransforms.materialParams.y, alphaTestMode)) discard;
     color.rgb += stockSeparateSpecular;
-    if (textureStageTransforms.materialAmbient.w > 1.5)
+    if (stockMaterialLightingMode() > 1.5)
         color.rgb = clamp(color.rgb, 0.0, 1.0);
     outColor = applySceneFog(color);
 }

@@ -1,14 +1,23 @@
+layout(constant_id = 72) const float stockVertexLightingModeValue = -1.0;
+layout(constant_id = 76) const uint stockFixedLightCount = 0xffffffffu;
+layout(constant_id = 77) const bool stockEnhancedSurfaces = true;
+float stockVertexLightingMode() {
+    return stockVertexLightingModeValue >= 0.0 ? stockVertexLightingModeValue :
+        textureStageTransforms.materialAmbient.w;
+}
+
 vec3 evaluateStockVertexLighting(vec3 objectPosition, vec3 objectNormal,
                                  out vec3 separateSpecular)
 {
     separateSpecular = vec3(0.0);
-    if (textureStageTransforms.materialAmbient.w < 1.5)
+    if (stockVertexLightingMode() < 1.5)
         return vec3(1.0);
 
     // GL_Renderer disables GL_NORMALIZE. Preserve the supplied normal's
     // magnitude rather than silently changing fixed-function diffuse/specular.
     vec3 normal = objectNormal;
-    int fixedLightCount = clamp(int(textureStageTransforms.fixedLightInfo.x), 0, 8);
+    int fixedLightCount = stockFixedLightCount != 0xffffffffu ? int(stockFixedLightCount) :
+        clamp(int(textureStageTransforms.fixedLightInfo.x), 0, 8);
     if (fixedLightCount > 0)
     {
         vec3 primary = textureStageTransforms.materialAmbient.rgb;
@@ -26,14 +35,16 @@ vec3 evaluateStockVertexLighting(vec3 objectPosition, vec3 objectNormal,
             vec3 eyeLight = (textureStageTransforms.fixedMatrices[0] *
                 vec4(position.xyz, position.w > 0.0 ? 1.0 : 0.0)).xyz;
             vec3 direction = eyeLight - (position.w > 0.0 ? eyePosition : vec3(0.0));
-            float distanceToLight = length(direction);
+            float distanceSquared = dot(direction, direction);
+            float inverseDistance = distanceSquared > 0.0 ? inversesqrt(distanceSquared) : 0.0;
+            float distanceToLight = distanceSquared * inverseDistance;
             float attenuation = position.w > 0.0 ?
                 1.0 / max(coefficients.x + coefficients.y * distanceToLight +
-                          coefficients.z * distanceToLight * distanceToLight, 1.0e-6) : 1.0;
-            direction = normalize(direction);
+                          coefficients.z * distanceSquared, 1.0e-6) : 1.0;
+            direction *= inverseDistance;
             float nDotL = dot(normal, direction);
             primary += diffuse.rgb * max(nDotL, 0.0) * attenuation;
-            if (nDotL > 0.0 && any(notEqual(specularColor.rgb, vec3(0.0))))
+            if (stockEnhancedSurfaces && nDotL > 0.0 && any(notEqual(specularColor.rgb, vec3(0.0))))
                 specular += specularColor.rgb * attenuation *
                     pow(max(dot(normal, normalize(direction + viewer)), 0.0),
                         clamp(specularColor.w, 0.0, 128.0));
@@ -61,7 +72,7 @@ vec3 evaluateStockVertexLighting(vec3 objectPosition, vec3 objectNormal,
     vec3 specularColor = vec3(textureStageTransforms.uvRow0[4].w,
                               textureStageTransforms.uvRow1[4].w,
                               textureStageTransforms.uvRowQ[4].w);
-    if (normalDotLight > 0.0 && any(notEqual(specularColor, vec3(0.0))))
+    if (stockEnhancedSurfaces && normalDotLight > 0.0 && any(notEqual(specularColor, vec3(0.0))))
     {
         vec3 viewDirection = normalize(vec3(textureStageTransforms.uvRow0[5].w,
                                             textureStageTransforms.uvRow1[5].w,

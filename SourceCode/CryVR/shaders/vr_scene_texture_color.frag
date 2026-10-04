@@ -70,6 +70,7 @@ vec4 sampleBaseTexture(vec2 uv) {
     return sampleStockTextureStage(0u, baseColorTexture, uv, scale, objectPosition);
 }
 vec4 sampleBumpTexture(vec2 uv) {
+    if (!stockEnhancedSurfaces) return vec4(0.5, 0.5, 1.0, 1.0);
     float scale = textureStageTransforms.textureLodBias.y;
     return textureGrad(bumpTexture, uv, dFdx(uv) * scale, dFdy(uv) * scale);
 }
@@ -164,8 +165,8 @@ void main() {
     if (stage0UsesTexCoord1 != 0u) baseTexCoord = lightmapTexCoord;
 #endif
     baseTexCoord = stockTerrainStageTexCoord(0u, baseTexCoord, objectPosition);
-    vec4 texel = sampleBaseTexture(baseTexCoord);
     if (stockTerrainMarker() > -16.5 && stockTerrainMarker() < -15.5) {
+        vec4 texel = sampleBaseTexture(baseTexCoord);
         vec4 color = texel * vertexColor * textureStageTransforms.terrainProjectionS[6];
         color = applyMaterialOverrides(color);
         if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(color.a,
@@ -181,17 +182,22 @@ void main() {
         vec4 barkTexel = textureGrad(baseColorTexture, texCoord,
             dFdx(texCoord)*textureStageTransforms.textureLodBias.x,
             dFdy(texCoord)*textureStageTransforms.textureLodBias.x);
-        vec3 normal = sampleBumpTexture(texCoord).rgb * 2.0 - 1.0;
-        float diffuse = clamp(dot(normal, secondaryColor.rgb * 2.0 - 1.0), 0.0, 1.0);
         vec4 ambient = textureStageTransforms.terrainProjectionS[6];
-        vec3 light = vertexColor.rgb + diffuse * textureStageTransforms.terrainProjectionT[6].rgb;
-        vec4 color = vec4(clamp(barkTexel.rgb * ambient.rgb * light * 2.0, 0.0, 1.0), barkTexel.a * ambient.a);
-        if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(color.a,
+        vec2 bumpDx = dFdx(texCoord) * textureStageTransforms.textureLodBias.y;
+        vec2 bumpDy = dFdy(texCoord) * textureStageTransforms.textureLodBias.y;
+        float alpha = barkTexel.a * ambient.a;
+        if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(alpha,
             textureStageTransforms.materialParams.y, alphaTestMode)) discard;
+        vec3 normal = stockEnhancedSurfaces ?
+            textureGrad(bumpTexture, texCoord, bumpDx, bumpDy).rgb * 2.0 - 1.0 : vec3(0.0, 0.0, 1.0);
+        float diffuse = clamp(dot(normal, secondaryColor.rgb * 2.0 - 1.0), 0.0, 1.0);
+        vec3 light = vertexColor.rgb + diffuse * textureStageTransforms.terrainProjectionT[6].rgb;
+        vec4 color = vec4(clamp(barkTexel.rgb * ambient.rgb * light * 2.0, 0.0, 1.0), alpha);
         outColor = applySceneFog(color);
         return;
     }
-    if (stockMaterialLightingMode() > 0.5 && stockMaterialLightingMode() < 1.5 &&
+    vec4 texel = sampleBaseTexture(baseTexCoord);
+    if (stockEnhancedSurfaces && stockMaterialLightingMode() > 0.5 && stockMaterialLightingMode() < 1.5 &&
         textureStageTransforms.objectLightPositionRadius.w < 0.0 &&
         textureStageTransforms.terrainProjectionS[6].w > 0.5) {
         // CGRCLightTempl adds specular independently of diffuse albedo. Its
@@ -230,7 +236,7 @@ void main() {
         return;
     }
     vec4 generatedVertexColor = vertexColor;
-    if (textureStageTransforms.materialParams.w > 0.5 && textureStageTransforms.materialParams.w < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
+    if (stockMaterialColorMode() > 0.5 && stockMaterialColorMode() < 1.5) generatedVertexColor.rgb = vec3(1.0) - generatedVertexColor.rgb;
     vec4 primaryColor = mix(generatedVertexColor, textureStageTransforms.primaryColor, textureStageTransforms.primaryColorMask);
     vec4 envColor = unpackUnorm4x8(stage0Constant);
     float alpha0 = sourceAlpha(stage0AlphaArg & 7u, texel, primaryColor, primaryColor, envColor);
@@ -242,13 +248,13 @@ void main() {
 #ifndef VR_BUMP_MAP
     float specularOcclusionChannel = textureStageTransforms.fogColor.w;
     bool derivativeSensitiveLighting = !stockFeatureDisabled(STOCK_NO_FRAGMENT_LIGHTING) &&
-        (hasMaterialLighting == 2u ||
+        (stockMaterialNormalMode(hasMaterialLighting) == 2u ||
          (specularOcclusionChannel > 0.5 && specularOcclusionChannel < 4.5));
     bool genericAlphaPath = stockDecalSimpleMode == 0u &&
         !stockTerrainProgram() && stockTerrainAmbientMode() == 0 &&
-        stockTerrainOnlyCount() == 0 && textureStageTransforms.materialParams.w <= 2.5 &&
-        !(textureStageTransforms.terrainProjectionT[7].w < -11.5 &&
-          textureStageTransforms.terrainProjectionT[7].w > -12.5);
+        stockTerrainOnlyCount() == 0 && stockMaterialColorMode() <= 2.5 &&
+        !(stockTerrainMarker() < -11.5 &&
+          stockTerrainMarker() > -12.5);
     alphaCheckedEarly = stockFragmentDiscardEnabled && genericAlphaPath &&
         !derivativeSensitiveLighting;
     if (alphaCheckedEarly) {
@@ -286,7 +292,7 @@ void main() {
     float specular = clamp((halfAngle - 0.75) * 4.0, 0.0, 1.0);
     specular *= specular;
     if (specularPass)
-        specular = stockProgramSpecular(objectPosition, mappedNormal, toLight);
+        specular = stockEnhancedSurfaces ? stockProgramSpecular(objectPosition, mappedNormal, toLight) : 0.0;
     float diffuse = specularPass ? specular :
         halfAngle * attenuation;
     vec3 ambientColor = projectedPass ? vec3(0.0) : vec3(textureStageTransforms.uvRow0[7].w,
@@ -308,7 +314,7 @@ void main() {
         color = applyMaterialOverrides(color);
         if (stockFragmentDiscardEnabled && !stockAlphaTestPasses(color.a,
                 textureStageTransforms.materialParams.y, alphaTestMode)) discard;
-        if (textureStageTransforms.materialAmbient.w > 1.5)
+        if (stockMaterialLightingMode() > 1.5)
             color.rgb = clamp(color.rgb, 0.0, 1.0);
         outColor = applySceneFog(color);
         return;
@@ -324,7 +330,7 @@ void main() {
     if (stockTerrainProgram() && stockTerrainLayerCount() == 0 &&
         stockTerrainOnlyCount() == 0 && stockTerrainAmbientMode() == 0)
         color.rgb *= textureStageTransforms.materialAmbient.rgb;
-    if (!stockFeatureDisabled(STOCK_NO_TERRAIN) && textureStageTransforms.materialParams.w > 2.5 && stockTerrainOnlyCount() == 0) {
+    if (!stockFeatureDisabled(STOCK_NO_TERRAIN) && stockMaterialColorMode() > 2.5 && stockTerrainOnlyCount() == 0) {
         color = vec4(mix(vec3(0.5), texel.rgb, secondaryColor.r), 1.0);
         outColor = applySceneFog(color);
         return;
@@ -364,8 +370,8 @@ void main() {
         color.rgb *= texture(projectorCookieTexture,(tile+localUv)/vec2(3.0,2.0)).rgb;
     }
 #endif
-    if (textureStageTransforms.terrainProjectionT[7].w < -11.5 &&
-        textureStageTransforms.terrainProjectionT[7].w > -12.5) {
+    if (stockTerrainMarker() < -11.5 &&
+        stockTerrainMarker() > -12.5) {
         // CGRCAmbient_Particle: ambient is added to the vertex light,
         // while its independent opacity multiplies texture and vertex alpha.
         vec4 ambient = textureStageTransforms.terrainProjectionS[6];
@@ -376,7 +382,7 @@ void main() {
     if (stockFragmentDiscardEnabled && !alphaCheckedEarly &&
         !stockAlphaTestPasses(color.a, textureStageTransforms.materialParams.y, alphaTestMode)) discard;
     color.rgb += stockSeparateSpecular;
-    if (textureStageTransforms.materialAmbient.w > 1.5)
+    if (stockMaterialLightingMode() > 1.5)
         color.rgb = clamp(color.rgb, 0.0, 1.0);
     // OpenGL's global distance fog also affects stock terrain programs.
     // CGRCTreeSprites applies HDREncode to the albedo/instance-color product

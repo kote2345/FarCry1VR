@@ -47,19 +47,21 @@ layout(set = 0, binding = 1, std140) uniform TextureStageTransforms {
     vec4 fixedLights[32]; vec4 fixedLightInfo; mat4 fixedMatrices[2]; uvec4 textureConstants[2]; vec4 fogEye1Ray;
 } textureStageTransforms;
 #include "scene_vertex_lighting.glsl"
+layout(constant_id = 71) const float stockVertexTerrainMarker = -1.0e30;
 vec3 safeNormalize(vec3 value) {
-    float magnitude = length(value);
-    return magnitude > 1.0e-6 ? value / magnitude : vec3(0.0);
+    float lengthSquared = dot(value, value);
+    return lengthSquared > 1.0e-12 ? value * inversesqrt(lengthSquared) : vec3(0.0);
 }
 void main() {
-    bool terrainShadow = textureStageTransforms.terrainProjectionT[7].w > 399.5 &&
-                         textureStageTransforms.terrainProjectionT[7].w < 400.5;
+    float terrainMarker = stockVertexTerrainMarker > -1.0e29 ? stockVertexTerrainMarker :
+        textureStageTransforms.terrainProjectionT[7].w;
+    bool terrainShadow = terrainMarker > 399.5 && terrainMarker < 400.5;
     vec3 drawPosition = inPosition;
     if (terrainShadow)
         drawPosition += inNormal * 0.05;
     clipPosition = drawPosition;
     objectPosition = drawPosition; objectNormal = inNormal;
-    bool vertexLighting = textureStageTransforms.materialAmbient.w > 1.5;
+    bool vertexLighting = stockVertexLightingMode() > 1.5;
     hasMaterialLighting = vertexLighting ? 0u : 1u;
     vec3 toLight = textureStageTransforms.objectLightPositionRadius.xyz;
     float radius = textureStageTransforms.objectLightPositionRadius.w;

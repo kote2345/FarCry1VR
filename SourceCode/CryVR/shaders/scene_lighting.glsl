@@ -15,6 +15,10 @@ layout(constant_id = 71) const float stockTerrainMarkerValue = -1.0e30;
 layout(constant_id = 72) const float stockMaterialLightingModeValue = -1.0;
 layout(constant_id = 73) const float stockMaterialColorModeValue = -1.0;
 layout(constant_id = 74) const uint stockMaterialNormalModeValue = 0xffffffffu;
+// Bits 0..7 mark Q=1, 8..15 identity S/T, 16..23 linear texgen.
+// The default retains the general projective/texgen path.
+layout(constant_id = 75) const uint stockTextureTransformFlags = 0x00ff0000u;
+layout(constant_id = 77) const bool stockEnhancedSurfaces = true;
 uint stockMaterialNormalMode(uint varyingMode) {
     return stockMaterialNormalModeValue != 0xffffffffu ? stockMaterialNormalModeValue : varyingMode;
 }
@@ -157,7 +161,7 @@ vec2 stockTerrainRawTexCoord(uint stage, vec2 fallbackUv, vec3 objectPositionFor
     // constants; their albedo keeps the mesh UV, not object-linear texgen.
     float programMarker = stockTerrainMarker();
     if (programMarker > -16.5 && programMarker < -14.5) return fallbackUv;
-    if (stockFeatureDisabled(STOCK_NO_TERRAIN) || textureStageTransforms.materialParams.w < 1.5)
+    if (stockFeatureDisabled(STOCK_NO_TERRAIN) || stockMaterialColorMode() < 1.5)
         return fallbackUv;
     vec4 position = vec4(objectPositionForTexgen, 1.0);
     return vec2(dot(textureStageTransforms.terrainProjectionS[stage], position),
@@ -167,7 +171,9 @@ vec2 stockTerrainRawTexCoord(uint stage, vec2 fallbackUv, vec3 objectPositionFor
 vec2 stockTerrainStageTexCoord(uint stage, vec2 fallbackUv,
                                vec3 objectPositionForTexgen)
 {
-    if (!stockFeatureDisabled(STOCK_NO_LINEAR_TEXGEN) && textureStageTransforms.linearControls[stage].x > 0.5)
+    if (!stockFeatureDisabled(STOCK_NO_LINEAR_TEXGEN) &&
+        (stockTextureTransformFlags & (1u << (stage + 16u))) != 0u &&
+        textureStageTransforms.linearControls[stage].x > 0.5)
     {
         uint mask = uint(textureStageTransforms.linearControls[stage].y + 0.5);
         uint base = stage * 4u;
@@ -183,13 +189,18 @@ vec2 stockTerrainStageTexCoord(uint stage, vec2 fallbackUv,
             dot(textureStageTransforms.linearMatrixRows[base + 3u], coordinate));
         return transformed.xy / transformed.w;
     }
-    vec2 projectedUv = !stockFeatureDisabled(STOCK_NO_TERRAIN) && textureStageTransforms.materialParams.w >= 1.5 ?
+    vec2 projectedUv = !stockFeatureDisabled(STOCK_NO_TERRAIN) && stockMaterialColorMode() >= 1.5 ?
         stockTerrainRawTexCoord(stage, fallbackUv, objectPositionForTexgen) : fallbackUv;
+    if ((stockTextureTransformFlags & (1u << (stage + 8u))) != 0u)
+        return projectedUv;
     vec3 projectedUv3 = vec3(projectedUv, 1.0);
+    vec2 transformedUv = vec2(dot(textureStageTransforms.uvRow0[stage].xyz, projectedUv3),
+                              dot(textureStageTransforms.uvRow1[stage].xyz, projectedUv3));
+    if ((stockTextureTransformFlags & (1u << stage)) != 0u)
+        return transformedUv;
     float q = dot(textureStageTransforms.uvRowQ[stage].xyz, projectedUv3);
     float divisor = abs(q) > 1.0e-7 ? q : (q < 0.0 ? -1.0e-7 : 1.0e-7);
-    return vec2(dot(textureStageTransforms.uvRow0[stage].xyz, projectedUv3),
-                dot(textureStageTransforms.uvRow1[stage].xyz, projectedUv3)) / divisor;
+    return transformedUv / divisor;
 }
 
 vec3 stockLightingNormalize(vec3 value)
@@ -316,6 +327,7 @@ vec3 evaluateStockLighting(vec3 objectPositionForLighting,
     }
     if (specularPass)
     {
+        if (!stockEnhancedSurfaces) return vec3(0.0);
         // CGRCLightTempl's non-per-pixel specular branch computes
         // saturate((NdotH - 0.75) * 4), then squares that term. The renderer
         // supplies the half-angle vector in lightVector for this pass.
@@ -331,7 +343,7 @@ vec3 evaluateStockLighting(vec3 objectPositionForLighting,
     float diffuseEncoding = fixedFunctionLighting ? 1.0 : 2.0;
     vec3 diffuse = max(lightColorAmbient.rgb, vec3(0.0)) * lambert * attenuation * diffuseEncoding;
     vec3 specular = vec3(0.0);
-    if (fixedFunctionLighting)
+    if (stockEnhancedSurfaces && fixedFunctionLighting)
     {
         // CGLRenderer::EF_LightMaterial installs the material/light specular
         // colors and shininess in GL. GL_LIGHT_MODEL_LOCAL_VIEWER defaults to

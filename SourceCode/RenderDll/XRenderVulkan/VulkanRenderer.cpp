@@ -1,6 +1,7 @@
 #include "RenderPCH.h"
 #include "../XRenderNULL/NULL_Renderer.h"
 #include "VulkanFrameRenderer.h"
+#include "VulkanRenderQuality.h"
 #include "VulkanVertexFormat.h"
 #include "VulkanTextureDecode.h"
 #include "../../CryCommon/CryHeaders.h"
@@ -64,10 +65,18 @@ inline int FastAsciiCaseCompareN(const char* left, const char* right, size_t cou
     return 0;
 }
 
-// Dynamic-light passes complement the baked lightmap path, as they do in the
-// stock OpenGL renderer. Their Vulkan implementation uses the translated
-// stock lighting path below, including DLF_LM specular occlusion sampling.
-constexpr bool kVulkanDynamicLightingEnabled = true;
+// The comparison build keeps sunlight and ambient/baked illumination.
+// Lightmap flags alone must not re-enable point/projector light passes.
+constexpr bool kVulkanDynamicLightingEnabled = false;
+bool ShouldRenderVulkanLight(const CDLight* light)
+{
+    if (!light) return false;
+    if (kVulkanDynamicLightingEnabled) return true;
+    const uint32 allowed = CryVR::kVulkanBasicRenderTest ?
+        (DLF_SUN | DLF_DIRECTIONAL) :
+        (DLF_SUN | DLF_DIRECTIONAL | DLF_LM | DLF_LMDOT3 | DLF_LMOCCL);
+    return !(light->m_Flags & DLF_TEMP) && (light->m_Flags & allowed);
+}
 
 float g_vulkanPolygonOffsetFactor = -1.0f;
 float g_vulkanPolygonOffsetUnits = -4.0f;
@@ -781,6 +790,7 @@ public:
     void ReleaseBuffer(CVertexBuffer* vertices) override {
         ClearGpuSkinning(vertices);
         m_frameBufferRevisions.erase(vertices);
+        InvalidateFrameBufferRevision(vertices);
         for (auto entry = m_frameNormalGeometry.begin(); entry != m_frameNormalGeometry.end();)
         {
             if (entry->first[0] == reinterpret_cast<uintptr_t>(vertices))
@@ -795,22 +805,45 @@ public:
     void UpdateBuffer(CVertexBuffer* vertices, const void* source, int count,
                       bool unlock, int offset, int type) override
     {
-        m_frameBufferRevisions[vertices] = ++m_geometryRevision;
+        bool changed = source && count > 0;
+        if (vertices && !source && type >= 0 && type <= 3)
+            for (int stream = 0; stream < VSF_NUM; ++stream)
+                if ((type == 0 && stream == VSF_GENERAL) || (type & (1 << stream)))
+                    changed = changed || !unlock || vertices->m_VS[stream].m_bLocked;
+        if (vertices && changed)
+        {
+            const uint64_t revision = ++m_geometryRevision;
+            m_frameBufferRevisions[vertices] = revision;
+            CacheFrameBufferRevision(vertices, revision);
+        }
         CNULLRenderer::UpdateBuffer(vertices, source, count, unlock, offset, type);
     }
     void CreateIndexBuffer(SVertexStream* stream, const void* source, int count) override
     {
-        m_ownedIndexRevisions[stream] = ++m_geometryRevision;
+        const uint64_t revision = ++m_geometryRevision;
+        m_ownedIndexRevisions[stream] = revision;
+        CacheOwnedIndexRevision(stream, revision);
         CNULLRenderer::CreateIndexBuffer(stream, source, count);
     }
     void UpdateIndexBuffer(SVertexStream* stream, const void* source, int count, bool unlock = true) override
     {
-        m_ownedIndexRevisions[stream] = ++m_geometryRevision;
+        if (!stream) return;
+        if (source && count > 0 && stream->m_VData && count <= stream->m_nItems &&
+            !stream->m_bLocked && !memcmp(stream->m_VData, source, size_t(count) * sizeof(uint16_t)))
+            return;
+        if ((source && count > 0) || (!source && (!unlock || stream->m_bLocked)))
+        {
+            const uint64_t revision = ++m_geometryRevision;
+            m_ownedIndexRevisions[stream] = revision;
+            CacheOwnedIndexRevision(stream, revision);
+        }
+        if (!source) stream->m_bLocked = !unlock;
         CNULLRenderer::UpdateIndexBuffer(stream, source, count, unlock);
     }
     void ReleaseIndexBuffer(SVertexStream* stream) override
     {
         m_ownedIndexRevisions.erase(stream);
+        InvalidateOwnedIndexRevision(stream);
         CNULLRenderer::ReleaseIndexBuffer(stream);
     }
     explicit CVulkanRenderer(CryVR::VulkanFrameRenderer* frameRenderer)
@@ -4691,12 +4724,14 @@ public:
                         m_frameRenderer->RequirePanelFallback();
                         return;
                     }
-                lightmapTexCoords.resize(static_cast<size_t>(vertices->m_NumVerts) * 2);
                 const int copiedVertices = crymin(vertices->m_NumVerts, lmVertexCount);
-                for (int vertex = 0; vertex < copiedVertices; ++vertex)
+                if (copiedVertices == vertices->m_NumVerts)
+                    lightmapTexCoords.Borrow(reinterpret_cast<float*>(lmVertices->m_VS[VSF_GENERAL].m_VData),
+                        size_t(copiedVertices) * 2);
+                else
                 {
-                    lightmapTexCoords[static_cast<size_t>(vertex) * 2] = source[vertex].st[0];
-                    lightmapTexCoords[static_cast<size_t>(vertex) * 2 + 1] = source[vertex].st[1];
+                    lightmapTexCoords.resize(static_cast<size_t>(vertices->m_NumVerts) * 2);
+                    memcpy(lightmapTexCoords.data(), source, size_t(copiedVertices) * sizeof(float) * 2);
                 }
                 textureStage1UsesTexCoord1 = true;
             }
@@ -5878,10 +5913,8 @@ public:
             m_activeHardwarePassType == eSHP_Light ||
             m_activeHardwarePassType == eSHP_DiffuseLight ||
             m_activeHardwarePassType == eSHP_SpecularLight;
-        // These are additive direct-light passes. The base/ambient material
-        // pass below still draws albedo and baked lightmaps.
-        if (!kVulkanDynamicLightingEnabled && hardwareMaterialLightPass)
-            return;
+        // Filter individual sources, rather than dropping the whole material
+        // Light pass: its first contribution can also carry object ambient.
         // OpenGL routes these passes through SLightMaterial::mfApply and
         // EF_LightMaterial; LMF_IGNORELIGHTS deliberately skips EF_SetLights.
         // MultiLights is its own PS30 path and does not use that executor.
@@ -5927,7 +5960,7 @@ public:
             m_RP.m_pShader && (m_RP.m_pShader->m_Flags & EF_NEEDNORMALS) &&
             !(m_RP.m_ObjFlags & FOB_FOGPASS) && m_RP.m_pCurObject &&
             m_activeResources && m_activeResources->m_LMaterial;
-        const bool canTranslateDynamicLights = kVulkanDynamicLightingEnabled && (
+        const bool canTranslateDynamicLights = (
             m_activeHardwarePassType == eSHP_MultiLights ||
             ((fixedFunctionMaterialLighting || hardwareMaterialLightPass) &&
              !(activeHardwareLightFlags & LMF_IGNORELIGHTS)));
@@ -6137,6 +6170,10 @@ public:
                 {
                     if (distance > radius || !(radius > 0.0f))
                         return 0.0f;
+                    // The stock b/a*a expression produces NaN at the source
+                    // origin. Its finite limit is two; never upload NaN light
+                    // attenuation to a movable receiver passing that point.
+                    if (distance <= 0.0f) return 2.0f;
                     const float a = distance / radius;
                     const float b = 2.0f * a * a * a - 3.0f * a * a + 1.0f;
                     // Preserve GLRendPipeline.cpp::sAttenuation's operation
@@ -6159,7 +6196,7 @@ public:
                         continue;
                     CDLight* light = fixedFunctionLightList ?
                         m_RP.m_pActiveDLights[lightIndex] : m_RP.m_DLights[lightLevel][lightIndex];
-                    if (!light || !(light->m_Flags &
+                    if (!ShouldRenderVulkanLight(light) || !(light->m_Flags &
                                     (DLF_DIRECTIONAL | DLF_POINT | DLF_PROJECT)))
                         continue;
                     // EF_SetLights filters projector lights before preparing
@@ -7672,6 +7709,8 @@ public:
             static_cast<const void*>(flareVertexData.data()) : drawVertexData;
         const uint32_t finalVertexCount = flareDeformActive ? 16u :
             static_cast<uint32_t>(vertices->m_NumVerts);
+        uint32_t nativeTerrainMode = 0;
+        float nativeTerrainParameters[4]{};
         uint32_t validatedMinimumVertex = UINT32_MAX;
         uint32_t validatedMaximumVertex = 0;
         // Material groups reference only a part of their shared leaf buffer.
@@ -7679,12 +7718,9 @@ public:
         uint32_t conversionFirst = 0, conversionEnd = finalVertexCount;
         if (!flareDeformActive && indexCount > 0)
         {
-            uint32_t minimum = finalVertexCount, maximum = 0;
-            for (int index = 0; index < indexCount; ++index)
-            {
-                minimum = crymin(minimum, static_cast<uint32_t>(indexData[index]));
-                maximum = crymax(maximum, static_cast<uint32_t>(indexData[index]));
-            }
+            uint32_t minimum, maximum;
+            ValidatedIndexRange(indices, indexData, uint32_t(indexCount), finalVertexCount,
+                minimum, maximum);
             if (maximum >= finalVertexCount)
             {
                 m_frameRenderer->RequirePanelFallback();
@@ -8250,7 +8286,26 @@ public:
                            sizeof(float) * 4);
                 }
             }
-            if (terrainSectorVertices)
+            if (terrainSectorVertices && finalVertexFormat == VERTEX_FORMAT_P3F_N_COL4UB_COL4UB &&
+                !fixedFunctionMaterialLighting && !stockTerrainShadowProgram &&
+                stockTerrainAmbientMode != 4 && !stockTerrainFogLayers)
+            {
+                // Keep the original terrain stream on GPU. Camera-dependent
+                // detail weights and projected UVs are vertex shader work.
+                Vec3d objectCamera = GetCamera().GetPos();
+                if (m_RP.m_pCurObject && (m_RP.m_pCurObject->m_ObjFlags & FOB_TRANS_MASK))
+                {
+                    Vec3d worldCamera = objectCamera;
+                    TransformPosition(objectCamera, worldCamera, m_RP.m_pCurObject->GetInvMatrix());
+                }
+                nativeTerrainMode = terrainDetailSort ? 4u : stockTerrainLayers > 0 ? 3u :
+                    stockTerrainLayers == 0 ? 2u : 1u;
+                nativeTerrainParameters[0] = objectCamera.x;
+                nativeTerrainParameters[1] = objectCamera.y;
+                nativeTerrainParameters[2] = objectCamera.z;
+                nativeTerrainParameters[3] = crymax(0.001f, terrainTexgen[3]);
+            }
+            else if (terrainSectorVertices)
             {
                 const auto* source = static_cast<const struct_VERTEX_FORMAT_P3F_N_COL4UB_COL4UB*>(
                     vertices->m_VS[VSF_GENERAL].m_VData);
@@ -8586,6 +8641,9 @@ public:
                 textureCoordinatePointers[1]->ePT == eSrcPointer_TexLM;
         for (size_t lightPass = 0; lightPass < lightPasses.size(); ++lightPass)
         {
+            // Specular draws use negative radius, including combined Light passes.
+            if (CryVR::kVulkanBasicRenderTest && lightPasses[lightPass][3] < 0.0f)
+                continue;
             // The engine queues fog objects separately from their lit base
             // objects, without lightmap IDs. Redrawing that base here replaces
             // the baked lighting. Keep the geometry for the volume overlay
@@ -9258,7 +9316,8 @@ public:
             // do not set QueueStockIndexedDraw's ocean waterEffect flag).
             m_frameRenderer->SetStockGpuProfileCategories(terrainShaderSort,
                 stockWaterMode > 0,
-                m_RP.m_pCurObject && m_RP.m_pCurObject->m_pCharInstance);
+                m_RP.m_pCurObject && m_RP.m_pCurObject->m_pCharInstance,
+                m_RP.m_pShader && !FastAsciiCaseCompare(m_RP.m_pShader->GetName(), "TerrainDetailObjects"));
             const uint64 specularMask = stockLightTemplate ? stockHardwarePass->m_StockProgramMask : 0;
             int specularGlossTexture = 0;
             if (stockLightTemplate && lightPasses[lightPass][3] < 0.0f &&
@@ -9285,6 +9344,7 @@ public:
                  ((specularMask & 0x800ull) ? 2u : 0u) |
                  ((specularMask & 0x20ull) ? 4u : 0u) |
                  ((specularMask & 0x10ull) ? 32u : 0u)) : 0u, specularGlossTexture);
+            m_frameRenderer->SetStockNativeTerrain(nativeTerrainParameters, nativeTerrainMode);
             const bool queued = m_frameRenderer->QueueStockClientIndexedDraw(
                 finalVertexData,
                 finalVertexCount, indexData,
@@ -9321,7 +9381,7 @@ public:
                 // The baked-lightmap fragment branch adds Ambient itself.
                 // Applying evaluateStockLighting to its primary color first
                 // would multiply that term by ambient a second time.
-                kVulkanDynamicLightingEnabled && !shaderLightingDisabled && !translatedWaterEffect &&
+                !shaderLightingDisabled && !translatedWaterEffect &&
                     !stockParticleAmbient && !programInfo.plantsBump &&
                     !stockTerrainLayerBase &&
                     // CGRCTerrain programs own their ambient term in the
@@ -9354,9 +9414,10 @@ public:
                 waterReflectionUpdatePtr, vertices,
                 validatedMinimumVertex, validatedMaximumVertex,
                 ImmutableGeometryRevision(vertices, indices, finalVertexData, immutableNormalGeometry,
-                    indexData, firstIndex, lightmapTexCoords.empty()),
+                    indexData, firstIndex),
                 vertices->m_VS[VSF_TANGENTS].m_VData ?
                     vertices->m_VS[VSF_TANGENTS].m_VData : sourceTangentBasis);
+            m_frameRenderer->SetStockNativeTerrain(nullptr, 0);
             // Auxiliary and subsequent material draws must not inherit this array.
             m_frameRenderer->SetStockProfilePlants(false);
             m_frameRenderer->SetStockDecalDraw(false);
@@ -10716,6 +10777,15 @@ private:
         // technique. EF_Flush then filters only the dynamic-light mask; it
         // does not rebuild that list or reselect the technique.
         uint32_t mask = CV_r_hwlights && object ? object->m_DynLMMask : 0u;
+        if (!kVulkanDynamicLightingEnabled)
+        {
+            const int level = SRendItem::m_RecurseLevel;
+            const int levels = sizeof(m_RP.m_DLights) / sizeof(m_RP.m_DLights[0]);
+            if (level >= 0 && level < levels)
+                for (int index = 0; index < m_RP.m_DLights[level].Num() && index < 32; ++index)
+                    if (!ShouldRenderVulkanLight(m_RP.m_DLights[level][index]))
+                        mask &= ~(uint32_t(1) << index);
+        }
         const char* filter = CV_r_showlight ? CV_r_showlight->GetString() : nullptr;
         if (filter && filter[0] != '0')
         {
@@ -12334,21 +12404,118 @@ private:
     std::unordered_map<std::array<uintptr_t, 8>, std::vector<byte>, NormalGeometryHash> m_frameNormalGeometry;
     std::unordered_map<const CVertexBuffer*, uint64_t> m_frameBufferRevisions;
     std::unordered_map<const SVertexStream*, uint64_t> m_ownedIndexRevisions;
+    struct BufferRevisionLookupEntry
+    {
+        const CVertexBuffer* buffer = nullptr;
+        uint64_t revision = 0;
+        bool valid = false;
+    };
+    struct IndexRevisionLookupEntry
+    {
+        const SVertexStream* stream = nullptr;
+        uint64_t revision = 0;
+        bool valid = false;
+    };
+    mutable std::array<BufferRevisionLookupEntry, 2048> m_frameBufferRevisionLookup{};
+    mutable std::array<IndexRevisionLookupEntry, 2048> m_ownedIndexRevisionLookup{};
     uint64_t m_geometryRevision = 0;
+    struct IndexRangeCacheEntry
+    {
+        std::array<uint64_t, 4> key{};
+        uint32_t minimum = 0, maximum = 0;
+    };
+    std::array<IndexRangeCacheEntry, 2048> m_indexRangeCache;
+    static size_t RevisionLookupSlot(const void* pointer)
+    {
+        return (reinterpret_cast<uintptr_t>(pointer) >> 4) & 2047u;
+    }
+    uint64_t FindOwnedIndexRevision(const SVertexStream* stream) const
+    {
+        if (!stream) return 0;
+        const size_t slot = RevisionLookupSlot(stream);
+        auto& cached = m_ownedIndexRevisionLookup[slot];
+        if (cached.valid && cached.stream == stream) return cached.revision;
+        const auto found = m_ownedIndexRevisions.find(stream);
+        const uint64_t revision = found == m_ownedIndexRevisions.end() ? 0 : found->second;
+        cached = {stream, revision, true};
+        return revision;
+    }
+    uint64_t FindFrameBufferRevision(const CVertexBuffer* buffer) const
+    {
+        if (!buffer) return 0;
+        const size_t slot = RevisionLookupSlot(buffer);
+        auto& cached = m_frameBufferRevisionLookup[slot];
+        if (cached.valid && cached.buffer == buffer) return cached.revision;
+        const auto found = m_frameBufferRevisions.find(buffer);
+        const uint64_t revision = found == m_frameBufferRevisions.end() ? 0 : found->second;
+        cached = {buffer, revision, true};
+        return revision;
+    }
+    void CacheOwnedIndexRevision(const SVertexStream* stream, uint64_t revision)
+    {
+        if (stream) m_ownedIndexRevisionLookup[RevisionLookupSlot(stream)] = {stream, revision, true};
+    }
+    void InvalidateOwnedIndexRevision(const SVertexStream* stream)
+    {
+        if (!stream) return;
+        auto& cached = m_ownedIndexRevisionLookup[RevisionLookupSlot(stream)];
+        if (cached.valid && cached.stream == stream) cached = {};
+    }
+    void CacheFrameBufferRevision(const CVertexBuffer* buffer, uint64_t revision)
+    {
+        if (buffer) m_frameBufferRevisionLookup[RevisionLookupSlot(buffer)] = {buffer, revision, true};
+    }
+    void InvalidateFrameBufferRevision(const CVertexBuffer* buffer)
+    {
+        if (!buffer) return;
+        auto& cached = m_frameBufferRevisionLookup[RevisionLookupSlot(buffer)];
+        if (cached.valid && cached.buffer == buffer) cached = {};
+    }
+    void ValidatedIndexRange(SVertexStream* stream, const uint16_t* data,
+        uint32_t count, uint32_t vertexCount, uint32_t& minimum, uint32_t& maximum)
+    {
+        const uint64_t revision = FindOwnedIndexRevision(stream);
+        IndexRangeCacheEntry* entry = nullptr;
+        std::array<uint64_t, 4> key{};
+        if (revision != 0)
+        {
+            key = {{reinterpret_cast<uint64_t>(data), revision, count, vertexCount}};
+            const size_t slot = ((key[0] >> 4) ^ (key[1] * 1099511628211ull) ^
+                (key[2] * 31u) ^ key[3]) & (m_indexRangeCache.size() - 1);
+            entry = &m_indexRangeCache[slot];
+            if (entry->key == key)
+            {
+                minimum = entry->minimum;
+                maximum = entry->maximum;
+                return;
+            }
+        }
+        minimum = vertexCount;
+        maximum = 0;
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            minimum = crymin(minimum, uint32_t(data[index]));
+            maximum = crymax(maximum, uint32_t(data[index]));
+        }
+        if (entry)
+        {
+            entry->key = key;
+            entry->minimum = minimum;
+            entry->maximum = maximum;
+        }
+    }
     uint64_t ImmutableGeometryRevision(CVertexBuffer* vertices, SVertexStream* indices,
         const void* data, const void* cachedNormals, const uint16_t* indexData,
-        int firstIndex, bool noLightmapCoordinates) const
+        int firstIndex) const
     {
-        if (!vertices || vertices->m_bDynamic || !noLightmapCoordinates ||
+        if (!vertices || !indices || vertices->m_bDynamic ||
             (data != vertices->m_VS[VSF_GENERAL].m_VData && (!cachedNormals || data != cachedNormals)) ||
             (m_RP.m_pCurObject && m_RP.m_pCurObject->m_pCharInstance) ||
             indexData != static_cast<const uint16_t*>(indices->m_VData) + firstIndex)
             return 0;
-        const auto index = m_ownedIndexRevisions.find(indices);
-        if (index == m_ownedIndexRevisions.end()) return 0;
-        const auto vertex = m_frameBufferRevisions.find(vertices);
-        return vertex == m_frameBufferRevisions.end() ? index->second :
-            std::max(index->second, vertex->second);
+        const uint64_t indexRevision = FindOwnedIndexRevision(indices);
+        if (!indexRevision) return 0;
+        return std::max(indexRevision, FindFrameBufferRevision(vertices));
     }
     size_t m_frameNormalGeometryBytes = 0;
     const void* CacheFrameNormalGeometry(CVertexBuffer* vertices, const void* source,
@@ -12360,11 +12527,11 @@ private:
         CryVR::VulkanVertexFormat input{}, output{};
         if (!CryVR::GetVulkanVertexFormat(sourceId, input) ||
             !CryVR::GetVulkanVertexFormat(targetId, output)) return nullptr;
-        const auto revision = m_frameBufferRevisions.find(vertices);
+        const uint64_t revision = FindFrameBufferRevision(vertices);
         const std::array<uintptr_t, 8> key{{reinterpret_cast<uintptr_t>(vertices),
             reinterpret_cast<uintptr_t>(source), reinterpret_cast<uintptr_t>(normals),
             uintptr_t(sourceId), uintptr_t(targetId), count, uintptr_t(normalStride),
-            revision == m_frameBufferRevisions.end() ? 0 : uintptr_t(revision->second)}};
+            uintptr_t(revision)}};
         const auto found = m_frameNormalGeometry.find(key);
         if (found != m_frameNormalGeometry.end()) return found->second.data();
         const size_t bytes = size_t(count) * output.stride;
@@ -12416,6 +12583,24 @@ private:
         std::vector<uint8_t> colors;
     };
     std::map<const CVertexBuffer*, StockGeneratedColors> m_stockGeneratedColors;
+    struct LightmapCoordinateStream
+    {
+        // Separate LM streams already have the exact Vulkan float2 layout.
+        // Borrow until QueueStockClientIndexedDraw copies the referenced range.
+        // The owned array is needed only for padding or strided fallback UVs.
+        std::vector<float> owned;
+        float* borrowed = nullptr;
+        size_t borrowedCount = 0;
+        void Borrow(float* source, size_t count) { borrowed = source; borrowedCount = count; }
+        void clear() { borrowed = nullptr; borrowedCount = 0; owned.clear(); }
+        void resize(size_t count) { borrowed = nullptr; borrowedCount = 0; owned.resize(count); }
+        size_t size() const { return borrowed ? borrowedCount : owned.size(); }
+        bool empty() const { return size() == 0; }
+        float* data() { return borrowed ? borrowed : owned.data(); }
+        const float* data() const { return borrowed ? borrowed : owned.data(); }
+        float& operator[](size_t index) { return data()[index]; }
+        const float& operator[](size_t index) const { return data()[index]; }
+    };
     struct DrawScratch
     {
         std::vector<uint16_t> triangulatedQuads;
@@ -12427,7 +12612,7 @@ private:
         std::vector<struct_VERTEX_FORMAT_P3F_N_COL4UB_COL4UB_TEX2F> terrainTexturedVertices;
         std::vector<struct_VERTEX_FORMAT_P3F_COL4UB_TEX2F> muzzleFlashVertices;
         std::vector<uint8_t> generatedVertices;
-        std::vector<float> lightmapCoordinates;
+        LightmapCoordinateStream lightmapCoordinates;
         std::vector<byte> separateUvVertices;
         std::vector<byte> litVertices;
     };
