@@ -47,6 +47,8 @@ struct ControllerState
     bool posture = false;
     bool jump = false;
     bool use = false;
+    float gripAmount = 0.0f;
+    float triggerAmount = 0.0f;
     float thumbstickX = 0.0f;
     float thumbstickY = 0.0f;
 };

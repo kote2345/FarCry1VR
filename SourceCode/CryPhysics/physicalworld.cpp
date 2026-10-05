@@ -914,6 +914,9 @@ void CPhysicalWorld::TimeStep(float time_interval, int flags)
 								}
 							}
 							Ebefore *= isneg(-nAnimatedObjects)+1; // increase energy growth limit if we have animated bodies involved
+							// Account for measured muscle work while retaining the passive
+							// contact-energy guard against numerical energy growth.
+							Ebefore += ContactSolverVRMotorWork();
 							if (Eafter>Ebefore*(1.0f+0.1f*isneg(g_nBodies-15)))
 								damping = min(damping, sqrt_tpl(Ebefore/Eafter));
 							for(pent=m_pTmpEntList1[i],bGroupFinished=1; pent; pent=pent->m_next_coll)

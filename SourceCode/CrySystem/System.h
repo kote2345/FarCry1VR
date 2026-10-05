@@ -147,6 +147,7 @@ public:
 	float GetVRHeadYawDeltaRadians() const override { return m_vulkanFrameRenderer.GetHeadYawDeltaRadians(); }
 	float GetVRHeadPitchDeltaRadians() const override { return m_vulkanFrameRenderer.GetHeadPitchDeltaRadians(); }
     bool GetVRControllerTransform(bool left, Matrix34& transform) const override;
+    bool GetVRFingerInput(bool left, float& grip, float& trigger) const override;
 	CryVR::VulkanResourceManager* GetVulkanResources() { return &m_vulkanResources; }
 	CryVR::VulkanShaderLibrary* GetVulkanShaders() { return &m_vulkanShaders; }
 	const char			*GetGameMOD() { if (m_szGameMOD[0]) return (m_szGameMOD);return (NULL); }

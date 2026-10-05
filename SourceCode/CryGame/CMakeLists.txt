@@ -9,6 +9,9 @@ add_definitions(-DCRY_NO_FFMPEG)
 endif()
 
 set(SRC_FILES
+	"VRPhysicalNPC.cpp"
+	"VRNPCDamage.cpp"
+	"VRBodyPhysics.cpp"
     "AdvCamSystem.cpp"
     "AIHandler.cpp"
     "BitStream_Base.cpp"
@@ -82,6 +85,7 @@ set(SRC_FILES
     "XNetworkStats.cpp"
     "XObjectProxy.cpp"
     "XPlayer.cpp"
+    "VRPhysicalWeapons.cpp"
     "XPlayerCamera.cpp"
     "XPlayerLight.cpp"
     "XplayerVehicle.cpp"
@@ -128,6 +132,9 @@ include_directories(
 endif()
 
 add_library(${PROJECT_NAME} SHARED ${SRC_FILES})
+if (ANDROID)
+target_link_libraries(${PROJECT_NAME} PRIVATE log)
+endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/SourceCode/CryCommon

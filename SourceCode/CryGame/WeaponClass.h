@@ -145,6 +145,7 @@ typedef struct WeaponParams
 
 class CWeaponClass : public ICharInstanceSink
 {
+	friend class CVRPhysicalWeapons;
 public:
 	CWeaponClass(CWeaponSystemEx& rWeaponSystem);
 	virtual ~CWeaponClass();
@@ -170,6 +171,9 @@ public:
 	const string&				GetBindBone() const		{	return m_sBindBone;	}
 	void								SetBindBone(const string& sBindBone)	{	m_sBindBone = sBindBone;	}
 	bool								LoadMuzzleFlash(const string& sGeometryName);
+	void TrackMuzzleBinding(ULONG_PTR handle, ICryCharInstance* owner);
+	bool DetachMuzzleBinding(ULONG_PTR handle);
+	void ClearMuzzleBindings(ICryCharInstance* owner);
 
 	// serialization
 	void Read(CStream& stm);
@@ -198,6 +202,7 @@ public:
 	void SetFirstPersonOffset(const Vec3d &posOfs, const Vec3d &angOfs);
 	Vec3 GetFirstPersonOffset() { return m_fpvPosOffset; };
 	void MoveToFirstPersonPos(IEntity *pIEntity);
+	bool GetVRHandModelTransform(const Matrix34& controller, Matrix34& model);
 
 	const Vec3& GetAngles() const	{	return m_vAngles;	}
 	const Vec3& GetPos() const	{	return m_vPos;	}
@@ -252,6 +257,8 @@ private:
 	Vec3								m_vAngles;
 	Vec3								m_vPos;
     Matrix34 m_vrGripInverse;
+	Matrix34 m_vrGripHandInverse;
+	Vec3 m_vrGripBonePosition;
     bool m_vrGripInitialized = false;
     const char* GetVRHandBoneName(bool left) const;
     void InitializeVRWeaponGrip();
@@ -270,6 +277,7 @@ private:
 	IStatObj*						m_pObject;				//!< third person weapon model
 	ICryCharInstance*		m_pCharacter;			//!< first person animated weapon
 	IStatObj*						m_pMuzzleFlash;		//!< muzzle flash (used in both 3rd and 1st person)
+	std::map<ULONG_PTR, ICryCharInstance*> m_muzzleBindingOwners;
 	string							m_sBindBone;			//!< name of bone to bind object to
 
 	// FIXME: clean this stuff up

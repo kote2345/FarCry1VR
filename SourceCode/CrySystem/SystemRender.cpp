@@ -52,6 +52,14 @@ bool CSystem::GetVRControllerTransform(bool left, Matrix34& transform) const
     transform = bodyView.GetInverted() * local;
     return true;
 }
+
+bool CSystem::GetVRFingerInput(bool left, float& grip, float& trigger) const
+{
+    const CryVR::ControllerState& state = left ? m_vrRuntime.GetLeftController() : m_vrRuntime.GetRightController();
+    grip = state.gripAmount;
+    trigger = state.triggerAmount;
+    return state.poseValid && state.active;
+}
 #include "System.h"
 
 #ifndef _XBOX

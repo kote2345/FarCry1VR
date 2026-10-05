@@ -2204,6 +2204,9 @@ void CEntity::EnablePhysics(bool enable)
 
 void CEntity::AddImpulse(int ipart, Vec3d pos, Vec3d impulse,bool bPos,float fAuxScale)
 {
+	// Explicitly disabled hit impulses must not be amplified by minimum-speed
+	// scaling or normalized as a zero direction.
+	if (!(impulse.GetLengthSquared()>1E-12f)) return;
 #ifndef _ISNOTFARCRY
 	IXGame *pXGame = (IXGame*) GetISystem()->GetIGame();
 #endif
@@ -2519,7 +2522,8 @@ void CEntity::ResolveCollision()
 				if (!m_pEntitySystem->m_pUpdateCollisionScript->GetIVal())
 					continue;
 
-				CallStateFunction( ScriptState_OnContact,pEntity->GetScriptObject() );
+				if (!SuppressVRWeaponPickup(pEntity))
+					CallStateFunction( ScriptState_OnContact,pEntity->GetScriptObject() );
 			}
 		}
 	}
@@ -3058,6 +3062,13 @@ void CEntity::OnDamage( IScriptObject *pObj )
 {
 	if(m_bGarbage)
 		return;
+	// Stop damage before the scripts can kill the local test player. This
+	// covers bullets, explosions, falls and the scripted drowning damage path.
+	int localTestPlayer = 0;
+	ICVar* invulnerable = GetISystem()->GetIConsole()->GetCVar("vr_test_player_invulnerable");
+	if (invulnerable && invulnerable->GetIVal() && m_pScriptObject &&
+		m_pScriptObject->GetValue("VRTestLocalPlayer", localTestPlayer) && localTestPlayer)
+		return;
 
 	//
 	//	store hit parameters
@@ -3077,7 +3088,19 @@ void CEntity::OnDamage( IScriptObject *pObj )
 //////////////////////////////////////////////////////////////////////////
 void CEntity::OnEnterArea( IEntity* entity, const int areaID )
 {
+	if (SuppressVRWeaponPickup(entity)) return;
 	CallStateFunction( ScriptState_OnEnterArea,entity->GetScriptObject(),areaID );
+}
+
+bool CEntity::SuppressVRWeaponPickup(IEntity* player) const
+{
+	if (!player || !player->GetScriptObject()) return false;
+	int enabled = 0;
+	if (!player->GetScriptObject()->GetValue("VRPhysicalWeapons", enabled) || !enabled) return false;
+	_SmartScriptObject classes(m_pScriptSystem, true);
+	int weaponPickup = 0;
+	return m_pScriptSystem->GetGlobalValue("VRPhysicalWeaponPickupClasses", classes) &&
+		classes->GetValue(GetEntityClassName(), weaponPickup) && weaponPickup != 0;
 }
 
 //////////////////////////////////////////////////////////////////////////

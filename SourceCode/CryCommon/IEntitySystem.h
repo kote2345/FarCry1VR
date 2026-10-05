@@ -1169,7 +1169,6 @@ public:
 	@param target	pointer to vec pos. If NULL - no hands IK
 */
 	virtual void SetHandsIKTarget( const Vec3* target=NULL ) = 0;
-
 	virtual void Remove() =0;
 
 	//! Set custom shader parameters

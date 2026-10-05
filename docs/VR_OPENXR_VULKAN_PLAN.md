@@ -23,7 +23,7 @@ The VR path is Vulkan-only. OpenGL/Zink is not part of the VR pipeline and remai
 
 The current transitional frame path captures the legacy renderer's completed RGBA backbuffer before swap, uploads it to a Vulkan texture, and draws it onto a shared head-locked panel at 2.5 m. The quad is transformed independently using each OpenXR eye pose and asymmetric FOV, so the panel has binocular depth. Vulkan performs the panel rendering and OpenXR composition; OpenGL still produces the game image and must be removed by the native scene-renderer port. This readback/upload path is a bring-up path, not a performance target.
 
-The normalized controller actions currently feed existing game bindings through SDL: left stick to WASD, left select to Enter, right select/trigger to Space, and right stick to relative mouse look. OpenXR action state is sampled per frame and cleared when session tracking is not active.
+The normalized controller actions feed existing game bindings through SDL: left stick to movement, left select to Enter, right trigger to the primary mouse button, right stick to relative menu look, right A cycles standing/crouching/prone, right B holds Space for jump, and either grip holds F for use. OpenXR action state is sampled per frame and cleared when session tracking is not active.
 
 ## Backend boundary
 

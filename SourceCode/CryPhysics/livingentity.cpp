@@ -25,6 +25,8 @@
 #include "geoman.h"
 #include "physicalworld.h"
 #include "livingentity.h"
+#include "rigidentity.h"
+#include <VRGripMath.h>
 
 
 inline Vec3_tpl<short> EncodeVec6b(const vectorf &vec) {
@@ -148,6 +150,7 @@ CLivingEntity::CLivingEntity(CPhysicalWorld *pWorld) : CPhysicalEntity(pWorld)
 	m_dhHist[0] = m_dhHist[1] = 0;
 	m_timeOnStairs = 0;
 	m_timeForceInertia = 0;
+	m_npcRootYieldTime = 0;
 	m_deltaPos.zero();
 	m_timeSmooth = 0;
 	m_bUseSphere = 0;
@@ -582,6 +585,26 @@ int CLivingEntity::GetStatus(pe_status *_status)
 
 int CLivingEntity::Action(pe_action* _action)
 {
+	if (_action->type==pe_action_vr_locomotion_limit::type_id) {
+		pe_action_vr_locomotion_limit* limit = (pe_action_vr_locomotion_limit*)_action;
+		if (limit->hand<0 || limit->hand>1) return 0;
+		m_vrLocomotionLimits[limit->hand] = *limit;
+		m_vrLocomotionAge = 0;
+		return 1;
+	}
+	if (_action->type == pe_action_npc_root::type_id) {
+		const pe_action_npc_root *action = (const pe_action_npc_root*)_action;
+		// No transform write, requested-velocity override, or airborne launch.
+		if (!(action->impulse.len2() < 1E8f) || !(action->yieldTime >= 0 && action->yieldTime <= 1)) return 0;
+		m_vel += vectorf(action->impulse.x,action->impulse.y,0)*(m_massinv*.5f);
+		const float horizontal = sqr(m_vel.x)+sqr(m_vel.y);
+		if (action->yieldTime>0 && horizontal>16.0f) {
+			const float scale = 4.0f/sqrt_tpl(horizontal); m_vel.x *= scale; m_vel.y *= scale;
+		}
+		m_npcRootYieldTime = action->yieldTime;
+		m_bActive = 1;
+		return 1;
+	}
 	int res;
 	if (res = CPhysicalEntity::Action(_action))
 		return res; 
@@ -661,6 +684,7 @@ int CLivingEntity::Action(pe_action* _action)
 	}
 	
 	if (_action->type==pe_action_reset::type_id) {
+		m_npcRootYieldTime = 0;
 		m_vel.zero(); m_velRequested.zero();
 		m_dh = m_dhSpeed = m_stablehTime = 0;
 		m_bFlying = 1;
@@ -883,7 +907,8 @@ float CLivingEntity::ShootRayDown(CPhysicalEntity **pentlist,int nents, const ve
 	float h=-1E10,maxdim,maxarea;
 	nslope = m_nslope;
 
-	for(i=nents-1;i>=0;i--) if (pentlist[i]!=this) 
+	for(i=nents-1;i>=0;i--) if (pentlist[i]!=this &&
+		!(pentlist[i]->GetType()==PE_RIGID && ((CRigidEntity*)pentlist[i])->IsVRGripCarrier(this)))
 	for(j=0;j<pentlist[i]->m_nParts;j++) if (pentlist[i]->m_parts[j].flags & geom_colltype_player) {
 		if (bIgnoreSmallObjects && (ibest>=0 || pentlist[i]->GetRigidBody(j)->v.len2()>sqr(m_maxVelGround*0.2f))) {
 			pentlist[i]->m_parts[j].pPhysGeomProxy->pGeom->GetBBox(&bbox);
@@ -1004,7 +1029,8 @@ float CLivingEntity::GetMaxTimeStep(float time_interval)
 void CLivingEntity::SyncWithGroundCollider(float time_interval)
 {
 	int i; vectorf newpos;
-	if (m_pLastGroundCollider && m_pLastGroundCollider->m_iSimClass==7)
+	if (m_pLastGroundCollider && (m_pLastGroundCollider->m_iSimClass==7 ||
+		(m_pLastGroundCollider->GetType()==PE_RIGID && ((CRigidEntity*)m_pLastGroundCollider)->IsVRGripCarrier(this))))
 		ReleaseGroundCollider();
 	m_velGround.zero();
 
@@ -1028,6 +1054,18 @@ void CLivingEntity::SyncWithGroundCollider(float time_interval)
 	}
 }
 
+void CLivingEntity::LimitVRLocomotion(vectorf& velocity)
+{
+	if (m_vrLocomotionAge>.1f) return;
+	vectorf normals[2]; float limits[2]; bool enabled[2];
+	for (int hand=0;hand<2;++hand) {
+		normals[hand] = m_vrLocomotionLimits[hand].normal;
+		limits[hand] = max(0.0f,m_vrLocomotionLimits[hand].maxSpeed);
+		enabled[hand] = m_vrLocomotionLimits[hand].enabled!=0;
+	}
+	ProjectVRGripVelocity(velocity,normals,limits,enabled);
+}
+
 void CLivingEntity::StartStep(float time_interval)
 {
 	m_timeStepPerformed = 0;
@@ -1039,6 +1077,7 @@ void CLivingEntity::StartStep(float time_interval)
 
 int CLivingEntity::Step(float time_interval)
 {
+	m_vrLocomotionAge += max(0.0f,time_interval);
 	if (time_interval<=0)
 		return 1;
 	if (m_timeStepPerformed>m_timeStepFull-0.001f && m_pWorld->m_vars.bMultiplayer+m_bStateReading==0)
@@ -1046,6 +1085,10 @@ int CLivingEntity::Step(float time_interval)
 	int i,j,imin,jmin,iter,nents,ncont,bWasFlying,bPushOther,bUnprojected,idmat,bFastPhys,bHasFastPhys,iCyl,icnt,nUnproj,bStaticUnproj,bDynUnproj;
 	vectorf pos0,newpos,move(zero),nslope,ncontact,ptcontact,ncontactHist[4],ncontactSum,BBoxInner[2],BBoxOuter[2],velGround;
 	float movelen,tmin,h,hcur,dh,tfirst,vrel,move0,movesum,kInertia=m_timeForceInertia>0 ? 6.0f:m_kInertia;
+	const bool npcRootYielding = m_npcRootYieldTime > 0;
+	const float npcRootWeight = min(1.0f,m_npcRootYieldTime/.2f);
+	if (npcRootYielding) kInertia = 1.0f+(max(1.0f,kInertia)-1.0f)*(1.0f-npcRootWeight);
+	m_npcRootYieldTime = max(0.0f,m_npcRootYieldTime-time_interval);
 	le_contact unproj[8];
 	CCylinderGeom CylinderGeomOuter,*pCyl[2];
 	geom_world_data gwd[2];
@@ -1091,6 +1134,7 @@ int CLivingEntity::Step(float time_interval)
 				m_vel += m_velRequested*(m_kAirControl*time_interval*2);
 		if (m_vel.len2() > sqr(m_pWorld->m_vars.maxVelPlayers))
 			m_vel.normalize() *= m_pWorld->m_vars.maxVelPlayers;
+		LimitVRLocomotion(m_vel);
 		move += m_vel*time_interval;
 		if (m_bFlying && !m_bSwimming && !m_pWorld->m_vars.bFlyMode) 
 			move += m_gravity*sqr(time_interval)*0.5f;
@@ -1109,6 +1153,9 @@ int CLivingEntity::Step(float time_interval)
 				pentlist, ent_terrain|ent_static|ent_sleeping_rigid|ent_rigid|ent_living|ent_independent|ent_triggers|ent_sort_by_mass, this);
 
 			for(i=j=bHasFastPhys=0,vrel=0; i<nents; i++) {
+				if (pentlist[i]->GetType()==PE_RIGID && ((CRigidEntity*)pentlist[i])->IsVRGripCarrier(this)) continue;
+				if (pentlist[i]->GetType() == PE_ARTICULATED && m_pForeignData &&
+					pentlist[i]->m_pForeignData == m_pForeignData) continue;
 				vectorf sz = pentlist[i]->m_BBox[1]-pentlist[i]->m_BBox[0];
 				if (pentlist[i]->m_iSimClass==2 && pentlist[i]->GetMassInv()*0.4f<m_massinv) {
 					pentlist[i]->GetStatus(&sd);
@@ -1471,6 +1518,13 @@ int CLivingEntity::Step(float time_interval)
 				vectorf vel = m_velRequested,g;
 				if (!m_bSwimming) vel -= m_nslope*(vel*m_nslope);
 				last_force = (vel-m_vel)*kInertia;
+				if (npcRootYielding) {
+					const float horizontal = sqr(last_force.x)+sqr(last_force.y);
+					const float maxAcceleration = 1.5f+6.0f*(1.0f-npcRootWeight);
+					if (horizontal>sqr(maxAcceleration)) {
+						const float scale = maxAcceleration/sqrt_tpl(horizontal); last_force.x *= scale; last_force.y *= scale;
+					}
+				}
 				if (m_nslope.z<m_slopeSlide && !m_bSwimming)	{
 					if (m_velRequested.len2()>0)
 						g.Set(0,0,-vel.len()*kInertia/sqrt_tpl(1-sqr(m_slopeClimb)));

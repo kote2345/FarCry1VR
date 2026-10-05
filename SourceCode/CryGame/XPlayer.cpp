@@ -16,6 +16,10 @@
 #include "WeaponClass.h"
 #include "XVehicle.h"
 #include "WeaponSystemEx.h"
+#include "VRPhysicalWeapons.h"
+#include "VRBodyPhysics.h"
+#include "VRPhysicalNPC.h"
+#include <VRPhysicsDiagnostics.h>
 #include "ScriptObjectStream.h"
 
 #include <IEntitySystem.h>
@@ -65,6 +69,265 @@ bool CheckIfNAN( const Vec3d& vPos )
 		return  true;
 	}
 	return false;
+}
+
+namespace
+{
+static ICryBone* FindVRArmBone(ICryCharInstance* character, const char* side, const char* part)
+{
+	char name[64];
+	sprintf(name, "Bip01 %s %s", side, part);
+	return character ? character->GetBoneByName(name) : NULL;
+}
+
+static bool IsVRBoneDescendant(ICryBone* bone, ICryBone* root)
+{
+	for (ICryBone* parent = bone; parent; parent = parent->GetParent())
+		if (parent == root)
+			return true;
+	return false;
+}
+
+// Keep the animation's leg pose relative to its pelvis, but remove animation
+// from the root, torso, shoulders and hands before solving tracked targets.
+static void PrepareVRBodyPose(ICryCharInstance* character)
+{
+	ICryBone* pelvis = character->GetBoneByName("Bip01 Pelvis");
+	ICryBone* leftLeg = FindVRArmBone(character, "L", "Thigh");
+	ICryBone* rightLeg = FindVRArmBone(character, "R", "Thigh");
+	if (!pelvis || !leftLeg || !rightLeg || !character->GetModel())
+		return;
+	const Matrix44 animatedPelvis = GetTransposed44(pelvis->GetAbsoluteMatrix());
+	const Matrix44 neutralPelvis = GetTransposed44(pelvis->GetDefaultAbsoluteMatrix());
+	const Matrix44 legDelta = neutralPelvis * Matrix44(Matrix34(animatedPelvis).GetInverted());
+	for (int i = 0; i < character->GetModel()->NumBones(); ++i)
+	{
+		ICryBone* bone = character->GetBoneByName(character->GetModel()->GetBoneName(i));
+		if (!bone) continue;
+		Matrix44& matrix = const_cast<Matrix44&>(bone->GetAbsoluteMatrix());
+		if (IsVRBoneDescendant(bone, leftLeg) || IsVRBoneDescendant(bone, rightLeg))
+			matrix = GetTransposed44(legDelta * GetTransposed44(matrix));
+		else
+			matrix = bone->GetDefaultAbsoluteMatrix();
+	}
+}
+
+static void HideVRHead(ICryCharInstance* character)
+{
+	ICryBone* head = character->GetBoneByName("Bip01 Head");
+	if (!head || !character->GetModel()) return;
+	Matrix44 collapsed = GetTransposed44(head->GetAbsoluteMatrix());
+	for (int row = 0; row < 3; ++row)
+		for (int column = 0; column < 3; ++column)
+			collapsed(row, column) = 0.0f;
+	for (int i = 0; i < character->GetModel()->NumBones(); ++i)
+	{
+		ICryBone* bone = character->GetBoneByName(character->GetModel()->GetBoneName(i));
+		if (bone && IsVRBoneDescendant(bone, head))
+			const_cast<Matrix44&>(bone->GetAbsoluteMatrix()) = GetTransposed44(collapsed);
+	}
+}
+
+// Cry's absolute bone matrices use the legacy transposed layout. Convert to
+// the regular Matrix34 layout while applying an object-space IK rotation.
+static void ApplyVRBoneDelta(ICryCharInstance* character, ICryBone* root,
+	const Matrix34& delta)
+{
+	if (!character || !character->GetModel() || !root)
+		return;
+	const int boneCount = character->GetModel()->NumBones();
+	for (int i = 0; i < boneCount; ++i)
+	{
+		const char* name = character->GetModel()->GetBoneName(i);
+		ICryBone* bone = name ? character->GetBoneByName(name) : NULL;
+		if (!bone || !IsVRBoneDescendant(bone, root))
+			continue;
+		Matrix44 standard = GetTransposed44(bone->GetAbsoluteMatrix());
+		standard = Matrix44(delta) * standard;
+		const_cast<Matrix44&>(bone->GetAbsoluteMatrix()) = GetTransposed44(standard);
+	}
+}
+
+static void ApplyVRFingerCurl(ICryCharInstance* character, bool leftHand,
+	float grip, float trigger)
+{
+	const char* side = leftHand ? "L" : "R";
+	grip = max(0.0f, min(1.0f, grip));
+	trigger = max(0.0f, min(1.0f, trigger));
+	for (int finger = 0; finger < 5; ++finger)
+	{
+		const float amount = finger == 1 ? trigger : grip;
+		if (amount <= 0.0f) continue;
+		for (int joint = 0; joint < 3; ++joint)
+		{
+			char part[24];
+			if (joint == 0) sprintf(part, "Finger%d", finger);
+			else sprintf(part, "Finger%d%d", finger, joint);
+			ICryBone* bone = FindVRArmBone(character, side, part);
+			if (!bone) continue;
+			// The authored Biped finger hinge is local Z on both hands.
+			// Use its current orientation so parent curls carry the hinge along;
+			// never infer an axis from wrist/finger positions or mirror by side.
+			const Matrix33 orientation(GetTransposed44(bone->GetAbsoluteMatrix()));
+			Vec3 axis = orientation * Vec3(0,0,1);
+			if (axis.GetLengthSquared() < 1.0e-8f) continue;
+			axis.Normalize();
+			const float fingerAngles[3] = { 65.0f, 85.0f, 60.0f };
+			const float thumbAngles[3] = { 40.0f, 55.0f, 35.0f };
+			const float curlLimit = finger == 1 ? 0.75f : 0.75f * 0.75f;
+			const float angle = DEG2RAD((finger == 0 ? -thumbAngles[joint] : fingerAngles[joint]) * amount * curlLimit);
+			const Matrix33 rotation = Matrix33::CreateRotationAA(angle, axis);
+			const Vec3 pivot = bone->GetBonePosition();
+			ApplyVRBoneDelta(character, bone,
+				Matrix34::CreateRotationAA(angle, axis, pivot - rotation * pivot));
+		}
+	}
+}
+
+static bool BuildVRBoneDelta(const Vec3& from, const Vec3& to,
+	const Vec3& pivot, Matrix34& delta)
+{
+	Vec3 source = from;
+	Vec3 target = to;
+	const float sourceLength = source.GetLength();
+	const float targetLength = target.GetLength();
+	if (sourceLength < 1.0e-5f || targetLength < 1.0e-5f)
+		return false;
+	source /= sourceLength;
+	target /= targetLength;
+	float cosine = source | target;
+	cosine = max(-1.0f, min(1.0f, cosine));
+	const float angle = cry_acosf(cosine);
+	Vec3 axis = source.Cross(target);
+	if (axis.GetLength() < 1.0e-5f)
+	{
+		axis = source.Cross(Vec3(0, 1, 0));
+		if (axis.GetLength() < 1.0e-5f)
+			axis = source.Cross(Vec3(1, 0, 0));
+	}
+	const float axisLength = axis.GetLength();
+	if (axisLength < 1.0e-5f)
+		return false;
+	axis /= axisLength;
+	const Matrix33 rotation = Matrix33::CreateRotationAA(angle, axis);
+	delta = Matrix34::CreateRotationAA(angle, axis, pivot - rotation * pivot);
+	return true;
+}
+
+static bool SolveVRArm(const Vec3& shoulder, const Vec3& wristTarget,
+	const Vec3& elbowPole, float upperLength, float forearmLength,
+	Vec3& elbow, Vec3& reachableWrist)
+{
+	if (upperLength <= 1.0e-4f || forearmLength <= 1.0e-4f)
+		return false;
+	Vec3 direction = wristTarget - shoulder;
+	float distance = direction.GetLength();
+	if (distance > 1.0e-4f)
+		direction /= distance;
+	else
+	{
+		direction.Set(0, 0, 1);
+		distance = 0.0f;
+	}
+	const float minReach = fabsf(upperLength - forearmLength) + 1.0e-4f;
+	const float maxReach = upperLength + forearmLength - 1.0e-4f;
+	const float reach = max(minReach, min(maxReach, distance));
+	reachableWrist = shoulder + direction * reach;
+
+	Vec3 pole = elbowPole - shoulder;
+	pole -= direction * (pole | direction);
+	float poleLength = pole.GetLength();
+	if (poleLength < 1.0e-4f)
+	{
+		pole = direction.Cross(Vec3(0, 1, 0));
+		poleLength = pole.GetLength();
+		if (poleLength < 1.0e-4f)
+		{
+			pole = direction.Cross(Vec3(1, 0, 0));
+			poleLength = pole.GetLength();
+		}
+	}
+	if (poleLength < 1.0e-4f)
+		return false;
+	pole /= poleLength;
+	const float along = (upperLength * upperLength - forearmLength * forearmLength + reach * reach) /
+		(2.0f * reach);
+	const float height = cry_sqrtf(max(0.0f, upperLength * upperLength - along * along));
+	elbow = shoulder + direction * along + pole * height;
+	return true;
+}
+
+static bool ApplyVRArmIK(ICryCharInstance* character,
+	const Matrix34& controllerWorld, bool leftHand,
+	const Vec3& characterPosition, const Vec3& characterAngles, bool physicalContact = false)
+{
+	const char* side = leftHand ? "L" : "R";
+	ICryBone* upper = FindVRArmBone(character, side, "UpperArm");
+	ICryBone* forearm = FindVRArmBone(character, side, "Forearm");
+	ICryBone* hand = FindVRArmBone(character, side, "Hand");
+	if (!upper || !forearm || !hand)
+		return false;
+
+	Matrix34 characterWorld = Matrix34::CreateRotationXYZ(
+		Deg2Rad(characterAngles), characterPosition);
+	const Matrix34 controller = characterWorld.GetInverted() * controllerWorld;
+	const Vec3 shoulder = upper->GetBonePosition();
+	const Vec3 modelElbow = forearm->GetBonePosition();
+	const Vec3 wrist = hand->GetBonePosition();
+	const float upperLength = (modelElbow - shoulder).GetLength();
+	const float forearmLength = (wrist - modelElbow).GetLength();
+	if (upperLength <= 1.0e-4f || forearmLength <= 1.0e-4f)
+		return false;
+
+	// A stable anatomical pole keeps locomotion arm swing from choosing the
+	// elbow direction; only the controller target drives the upper body.
+	const float armLength = upperLength + forearmLength;
+	ICryBone* oppositeUpper = FindVRArmBone(character, leftHand ? "R" : "L", "UpperArm");
+	if (!oppositeUpper) return false;
+	// Area 51 takes its pole from the model elbow, not a camera-space axis.
+	// Use the named shoulder pair to keep the pole outside the torso even
+	// when the imported rig's left/right axes are opposite to the camera's.
+	Vec3 outward = shoulder - oppositeUpper->GetBonePosition();
+	outward.z = 0;
+	if (outward.GetLength() < 1.0e-4f) return false;
+	outward.Normalize();
+	const Vec3 elbowPole = modelElbow + outward * (0.35f * armLength) -
+		Vec3(0, 0, 0.20f * armLength);
+	Vec3 targetElbow, reachableWrist;
+	if (!SolveVRArm(shoulder, controller.GetTranslation(), elbowPole,
+		upperLength, forearmLength, targetElbow, reachableWrist))
+		return false;
+
+	Matrix34 upperDelta;
+	if (!BuildVRBoneDelta(modelElbow - shoulder, targetElbow - shoulder,
+		shoulder, upperDelta))
+		return false;
+	ApplyVRBoneDelta(character, upper, upperDelta);
+
+	const Vec3 elbowAfterUpper = upperDelta * modelElbow;
+	const Vec3 wristAfterUpper = upperDelta * wrist;
+	Matrix34 forearmDelta;
+	if (!BuildVRBoneDelta(wristAfterUpper - elbowAfterUpper,
+		reachableWrist - elbowAfterUpper, elbowAfterUpper, forearmDelta))
+		return false;
+	ApplyVRBoneDelta(character, forearm, forearmDelta);
+
+	Matrix44 currentHandStandard = GetTransposed44(hand->GetAbsoluteMatrix());
+	Matrix33 currentHandRotation(currentHandStandard);
+	// Fixed controller-space offsets: Y +90 for both, Z -90 left / +90 right.
+	const Matrix33 desiredHandRotation = Matrix33(controller) *
+		Matrix33::CreateRotationZ(leftHand ? -gf_PI_DIV_2 : gf_PI_DIV_2) *
+		Matrix33::CreateRotationY(gf_PI_DIV_2);
+	const Matrix33 handDeltaRotation = desiredHandRotation * currentHandRotation.GetInverted();
+	const Vec3 handPivot = hand->GetBonePosition();
+	Matrix34 handDelta(handDeltaRotation);
+	// A constrained physical hand is authoritative for the rendered palm.
+	// IK reach clamping must never detach its skin from the held contact.
+	const Vec3 displayedWrist = physicalContact ? controller.GetTranslation() : handPivot;
+	handDelta.SetTranslation(displayedWrist - handDeltaRotation * handPivot);
+	ApplyVRBoneDelta(character, hand, handDelta);
+	return true;
+}
 }
 
 
@@ -389,6 +652,12 @@ CPlayer::CPlayer(CXGame *pGame) :
 ///////////////////////////////////////////////
 CPlayer::~CPlayer()
 {
+	delete m_pVRPhysicalNPC;
+	m_pVRPhysicalNPC = NULL;
+	delete m_pVRPhysicalWeapons;
+	m_pVRPhysicalWeapons = NULL;
+	delete m_pVRBodyPhysics;
+	m_pVRBodyPhysics = NULL;
 	SwitchFlashLight( false );
 
 	ListOfPlayers::iterator	self = std::find(m_pGame->m_DeadPlayers.begin(), m_pGame->m_DeadPlayers.end(), this);
@@ -528,6 +797,11 @@ void CPlayer::SetHeatVisionValues(int dwFlags,const char *szName,float fValue,fl
 */
 void CPlayer::InitWeapons()
 {
+	if (m_pVRPhysicalNPC) m_pVRPhysicalNPC->Reset(m_pEntity);
+	delete m_pVRPhysicalWeapons;
+	m_pVRPhysicalWeapons = NULL;
+	delete m_pVRBodyPhysics;
+	m_pVRBodyPhysics = NULL;
 //	ValidateHeap();
 	IEntitySystem *pEntitySystem = (IEntitySystem *) m_pGame->GetSystem()->GetIEntitySystem();
 
@@ -878,12 +1152,93 @@ void CPlayer::AutoAiming()
 ///////////////////////////////////////////////
 /*! Updates the player-container. Should be called every frame.
 */
+bool CPlayer::EnsurePhysicalNPCDamageRig()
+{
+	if (!IsAI() || !IsAlive() || !m_pEntity->GetPhysics() || m_pEntity->GetPhysics()->GetType()!=PE_LIVING) return false;
+	Matrix34 controller;
+	if (!m_pGame->GetSystem()->GetVRControllerTransform(true,controller) &&
+		!m_pGame->GetSystem()->GetVRControllerTransform(false,controller)) return false;
+	ICryCharInstance* character = m_pEntity->GetCharInterface()->GetCharacter(0);
+	if (!character) return false;
+	if (!character->GetCharacterPhysics()) {
+		pe_status_dynamics dynamics;
+		const float mass = m_pEntity->GetPhysics()->GetStatus(&dynamics) ? max(1.0f,dynamics.mass) : 80.0f;
+		m_pEntity->GetCharInterface()->PhysicalizeCharacter(0,mass,-1,1.0f,true);
+	}
+	if (!character->GetCharacterPhysics()) return false;
+	m_vrNPCDamageActiveUntil = m_pTimer->GetCurrTime()+1.2f;
+	character->SetActiveRagdoll(true);
+	m_pEntity->NeedsUpdateCharacter(0,true);
+	return true;
+}
+
 void CPlayer::Update()
 {
 	FUNCTION_PROFILER( GetISystem(),PROFILE_GAME );
 
 	bool bMyPlayer = IsMyPlayer();
+	// Entity damage dispatch uses this identity marker before any Lua health
+	// reduction/death callback. Never give the test protection to AI players.
+	m_pScriptObject->SetValue("VRTestLocalPlayer", bMyPlayer && !IsAI() ? 1 : 0);
+	ICVar* testInvulnerable = m_pGame->GetSystem()->GetIConsole()->GetCVar("vr_test_player_invulnerable");
+	if (bMyPlayer && !IsAI() && IsAlive() && testInvulnerable && testInvulnerable->GetIVal())
+		m_stats.health = m_stats.maxHealth > 0 ? m_stats.maxHealth : 100;
 	bool bPlayerVisible = bMyPlayer || IsVisible();
+	if (m_pVRPhysicalNPC && (!IsAI() || !IsAlive())) m_pVRPhysicalNPC->Reset(m_pEntity);
+	if (!bMyPlayer && IsAI() && IsAlive())
+	{
+		ICryCharInstance* character = m_pEntity->GetCharInterface()->GetCharacter(0);
+		if (character && m_pEntity->GetPhysics() && m_pEntity->GetPhysics()->GetType() == PE_LIVING)
+		{
+			Matrix34 controller;
+			const bool vr = m_pGame->GetSystem()->GetVRControllerTransform(true, controller) ||
+				m_pGame->GetSystem()->GetVRControllerTransform(false, controller);
+			// Every NPC retains its skeleton; only nearby NPCs need continuous
+			// contact solving. This also includes actors behind the player.
+			const bool nearby = vr && ((m_pEntity->GetPos()-m_pGame->GetSystem()->GetViewCamera().GetPos()).GetLengthSquared() < 64.0f ||
+				m_vrNPCDamageActiveUntil > m_pTimer->GetCurrTime());
+			if (nearby && !character->GetCharacterPhysics())
+			{
+				pe_status_dynamics dynamics;
+				const float mass = m_pEntity->GetPhysics()->GetStatus(&dynamics) ? max(1.0f, dynamics.mass) : 80.0f;
+				m_pEntity->GetCharInterface()->PhysicalizeCharacter(0, mass, -1, 1.0f, true);
+			}
+			character->SetActiveRagdoll(nearby);
+			if (nearby && !m_pVRPhysicalNPC) m_pVRPhysicalNPC = new CVRPhysicalNPCController(m_pGame->GetSystem());
+			if (m_pVRPhysicalNPC) m_pVRPhysicalNPC->Update(m_pEntity,character,m_pTimer->GetFrameTime(),nearby);
+			if (nearby) m_pEntity->NeedsUpdateCharacter(0, true);
+			// Restore only a living AI weapon explicitly in its held state.
+			CWeaponClass* heldWeapon = m_nSelectedWeaponID != -1 ? GetSelectedWeapon() : NULL;
+			if (heldWeapon && heldWeapon->GetObject() && m_weaponPositionState == WEAPON_POS_HOLD &&
+				!m_pMountedWeapon && !GetVehicle() && !character->IsBindingValid(GetWeaponInfo().hBindInfo))
+			{
+				const string& socket = heldWeapon->GetBindBone();
+				if (!socket.empty() && character->GetBoneByName(socket.c_str())) {
+					GetWeaponInfo().hBindInfo = character->AttachObjectToBone(heldWeapon->GetObject(),socket.c_str());
+					VRPhysicsTrace("[VRNPCWeaponBind] entity=%d weapon=%d restored=%d",m_pEntity->GetId(),m_nSelectedWeaponID,
+						character->IsBindingValid(GetWeaponInfo().hBindInfo));
+				}
+			}
+		}
+	}
+
+	if (bMyPlayer)
+	{
+		Matrix34 leftController, rightController;
+		const bool leftTracked = m_pGame->GetSystem()->GetVRControllerTransform(true, leftController);
+		const bool rightTracked = m_pGame->GetSystem()->GetVRControllerTransform(false, rightController);
+		// In VR keep the animated world character visible while retaining the
+		// original first-person camera and controller-attached weapon.
+		if (leftTracked || rightTracked)
+		{
+			m_pEntity->DrawCharacter(0, ETY_DRAW_NORMAL);
+			m_pEntity->NeedsUpdateCharacter(0, true);
+		}
+		else if (m_bFirstPerson)
+		{
+			m_pEntity->DrawCharacter(0, ETY_DRAW_NONE);
+		}
+	}
 
 	SPlayerUpdateContext ctx;
 	ctx.bPlayerVisible = bPlayerVisible;
@@ -897,6 +1252,7 @@ void CPlayer::Update()
 
 	if( !IsAlive() )
 	{
+		if (m_pVRPhysicalWeapons) m_pVRPhysicalWeapons->Update();
 		UpdateDead(ctx);
 		// [marco] even after the player dies, he can slide and fall into water - 
 		// this call will create the splash sounds
@@ -2375,6 +2731,7 @@ void CPlayer::ProcessMovements(CXEntityProcessingCmd &cmd, bool bScheduled)
 	hike.dir=speedxyz;     
 
 	DampInputVector(hike.dir,m_input_accel,m_input_stop_accel,true,false);
+	if (IsMyPlayer() && IsVRPhysicalWeaponsActive()) m_pVRPhysicalWeapons->LimitNPCGripMovement(hike.dir);
 	
 	pPhysEnt->Action(&hike);
 
@@ -2484,7 +2841,14 @@ void CPlayer::SelectPrevWeapon()
 */
 //////////////////////////////////////////////////////////////////////////
 void CPlayer::ProcessWeapons(CXEntityProcessingCmd &cmd)
-{	
+{
+	if (IsVRPhysicalWeaponsActive())
+	{
+		if (cmd.CheckAction(ACTION_RELOAD)) m_pVRPhysicalWeapons->Reload();
+		m_stats.firing = false;
+		m_stats.FiringType = eNotFiring;
+		return;
+	}
 	// do not allow to use weapons and move when underwater or in a wtaer volume, and 
 	// he is actively swimming			
 
@@ -2872,6 +3236,12 @@ void CPlayer::SetWeapon(int iClsID)
 */
 void CPlayer::GetFirePosAngles(Vec3d& firePos, Vec3d& fireAngles)
 {
+	if (m_vrPhysicalWeaponFire)
+	{
+		firePos = m_vrPhysicalFireOrigin;
+		fireAngles = m_vrPhysicalFireAngles;
+		return;
+	}
 	if (!m_bIsAI)
 	{
 		//we must always take leaning into account!
@@ -3037,6 +3407,8 @@ void CPlayer::UpdateMelee()
 */
 void CPlayer::UpdateWeapon()
 {
+	UpdateVRPhysicalWeapons();
+	if (IsVRPhysicalWeaponsActive()) return;
 	FUNCTION_PROFILER( GetISystem(),PROFILE_GAME );
 	
 	float frametime=m_pTimer->GetFrameTime();
@@ -5150,6 +5522,32 @@ void CPlayer::UpdateDrawAngles( )
 /*!drawn the player
 	called by the engine when the player has to be drawn
 */
+void CPlayer::UpdateVRBodyPhysics()
+{
+	ICryCharInstance* character = m_pEntity->GetCharInterface()->GetCharacter(0);
+	static int bodySamples = 0;
+	if (bodySamples++<3) VRPhysicsTrace("[VRBodyUpdate] char=%d model=%d active=%d",character!=NULL,character && character->GetModel(),IsVRPhysicalWeaponsActive());
+	if (!character || !character->GetModel() || !IsVRPhysicalWeaponsActive()) return;
+	const int count = character->GetModel()->NumBones();
+	std::vector<Matrix44> saved(count);
+	for (int i=0;i<count;++i) saved[i] = character->GetBoneByName(character->GetModel()->GetBoneName(i))->GetAbsoluteMatrix();
+	PrepareVRBodyPose(character);
+	const Vec3 angles(0,0,m_vEyeAngles.z+RAD2DEG(m_pGame->GetSystem()->GetVRHeadYawDeltaRadians()));
+	Matrix34 world = Matrix34::CreateRotationXYZ(Deg2Rad(angles),m_pEntity->GetPos()+character->GetOffset());
+	Vec3 eyes;
+	if (GetVRModelEyePosition(eyes)) world.SetTranslation(m_pGame->GetSystem()->GetViewCamera().GetPos()-Matrix33(world)*eyes);
+	for (int hand=0;hand<2;++hand) {
+		Matrix34 target;
+		if (!m_pGame->GetSystem()->GetVRControllerTransform(hand==0,target)) continue;
+		// All arm motors follow tracking. The constrained render pose must
+		// never become an opposing target for the upper arm and forearm.
+		ApplyVRArmIK(character,target,hand==0,world.GetTranslation(),angles,m_pVRPhysicalWeapons->HasPhysicalGrip(hand));
+	}
+	if (!m_pVRBodyPhysics) m_pVRBodyPhysics = new CVRBodyPhysics;
+	m_pVRBodyPhysics->Resolve(character,world,m_pGame->GetSystem(),m_pEntity,m_pTimer->GetFrameTime(),m_pVRPhysicalWeapons);
+	for (int i=0;i<count;++i) const_cast<Matrix44&>(character->GetBoneByName(character->GetModel()->GetBoneName(i))->GetAbsoluteMatrix()) = saved[i];
+}
+
 void CPlayer::OnDraw(const SRendParams & _RendParams)
 {
 	//return;
@@ -5158,9 +5556,27 @@ void CPlayer::OnDraw(const SRendParams & _RendParams)
 
 	// if nRecursionLevel is not 0 - use only 3tp person view ( for reflections )
 	int nRecursionLevel = (int)(INT_PTR)m_pGame->GetSystem()->GetIRenderer()->EF_Query(EFQ_RecurseLevel) - 1;
+	Matrix34 vrController;
+	const bool fullBodyVR = IsMyPlayer() &&
+		(m_pGame->GetSystem()->GetVRControllerTransform(true, vrController) ||
+		 m_pGame->GetSystem()->GetVRControllerTransform(false, vrController));
+	if (fullBodyVR && m_bFirstPerson)
+	{
+		// The tracked first-person weapon is drawn below. Remove only the
+		// selected weapon's avatar bindings, otherwise the IK hand draws a
+		// second weapon with the third-person socket transform.
+		ICryCharInstance* avatar = m_pEntity->GetCharInterface()->GetCharacter(PLAYER_MODEL_IDX);
+		if (avatar)
+		{
+			if (IsVRPhysicalWeaponsActive())
+				for (PlayerWeaponsItor it = m_mapPlayerWeapons.begin(); it != m_mapPlayerWeapons.end(); ++it)
+					it->second.DetachBindingHandles(avatar);
+			else if (m_nSelectedWeaponID != -1) GetWeaponInfo().DetachBindingHandles(avatar);
+		}
+	}
 
 	// draw first person weapon
-	if(m_bFirstPerson && !nRecursionLevel && m_stats.drawfpweapon	&& m_nSelectedWeaponID != -1)
+	if(m_bFirstPerson && !nRecursionLevel && m_stats.drawfpweapon && m_nSelectedWeaponID != -1 && !IsVRPhysicalWeaponsActive())
 	{
 		CWeaponClass* pWeapon		= GetSelectedWeapon();
 		ICryCharInstance *pInst	= pWeapon->GetCharacter();
@@ -5185,16 +5601,23 @@ void CPlayer::OnDraw(const SRendParams & _RendParams)
 			}
 		}
 
-		return;
+		if (!fullBodyVR)
+			return;
 	}
 
 
 	ICryCharInstance *pChar = m_pEntity->GetCharInterface()->GetCharacter(0);
 	if (!pChar)
+	{
+		if (IsVRPhysicalWeaponsActive() && !nRecursionLevel) m_pVRPhysicalWeapons->Render(_RendParams);
 		return;
+	}
 
 	if (!(pChar->GetFlags() & CS_FLAG_DRAW_MODEL) && !nRecursionLevel)
+	{
+		if (IsVRPhysicalWeaponsActive()) m_pVRPhysicalWeapons->Render(_RendParams);
 		return;
+	}
 
   SRendParams RendParams = _RendParams;
 //  RendParams.vPos = m_pEntity->GetPos(); // position is not always entity position
@@ -5234,6 +5657,125 @@ void CPlayer::OnDraw(const SRendParams & _RendParams)
 			RendParams.vAngles.Set(0, 0, m_pEntity->GetAngles().z);
 		
 	}
+
+	std::vector<Matrix44> animationPose;
+	pChar->SetRenderBonePose(NULL, 0);
+	if (fullBodyVR && IsAlive() && pChar->GetModel())
+	{
+		const int boneCount = pChar->GetModel()->NumBones();
+		animationPose.resize(boneCount);
+		for (int i = 0; i < boneCount; ++i)
+			animationPose[i] = pChar->GetBoneByName(pChar->GetModel()->GetBoneName(i))->GetAbsoluteMatrix();
+		PrepareVRBodyPose(pChar);
+		// Locomotion leg yaw must never turn the tracked upper body.
+		RendParams.vAngles.Set(0, 0, m_vEyeAngles.z +
+			RAD2DEG(m_pGame->GetSystem()->GetVRHeadYawDeltaRadians()));
+		RendParams.pMatrix = NULL;
+		Vec3 modelEyes;
+		if (GetVRModelEyePosition(modelEyes))
+		{
+			const Matrix34 rotation = Matrix34::CreateRotationXYZ(Deg2Rad(RendParams.vAngles), Vec3(0,0,0));
+			RendParams.vPos = m_pGame->GetSystem()->GetViewCamera().GetPos() -
+				rotation * modelEyes - pChar->GetOffset();
+		}
+		Matrix34 leftController, rightController;
+		const bool leftTracked = m_pGame->GetSystem()->GetVRControllerTransform(true, leftController);
+		const bool rightTracked = m_pGame->GetSystem()->GetVRControllerTransform(false, rightController);
+		if (IsVRPhysicalWeaponsActive())
+		{
+			if (leftTracked) m_pVRPhysicalWeapons->GetPropHandTarget(0, leftController);
+			if (rightTracked) m_pVRPhysicalWeapons->GetPropHandTarget(1, rightController);
+		}
+		Vec3 characterPosition = RendParams.vPos + pChar->GetOffset();
+		if (leftTracked)
+			ApplyVRArmIK(pChar, leftController, true, characterPosition, RendParams.vAngles,
+				IsVRPhysicalWeaponsActive() && m_pVRPhysicalWeapons->HasPhysicalGrip(0));
+		if (rightTracked)
+			ApplyVRArmIK(pChar, rightController, false, characterPosition, RendParams.vAngles,
+				IsVRPhysicalWeaponsActive() && m_pVRPhysicalWeapons->HasPhysicalGrip(1));
+		if (IsVRPhysicalWeaponsActive() && !nRecursionLevel && !_RendParams.pShadowVolumeLightSource)
+		{
+			if (!m_pVRBodyPhysics) m_pVRBodyPhysics = new CVRBodyPhysics;
+			Matrix34 bodyWorld = Matrix34::CreateRotationXYZ(Deg2Rad(RendParams.vAngles), characterPosition);
+			m_pVRBodyPhysics->Resolve(pChar, bodyWorld, m_pGame->GetSystem(), m_pEntity, 0.0f, m_pVRPhysicalWeapons);
+			characterPosition = bodyWorld.GetTranslation();
+			RendParams.vPos = characterPosition - pChar->GetOffset();
+			if (leftTracked && m_pVRBodyPhysics->GetHandCollisionTarget(0, leftController))
+				ApplyVRArmIK(pChar, leftController, true, characterPosition, RendParams.vAngles);
+			if (rightTracked && m_pVRBodyPhysics->GetHandCollisionTarget(1, rightController))
+				ApplyVRArmIK(pChar, rightController, false, characterPosition, RendParams.vAngles);
+		}
+		if (IsVRPhysicalWeaponsActive() && !nRecursionLevel && !_RendParams.pShadowVolumeLightSource)
+		{
+			const Matrix34 characterWorld = Matrix34::CreateRotationXYZ(Deg2Rad(RendParams.vAngles), characterPosition);
+			for (int side = 0; side < 2; ++side)
+			{
+				const bool tracked = side == 0 ? leftTracked : rightTracked;
+				if (!tracked) continue;
+				ICryBone* wrist = FindVRArmBone(pChar, side == 0 ? "L" : "R", "Hand");
+				if (!wrist) continue;
+				Vec3 bases(0,0,0); int count = 0;
+				for (int finger = 1; finger < 5; ++finger)
+				{
+					char name[24]; sprintf(name, "Finger%d", finger);
+					if (ICryBone* base = FindVRArmBone(pChar, side == 0 ? "L" : "R", name))
+					{ bases += base->GetBonePosition(); ++count; }
+				}
+				Vec3 palm = count ? (wrist->GetBonePosition() + bases / (float)count) * 0.5f : wrist->GetBonePosition();
+				const Matrix34& controller = side == 0 ? leftController : rightController;
+				// Anchor the gun to the un-recoiled palm first. Recoil moves the
+				// avatar afterwards, avoiding a feedback loop into weapon placement.
+				m_pVRPhysicalWeapons->SetHandPalm(side, characterWorld * palm, controller);
+			}
+			// Capture both anchors before recoil so both hands use this frame.
+			bool hasRecoil = false;
+			for (int side = 0; side < 2; ++side)
+			{
+				if (!(side == 0 ? leftTracked : rightTracked)) continue;
+				const Matrix34& controller = side == 0 ? leftController : rightController;
+				Matrix34 recoil;
+				if (m_pVRPhysicalWeapons->GetHandRecoil(side, controller, recoil))
+				{
+					hasRecoil = true;
+					ApplyVRArmIK(pChar, recoil * controller, side == 0, characterPosition, RendParams.vAngles);
+				}
+			}
+			if (hasRecoil && m_pVRBodyPhysics)
+			{
+				Matrix34 bodyWorld = Matrix34::CreateRotationXYZ(Deg2Rad(RendParams.vAngles), characterPosition);
+				// Recoil may change the arm pose; constrain it without another impulse.
+				m_pVRBodyPhysics->Resolve(pChar, bodyWorld, m_pGame->GetSystem(), m_pEntity, 0.0f, m_pVRPhysicalWeapons);
+				characterPosition = bodyWorld.GetTranslation();
+				RendParams.vPos = characterPosition - pChar->GetOffset();
+				if (leftTracked && m_pVRBodyPhysics->GetHandCollisionTarget(0, leftController))
+					ApplyVRArmIK(pChar, leftController, true, characterPosition, RendParams.vAngles);
+				if (rightTracked && m_pVRBodyPhysics->GetHandCollisionTarget(1, rightController))
+					ApplyVRArmIK(pChar, rightController, false, characterPosition, RendParams.vAngles);
+			}
+
+		}
+		// Torso constraints may move the shoulders. Re-solve held hands last
+		// so their palms stay attached to the physical grip rather than jitter.
+		if (IsVRPhysicalWeaponsActive())
+		{
+			Matrix34 target;
+			if (leftTracked && m_pVRPhysicalWeapons->GetPropHandTarget(0, target))
+				ApplyVRArmIK(pChar, target, true, characterPosition, RendParams.vAngles,m_pVRPhysicalWeapons->HasPhysicalGrip(0));
+			if (rightTracked && m_pVRPhysicalWeapons->GetPropHandTarget(1, target))
+				ApplyVRArmIK(pChar, target, false, characterPosition, RendParams.vAngles,m_pVRPhysicalWeapons->HasPhysicalGrip(1));
+		}
+		float grip = 0.0f, trigger = 0.0f;
+		if (leftTracked && m_pGame->GetSystem()->GetVRFingerInput(true, grip, trigger))
+			ApplyVRFingerCurl(pChar, true, grip, trigger);
+		if (rightTracked && m_pGame->GetSystem()->GetVRFingerInput(false, grip, trigger))
+			ApplyVRFingerCurl(pChar, false, grip, trigger);
+		if (m_bFirstPerson && !nRecursionLevel && !_RendParams.pShadowVolumeLightSource)
+			HideVRHead(pChar);
+		std::vector<Matrix44> renderPose(boneCount);
+		for (int i = 0; i < boneCount; ++i)
+			renderPose[i] = pChar->GetBoneByName(pChar->GetModel()->GetBoneName(i))->GetAbsoluteMatrix();
+		pChar->SetRenderBonePose(&renderPose[0], boneCount);
+	}
 /*
 	else
 	{
@@ -5252,6 +5794,13 @@ void CPlayer::OnDraw(const SRendParams & _RendParams)
 	}
 	else
 		pChar->Draw(RendParams,m_pEntity->GetPos());
+	// Do not feed the render-only pose back into animation, physics or the
+	// next eye's IK solve. Area 51 similarly operates on a copy of the pose.
+	for (size_t i = 0; i < animationPose.size(); ++i)
+		const_cast<Matrix44&>(pChar->GetBoneByName(pChar->GetModel()->GetBoneName((int)i))->GetAbsoluteMatrix()) = animationPose[i];
+	if (!animationPose.empty()) pChar->ForceReskin();
+	if (IsVRPhysicalWeaponsActive() && !nRecursionLevel)
+		m_pVRPhysicalWeapons->Render(_RendParams);
 }
 
 
@@ -5466,6 +6015,22 @@ void CPlayer::SetDimStealth(const pe_player_dimensions* const pDim)
 	@param pDim struct containing the player dimensions
 	@see pe_player_dimensions
 */
+int CPlayer::SetPhysicalDimensions(IPhysicalEntity* physics, const pe_player_dimensions& dimensions)
+{
+	pe_player_dimensions adjusted = dimensions;
+	Matrix34 controller;
+	if (IsMyPlayer() && m_bFirstPerson &&
+		(m_pGame->GetSystem()->GetVRControllerTransform(true, controller) ||
+		 m_pGame->GetSystem()->GetVRControllerTransform(false, controller)))
+	{
+		// Preserve stance height and grounding, reducing only locomotion radius.
+		adjusted.sizeCollider.x = min(adjusted.sizeCollider.x, .20f);
+		adjusted.sizeCollider.y = min(adjusted.sizeCollider.y, .20f);
+		if (!is_unused(adjusted.headRadius)) adjusted.headRadius = min(adjusted.headRadius, .10f);
+	}
+	return physics->SetParams(&adjusted);
+}
+
 void CPlayer::SetDimNormal(const pe_player_dimensions* const pDim)
 {
 	if(!pDim)
@@ -5802,16 +6367,16 @@ bool	CPlayer::CanStand( const Vec3& pos)
 	ppos.pos = pos;
 	phys->SetParams(&ppos);
 
-	if(!phys->SetParams( &m_PlayerDimCrouch ))
+	if(!SetPhysicalDimensions(phys, m_PlayerDimCrouch))
 		result=false;
-	if(result && !phys->SetParams( &m_PlayerDimNormal ))
+	if(result && !SetPhysicalDimensions(phys, m_PlayerDimNormal))
 		result=false;
 
 	// restore active/position
 	m_pEntity->ActivatePhysics( bActive );
 	ppos.pos = curPos;
 	phys->SetParams(&ppos);
-	phys->SetParams( &m_PlayerDimNormal );
+	SetPhysicalDimensions(phys, m_PlayerDimNormal);
 //	m_CurStance = eNone;
 //	GoStand( );
 
@@ -5837,7 +6402,7 @@ bool	CPlayer::GoStand(bool ignoreSpam)
 			m_pEntity->SetPhysAngles( Vec3(0,0,0) );			// reset angle if proning
 
 
-		if(phys->SetParams( &m_PlayerDimNormal ))
+		if(SetPhysicalDimensions(phys, m_PlayerDimNormal))
 		{
 			//InitCameraTransition( PCM_CASUAL ,true );
 			m_AngleLimitBase.Set(0,0,0);
@@ -5895,7 +6460,7 @@ bool	CPlayer::GoStealth( )
 			m_pEntity->SetPhysAngles( Vec3(0,0,0) );			// reset angle if proning
 
 		// Use stealth physics dimensions.
-		if(phys->SetParams( &m_PlayerDimStealth ))	//if can stealth here
+		if(SetPhysicalDimensions(phys, m_PlayerDimStealth))	//if can stealth here
 		{
 			//InitCameraTransition( PCM_CASUAL );
 			m_AngleLimitBase.Set(0,0,0);
@@ -5950,7 +6515,7 @@ bool	CPlayer::GoCrouch( )
 			m_pEntity->SetPhysAngles( Vec3(0,0,0) );			// reset angle if proning
 
 		// Use crouching physics dimensions.
-		if(phys->SetParams( &m_PlayerDimCrouch ))
+		if(SetPhysicalDimensions(phys, m_PlayerDimCrouch))
 		{
 			//InitCameraTransition( PCM_CASUAL, true );
 			m_AngleLimitBase.Set(0,0,0);
@@ -6001,12 +6566,12 @@ bool	CPlayer::GoProne( )
 		// Use proning physics dimensions.
 		// if can't change dimentions at current position - put player little up
 		// and try again
-		if(!phys->SetParams( &m_PlayerDimProne ))
+		if(!SetPhysicalDimensions(phys, m_PlayerDimProne))
 		{
 			Vec3d pos = m_pEntity->GetPos();
 			pos.z += .5f;
 			m_pEntity->SetPos( pos );
-			if(!phys->SetParams( &m_PlayerDimProne ))
+			if(!SetPhysicalDimensions(phys, m_PlayerDimProne))
 			{
 				// restore position
 				pos.z -= .5f;
@@ -6066,7 +6631,7 @@ bool	CPlayer::GoSwim( )
 //		m_pEntity->SetPhysAngles( m_EnvTangent );			// set angels for phisics (body is flat on surfece tangent space)
 
 		// Use proning physics dimensions for swimming.
-		if(phys->SetParams( &m_PlayerDimSwim ))
+		if(SetPhysicalDimensions(phys, m_PlayerDimSwim))
 		{
 
 			InitCameraTransition( PCM_CASUAL, true );
@@ -6333,7 +6898,10 @@ void CPlayer::SetViewMode(bool bThirdPerson)
 
 	if( !bThirdPerson )
 	{
-		m_pEntity->DrawCharacter(0, 0);
+		Matrix34 controller;
+		const bool fullBodyVR = m_pGame->GetSystem()->GetVRControllerTransform(true, controller) ||
+			m_pGame->GetSystem()->GetVRControllerTransform(false, controller);
+		m_pEntity->DrawCharacter(0, fullBodyVR ? ETY_DRAW_NORMAL : 0);
 		m_pEntity->NeedsUpdateCharacter(0, true);
 	}
 	else 

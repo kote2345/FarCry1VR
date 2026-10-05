@@ -26,7 +26,7 @@ enum rentity_flags_int {
 //#define getmask(i) (1u<<(i))
 //const int NMASKBITS = 32;
 
-enum constr_info_flags { constraint_limited_1axis=1, constraint_limited_2axes=2, constraint_rope=4 };
+enum constr_info_flags { constraint_limited_1axis=1, constraint_limited_2axes=2, constraint_rope=4, constraint_fixed_orientation=8 };
 
 struct constraint_info {
 	quaternionf qframe_rel[2];
@@ -106,6 +106,17 @@ class CRigidEntity : public CPhysicalEntity {
 	int UpdatePenaltyContact(int i, float time_interval);
 	int VerifyExistingContacts(float maxdist);
 	void UpdateConstraints();
+	void RegisterVRTrackingContacts(float dt);
+	entity_contact m_vrMotors[2];
+	float m_vrMotorDt = 0;
+	int m_vrAngularBodyId = -1;
+	vectorf m_vrAngularVelocityBefore = vectorf(zero);
+	pe_action_vr_tracking m_vrTracking;
+	float m_vrTrackingAge;
+	bool IsVRGripCarrier(CPhysicalEntity* candidate);
+	bool IgnoreVRGripCollision(CPhysicalEntity* candidate);
+	int m_vrCarrierId = -1;
+	unsigned int m_vrCarrierHands = 0;
 	void UpdateContactsAfterStepBack(float time_interval);
 	void ApplyBuoyancy(float time_interval,const vectorf &gravity);
 	void ArchiveContact(int idx);

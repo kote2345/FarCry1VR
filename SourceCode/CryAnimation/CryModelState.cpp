@@ -59,6 +59,7 @@ CryModelState::CryModelState (CryModel* pMesh):
 	//m_pqLast.reset();
 	//m_pBoneHead = m_pBoneSpine2 = m_pBoneLeftArm = NULL;
 	m_pCharPhysics = 0;
+	m_bActiveRagdoll = false;
 	m_bHasPhysics = 0;
 	for (int i = 0; i < 4; ++i) {
     m_pIKEffectors[i] = 0;
@@ -591,7 +592,7 @@ void CryModelState::UpdateBones (const ActiveLayerArray& arrActiveLayers)
 	m_uFlags &= ~nFlagNeedBoneUpdate;
 
 	for (CryCharFxTrailArray::iterator it = m_arrFxTrails.begin(); it != m_arrFxTrails.end(); ++it)
-		if (*it)(*it)->Deform (getBoneGlobalMatrices());
+		if (*it)(*it)->Deform (&m_arrBoneGlobalMatrices[0]);
 }
 
 

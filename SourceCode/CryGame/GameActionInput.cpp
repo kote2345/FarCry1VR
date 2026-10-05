@@ -980,6 +980,12 @@ void CXGame::InitConsoleVars()
 		"When set to 1 all AI in the game will become invulnerable (default 0)\n"
 		"Usage: game_AI_Invulnerable (1/0)\n"
 		"");	
+	pConsole->CreateVariable("vr_prop_mass_scale", "0.5", 0,
+		"Physical mass/density multiplier for rigid props (applied at body creation)");
+	pConsole->CreateVariable("vr_test_player_invulnerable", "1", 0,
+		"Keep the local player alive during physical NPC testing. 0 restores normal damage.");
+	pConsole->CreateVariable("vr_npc_muzzle_fire", "1", 0,
+		"Fire NPC handheld guns from their current third-person muzzle pose.");
 
 	cv_game_Health = pConsole->CreateVariable("game_Health","1",VF_SAVEGAME,
 		"Factor to scale the ai health, default = 1.0\n"

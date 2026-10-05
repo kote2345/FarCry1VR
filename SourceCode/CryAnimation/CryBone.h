@@ -54,6 +54,7 @@ public:
 	virtual const Matrix44& GetRelativeMatrix() {return m_matRelativeToParent;}
 	// returns the matrix in object coordinates
 	virtual const Matrix44& GetAbsoluteMatrix() {return getMatrixGlobal();}
+	virtual Matrix44 GetDefaultAbsoluteMatrix();
 	// fixes the bone matrix to the given position in world coordinates,
 	// assuming the character position and orientation are given by the vCharPos and vCharAngles
 	// vCharAngles are the same as in the entity and in the Draw call to ICryCharInstance

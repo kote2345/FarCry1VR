@@ -90,6 +90,9 @@ public:
 	void ReleaseGroundCollider();
 	void SetGroundCollider(CPhysicalEntity *pCollider);
 	void SyncWithGroundCollider(float time_interval);
+	void LimitVRLocomotion(vectorf& velocity);
+	pe_action_vr_locomotion_limit m_vrLocomotionLimits[2];
+	float m_vrLocomotionAge = 1;
 	void RegisterContact(const vectorf& pt,const vectorf& n, CPhysicalEntity *pCollider, int ipart,int idmat);
 	void RegisterUnprojContact(const le_contact &unproj);
 	int IsPositionFree(const vectorf *BBox,float newh,const vectorf &newdim);
@@ -103,6 +106,7 @@ public:
 	float m_mass,m_massinv;
 	int m_bFlying,m_bJumpRequested,m_bSwimming, m_surface_idx, m_lastGroundSurfaceIdx;
 	float m_timeFlying,m_minFlyTime,m_timeForceInertia;
+	float m_npcRootYieldTime;
 	float m_slopeSlide,m_slopeClimb,m_slopeJump,m_slopeFall;
 	float m_maxVelGround;
 	CCylinderGeom m_CylinderGeom;

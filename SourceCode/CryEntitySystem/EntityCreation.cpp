@@ -540,6 +540,14 @@ bool CEntity::CreateRigidBody(pe_type type, float density,float mass,int surface
 			return true;
 	}
 
+	// Keep deferred physics data at its authored mass: apply the VR prop
+	// scale only when constructing the actual body, once per physicalization.
+	if (type==PE_RIGID) {
+		ICVar* propScale = m_pISystem->GetIConsole()->GetCVar("vr_prop_mass_scale");
+		const float scale = propScale ? max(.05f,propScale->GetFVal()) : 1.0f;
+		if (mass>0) mass *= scale;
+		if (density>0) density *= scale;
+	}
 	m_flags|=ETY_FLAG_CALC_PHYSICS;
 	m_flags|=ETY_FLAG_CLIENT_ONLY;
 	m_flags|=ETY_FLAG_RIGIDBODY;
@@ -1052,6 +1060,10 @@ int pos = 0;
 bool CEntity::StartAnimation( int pos,const char *animation, int iLayerID, float fBlendTime, bool bStartWithLayer0Phase )
 {
 	CHECK_CHARACTER_SLOT_0( "CEntity::StartAnimation" );
+	int physicalHit = 0;
+	if (pos == 0 && animation && !strncmp(animation, "pain_", 5) &&
+		m_pScriptObject && m_pScriptObject->GetValue("VRNPCPhysicalHit", physicalHit) && physicalHit)
+		return true;
 
     if(m_pCryCharInstance[pos])
 	{

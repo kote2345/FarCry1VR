@@ -10,12 +10,14 @@
 #include "StdAfx.h"
 #include "WeaponClass.h"
 #include "XPlayer.h"
+#include "VRNPCDamage.h"
 #include "XVehicle.h"
 #include "Flock.h"
 #include "WeaponSystemEx.h"
 #include "ScriptObjectWeaponClass.h"
 #include <CryCharAnimationParams.h>
 #include <IAISystem.h>
+#include <IStatObj.h>
 
 
 #define SCRIPT_BEGINCALL(host, func)\
@@ -118,6 +120,8 @@ void CWeaponClass::Reset()
 	}
 	if (m_pCharacter)
 	{
+		while (!m_muzzleBindingOwners.empty())
+			DetachMuzzleBinding(m_muzzleBindingOwners.begin()->first);
 		m_rWeaponSystem.GetGame()->GetSystem()->GetIAnimationSystem()->RemoveCharacter(m_pCharacter);
 		m_pCharacter = NULL;
 	}
@@ -360,6 +364,14 @@ void CWeaponClass::SetFirstPersonWeaponPos( const Vec3 &pos,const Vec3 &angles )
 Vec3	CWeaponClass::GetFirePos( IEntity *pIEntity ) const
 {
 	ASSERT( pIEntity != 0 );
+	CPlayer* player = NULL;
+	if (pIEntity->GetContainer() && pIEntity->GetContainer()->QueryContainerInterface(CIT_IPLAYER, (void**)&player) &&
+		player->IsVRPhysicalWeaponFire())
+	{
+		Vec3 position, angles;
+		player->GetFirePosAngles(position, angles);
+		return position;
+	}
 	Vec3 firepos = pIEntity->GetCamera()->GetPos();
 
 	return firepos;
@@ -443,6 +455,23 @@ void CWeaponClass::InitializeVRWeaponGrip()
         mirrorCorrection *= Matrix33::CreateRotationY(gf_PI);
     }
     Matrix34 offset = Matrix34::CreateRotationXYZ(Deg2Rad(gripAngles), gripOffset);
+	m_vrGripHandInverse = Matrix34(GetTransposed44(bone->GetAbsoluteMatrix())).GetInverted();
+	m_vrGripBonePosition = bone->GetBonePosition();
+	// Match a palm point on the authored holding hand, not its wrist pivot.
+	// Weapon/breech children are excluded from the finger-base average.
+	Vec3 fingerBases(0,0,0);
+	int fingerCount = 0;
+	for (int i = 0; i < GetCharacter()->GetModel()->NumBones(); ++i)
+	{
+		const char* name = GetCharacter()->GetModel()->GetBoneName(i);
+		ICryBone* child = GetCharacter()->GetBoneByName(name);
+		if (child->GetParent() != bone || (strncmp(name, "Bone", 4) && !strstr(name, "Finger"))) continue;
+		const float distance = (child->GetBonePosition() - m_vrGripBonePosition).GetLength();
+		if (distance < 0.01f || distance > 0.15f) continue;
+		fingerBases += child->GetBonePosition(); ++fingerCount;
+	}
+	if (fingerCount >= 2)
+		m_vrGripBonePosition = (m_vrGripBonePosition + fingerBases / (float)fingerCount) * 0.5f;
     m_vrGripInverse = (Matrix34(GetTransposed44(bone->GetAbsoluteMatrix())) * offset * mirrorCorrection).GetInverted();
     m_vrGripInitialized = true;
 }
@@ -477,6 +506,10 @@ void CWeaponClass::HideVRUpperArms(bool left)
 
 void CWeaponClass::MoveToFirstPersonPos(IEntity *pIEntity)
 {
+	CPlayer* player = NULL;
+	if (pIEntity && pIEntity->GetContainer() &&
+		pIEntity->GetContainer()->QueryContainerInterface(CIT_IPLAYER, (void**)&player) && player->IsVRPhysicalWeaponFire())
+		return; // The scoped physical instance already supplied its hand transform.
     Matrix34 controller;
     if (GetCharacter() && m_rWeaponSystem.GetGame()->GetSystem()->GetVRControllerTransform(false, controller))
     {
@@ -508,6 +541,28 @@ void CWeaponClass::MoveToFirstPersonPos(IEntity *pIEntity)
 
 	m_vPos = m.TransformPointOLD(pos);
 	m_vAngles = pIEntity->GetCamera()->GetAngles()+m_fpvAngleOffset;
+}
+
+bool CWeaponClass::GetVRHandModelTransform(const Matrix34& controller, Matrix34& model)
+{
+    if (!GetCharacter()) return false;
+    if (!m_vrGripInitialized) InitializeVRWeaponGrip();
+    if (!m_vrGripInitialized) return false;
+    IConsole* console = m_rWeaponSystem.GetGame()->GetSystem()->GetIConsole();
+    ICVar* pitch = console ? console->GetCVar("vr_weapon_pitch_offset") : NULL;
+    ICVar* yaw = console ? console->GetCVar("vr_weapon_yaw_offset") : NULL;
+    const Matrix34 base = controller * Matrix33::CreateRotationY(-gf_PI_DIV_2) *
+        Matrix33::CreateRotationZ(DEG2RAD(pitch ? pitch->GetFVal() : 15.0f)) *
+        Matrix33::CreateRotationX(DEG2RAD(yaw ? yaw->GetFVal() : 0.0f));
+	model = base *
+        Matrix33::CreateRotationZ(-gf_PI_DIV_2) *
+        Matrix33::CreateRotationY(gf_PI) * m_vrGripInverse;
+	// Keep the configured orientation unchanged. Correct translation only:
+	// the authored holding wrist must coincide with the tracked hand, rather
+	// than retaining the old RHOffset that moves it away from the controller.
+	const Vec3 gripTarget = controller.GetTranslation();
+	model.SetTranslation(gripTarget - Matrix33(model) * m_vrGripBonePosition);
+    return true;
 }
 
 void CWeaponClass::Unload()
@@ -739,6 +794,33 @@ bool CWeaponClass::InitModels()
 	return true;
 }
 
+void CWeaponClass::TrackMuzzleBinding(ULONG_PTR handle, ICryCharInstance* owner)
+{
+	if (!handle || !owner || m_muzzleBindingOwners.find(handle) != m_muzzleBindingOwners.end()) return;
+	m_muzzleBindingOwners[handle] = owner;
+}
+
+bool CWeaponClass::DetachMuzzleBinding(ULONG_PTR handle)
+{
+	std::map<ULONG_PTR, ICryCharInstance*>::iterator found = m_muzzleBindingOwners.find(handle);
+	if (found == m_muzzleBindingOwners.end()) return false;
+	ICryCharInstance* owner = found->second;
+	owner->Detach(handle);
+	m_muzzleBindingOwners.erase(found);
+	return true;
+}
+
+void CWeaponClass::ClearMuzzleBindings(ICryCharInstance* owner)
+{
+	for (std::map<ULONG_PTR, ICryCharInstance*>::iterator i = m_muzzleBindingOwners.begin();
+		i != m_muzzleBindingOwners.end();)
+	{
+		if (i->second != owner) { ++i; continue; }
+		owner->Detach(i->first);
+		m_muzzleBindingOwners.erase(i++);
+	}
+}
+
 bool CWeaponClass::LoadMuzzleFlash(const string& sGeometryName)
 {
 	ISystem*		pSystem = m_rWeaponSystem.GetGame()->GetSystem();
@@ -860,7 +942,7 @@ int CWeaponClass::Fire(const Vec3d &originalOrigin, const Vec3d &originalAngles,
 {
     Vec3d origin = originalOrigin, angles = originalAngles;
     Matrix34 controller;
-    if (pPlayer && pPlayer->IsMyPlayer() && m_vrGripInitialized &&
+    if (pPlayer && pPlayer->IsMyPlayer() && !pPlayer->IsVRPhysicalWeaponFire() && m_vrGripInitialized &&
         m_rWeaponSystem.GetGame()->GetSystem()->GetVRControllerTransform(false, controller))
     {
         MoveToFirstPersonPos(pPlayer->GetEntity());
@@ -895,6 +977,38 @@ int CWeaponClass::Fire(const Vec3d &originalOrigin, const Vec3d &originalAngles,
 	m_fireParams = *(m_vFireModes[pPlayer->m_stats.firemode]);
 
 	bool aiming = pPlayer->m_stats.aiming;
+	// Use the same bound-object bone and character transform as TPV rendering.
+	// AI still decides when to fire, but cannot steer a shot away from the barrel.
+	ICVar* muzzleFire = GetISystem()->GetIConsole()->GetCVar("vr_npc_muzzle_fire");
+	if (pPlayer->IsAI() && !pPlayer->GetVehicle() && !pPlayer->m_pMountedWeapon &&
+		m_fireParams.iFireModeType == FireMode_Instant && muzzleFire && muzzleFire->GetIVal())
+	{
+		ICryCharInstance* character = pPlayer->GetEntity()->GetCharInterface()->GetCharacter(0);
+		Matrix44 muzzleLocal;
+		const char* muzzleName = "spitfire";
+		m_soWeaponClass->GetValue("SpitFireBone", muzzleName);
+		if (character && character->IsBindingValid(winfo.hBindInfo) &&
+			character->GetTPVWeaponHelperMatrix(muzzleName, winfo.hBindInfo, muzzleLocal))
+		{
+			const Matrix34 model = Matrix34::CreateRotationXYZ(Deg2Rad(pPlayer->m_vCharacterAngles),
+				pPlayer->GetEntity()->GetPos() + character->GetOffset());
+			const Matrix34 muzzle = model * Matrix34(GetTransposed44(muzzleLocal));
+			// TPV gun meshes are authored barrel-forward along object +X.
+			// spitfire is an effects helper with an arbitrary rotation (notably
+			// on Falcon); cancel that rotation before transforming the barrel.
+			const Matrix44* helper = GetObject() ? GetObject()->GetHelperMatrixByName(muzzleName) : NULL;
+			if (!helper) return 0;
+			const Matrix34 object = muzzle * Matrix34(GetTransposed44(*helper)).GetInverted();
+			const Vec3 direction = object.TransformVector(Vec3(1, 0, 0));
+			const float lengthSquared = direction.GetLengthSquared();
+			if (lengthSquared > 1e-8f && lengthSquared < 1e6f &&
+				muzzle.GetTranslation().GetLengthSquared() < 1e12f)
+			{
+				origin = muzzle.GetTranslation();
+				angles = ConvertVectorToCameraAngles(direction);
+			}
+		}
+	}
 	eFireType ft = pPlayer->m_stats.FiringType;
 	float fAccuracy = pPlayer->m_stats.accuracy;
 
@@ -1396,6 +1510,9 @@ void CWeaponClass::ProcessHitTarget(const SWeaponHit &hit)
 void CWeaponClass::ProcessHit(const SWeaponHit &hit)
 {
 	FUNCTION_PROFILER( GetISystem(),PROFILE_GAME );
+	CVRNPCDamageController::Hit physicalHit;
+	const bool physicalBullet = m_fireParams.iFireModeType!=FireMode_Melee && !hit.projectile &&
+		CVRNPCDamageController::Prepare(m_rWeaponSystem.GetGame()->GetSystem(),hit,physicalHit);
 #ifdef FIRE_DEBUG
 	m_rWeaponSystem.GetGame()->GetSystem()->GetILog()->Log("CWeaponClass::ProcessHit target=%s pos=(%.2f %.2f %.2f)",
 		hit.target?hit.target->GetName():"nil",hit.pos.x,hit.pos.y,hit.pos.z);
@@ -1463,9 +1580,9 @@ void CWeaponClass::ProcessHit(const SWeaponHit &hit)
 	m_ssoProcessHit->SetValueChain("weapon",hit.weapon);
 	m_ssoProcessHit->SetValueChain("damage",hit.damage);
 	m_ssoProcessHit->SetValueChain("weapon_death_anim_id", hit.weapon_death_anim_id);
-	m_ssoProcessHit->SetValueChain("impact_force_mul", hit.iImpactForceMul);
-	m_ssoProcessHit->SetValueChain("impact_force_mul_final", hit.iImpactForceMulFinal);
-	m_ssoProcessHit->SetValueChain("impact_force_mul_final_torso", hit.iImpactForceMulFinalTorso);
+	m_ssoProcessHit->SetValueChain("impact_force_mul", physicalBullet ? 0 : hit.iImpactForceMul);
+	m_ssoProcessHit->SetValueChain("impact_force_mul_final", physicalBullet ? 0 : hit.iImpactForceMulFinal);
+	m_ssoProcessHit->SetValueChain("impact_force_mul_final_torso", physicalBullet ? 0 : hit.iImpactForceMulFinalTorso);
 
 	if (m_fireParams.iFireModeType == FireMode_Melee)
 		m_ssoProcessHit->SetValueChain("melee", true);
@@ -1506,9 +1623,22 @@ void CWeaponClass::ProcessHit(const SWeaponHit &hit)
 		m_rWeaponSystem.GetGame()->GetSystem()->GetILog()->Log("CWeaponClass::ProcessHit OnDamage");
 #endif
 
+		// The legacy pain clip must not become the motor target for this hit.
+		// Scope the marker to this damage callback, preserving nested callbacks.
+		int previousPhysicalHit = 0;
+		IScriptObject* targetScript = hit.target->GetScriptObject();
+		if (physicalBullet && targetScript) {
+			targetScript->GetValue("VRNPCPhysicalHit", previousPhysicalHit);
+			targetScript->SetValue("VRNPCPhysicalHit", 1);
+		}
+		const EntityId damagedEntity = hit.target->GetId();
 		hit.target->OnDamage(m_ssoProcessHit);
-		if(hit.target->IsStatic())
-			hit.target->AddImpulse( hit.ipart, hit.pos, hit.dir*(float)(hit.iImpactForceMul));
+		IEntity* currentTarget = GetISystem()->GetIEntitySystem()->GetEntity(damagedEntity);
+		if (physicalBullet && currentTarget && currentTarget->GetScriptObject())
+			currentTarget->GetScriptObject()->SetValue("VRNPCPhysicalHit", previousPhysicalHit);
+		if (physicalBullet) CVRNPCDamageController::Apply(m_rWeaponSystem.GetGame()->GetSystem(),physicalHit);
+		if(currentTarget && currentTarget->IsStatic())
+			currentTarget->AddImpulse( hit.ipart, hit.pos, hit.dir*(float)(hit.iImpactForceMul));
 	}
 }
 

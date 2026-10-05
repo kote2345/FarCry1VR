@@ -71,7 +71,7 @@ enum contactflags { contact_count_mask=0x3F, contact_new=0x40, contact_2b_verifi
 										contact_constraint_1dof=0x800, contact_solve_for=0x1000,
 										contact_constraint=contact_constraint_3dof|contact_constraint_2dof|contact_constraint_1dof,
 										contact_angular_log2=8,contact_bidx=0x2000,contact_bidx_log2=13, contact_maintain_count=0x4000,
-										contact_wheel=0x8000, contact_use_C=0x10000, contact_inexact=0x20000 };
+										contact_wheel=0x8000, contact_use_C=0x10000, contact_inexact=0x20000, contact_vr_motor=0x40000 };
 
 class CPhysicalEntity;
 
@@ -102,7 +102,10 @@ struct entity_contact {
 
 	vectorf r0,r;
 	vectorf dP,P;
+	vectorf solvedExternalImpulse = vectorf(zero); // accepted impulses, excludes positional unprojection
 	float dPn;
+	float motorSoftness = 0;
+	float motorImpulseLimit = 0;
 };
 
 extern bool g_bUsePreCG;
@@ -110,6 +113,8 @@ extern int g_nContacts,g_nBodies;
 void InitContactSolver(float time_interval);
 void RegisterContact(entity_contact *pcontact);
 void InvokeContactSolver(float time_interval, SolverSettings *pss);
+bool ContactSolverHasVRMotors();
+float ContactSolverVRMotorWork(); // twice the actual kinetic energy added by motors
 char *AllocSolverTmpBuf(int size);
 
 #endif

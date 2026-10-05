@@ -92,6 +92,7 @@ public:
 
 	//! marks all LODs as needed to be reskinned
 	virtual void ForceReskin ();
+	virtual void SetRenderBonePose(const Matrix44* matrices, unsigned count);
 
 	//! returns the leaf buffer materials in this character (as they are used in the renderer)
 	virtual const list2<CMatInfo>*getLeafBufferMaterials();
@@ -273,6 +274,7 @@ private:
 	virtual int CreateAuxilaryPhysics(IPhysicalEntity *pHost, int nLod=0);
 	virtual void SynchronizeWithPhysicalEntity(IPhysicalEntity *pent,const Vec3& posMaster,const Quat& qMaster);
 	virtual IPhysicalEntity *RelinquishCharacterPhysics();
+	virtual void SetActiveRagdoll(bool enabled);
 	virtual void SetCharacterPhysParams(float mass,int surface_idx);
 	virtual IPhysicalEntity *GetCharacterPhysics();
 	virtual IPhysicalEntity *GetCharacterPhysics(const char *pRootBoneName);

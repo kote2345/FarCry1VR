@@ -27,6 +27,7 @@
 
 CRigidEntity::CRigidEntity(CPhysicalWorld *pWorld) : CPhysicalEntity(pWorld)
 {
+	m_vrTracking.enabled = 0; m_vrTrackingAge = 0;
 	m_iSimClass=2; 
 	if (pWorld) 
 		m_gravity = pWorld->m_vars.gravity;
@@ -330,6 +331,24 @@ int CRigidEntity::GetParams(pe_params *_params)
 
 int CRigidEntity::GetStatus(pe_status *_status)
 {
+	if (_status->type==pe_status_vr_drive::type_id) {
+		if (m_iForeignData!=PHYS_FOREIGN_ID_VR_BODY) return 0;
+		pe_status_vr_drive* status = (pe_status_vr_drive*)_status;
+		status->targetPos = m_vrTracking.pos; status->targetRotation = m_vrTracking.q;
+		status->age = m_vrTrackingAge; status->dt = m_vrMotorDt;
+		status->angularBodyId = m_vrAngularBodyId;
+		if (m_vrMotorDt>0) status->requestedW = m_vrMotors[1].vreq;
+		status->beforeW = m_vrAngularVelocityBefore;
+		IPhysicalEntity* angularBody = m_pWorld->GetPhysicalEntityById(m_vrAngularBodyId);
+		pe_status_dynamics angularMotion;
+		if (angularBody && angularBody!=this && angularBody->GetStatus(&angularMotion)) status->afterW = angularMotion.w;
+		else status->afterW = m_body.w;
+		if (m_vrMotorDt>0) {
+			status->force = m_vrMotors[0].solvedExternalImpulse/m_vrMotorDt;
+			status->torque = m_vrMotors[1].solvedExternalImpulse/m_vrMotorDt;
+		}
+		return 1;
+	}
 	int res;
 	if (res = CPhysicalEntity::GetStatus(_status)) {
 		if (_status->type==pe_status_pos::type_id) {
@@ -353,9 +372,23 @@ int CRigidEntity::GetStatus(pe_status *_status)
 		status->waterResistance = sqrt_tpl(m_maxWaterResistance2);
 		m_maxWaterResistance2 = 0;
 		status->mass = m_body.M;
+		status->inertiaInverse = m_body.Iinv;
 		return 1;
 	}
 
+	if (_status->type==pe_status_contact_normals::type_id) {
+		pe_status_contact_normals *status = (pe_status_contact_normals*)_status;
+		masktype mask = 0;
+		for (int i=0; i<m_nColliders; ++i) mask |= m_pColliderContacts[i];
+		status->count = 0;
+		for (int i=0; i<NMASKBITS && status->count<8; ++i) if (mask & getmask(i)) {
+			const vectorf normal = m_pContacts[i].n;
+			bool duplicate = false;
+			for (int j=0; j<status->count; ++j) duplicate |= (normal*status->normals[j]) > .99f;
+			if (!duplicate) status->normals[status->count++] = normal;
+		}
+		return status->count;
+	}
 	if (_status->type==pe_status_collisions::type_id) {
 		pe_status_collisions *status = (pe_status_collisions*)_status;
 		int i,n,nmax = min(status->len, sizeof(m_CollHistory)/sizeof(m_CollHistory[0]));
@@ -382,6 +415,38 @@ int CRigidEntity::GetStatus(pe_status *_status)
 
 int CRigidEntity::Action(pe_action *_action)
 {
+	if (_action->type==pe_action_vr_grip_owner::type_id) {
+		pe_action_vr_grip_owner* action = (pe_action_vr_grip_owner*)_action;
+		if (GetType()!=PE_RIGID || action->hand<0 || action->hand>1) return 0;
+		if (action->enabled) {
+			CPhysicalEntity* carrier = (CPhysicalEntity*)m_pWorld->GetPhysicalEntityById(action->carrierId);
+			if (!carrier || carrier->GetType()!=PE_LIVING ||
+				(m_vrCarrierHands && m_vrCarrierId!=action->carrierId)) return 0;
+			m_vrCarrierId = action->carrierId;
+			m_vrCarrierHands |= 1u<<action->hand;
+			// Purge old collision contacts without touching grip/arm constraints.
+			for (int i=0;i<m_nColliders;++i) if (IsVRGripCarrier(m_pColliders[i])) {
+				m_pColliderContacts[i] = 0;
+				if (m_pColliders[i]->GetType()==PE_RIGID) {
+					CRigidEntity* peer = (CRigidEntity*)m_pColliders[i];
+					for (int j=0;j<peer->m_nColliders;++j)
+						if (peer->m_pColliders[j]==this) peer->m_pColliderContacts[j] = 0;
+				}
+			}
+		} else if (m_vrCarrierId==action->carrierId) {
+			m_vrCarrierHands &= ~(1u<<action->hand);
+			if (!m_vrCarrierHands) m_vrCarrierId = -1;
+		}
+		Awake();
+		return 1;
+	}
+	if (_action->type==pe_action_vr_tracking::type_id) {
+		if (m_iForeignData!=PHYS_FOREIGN_ID_VR_BODY) return 0;
+		m_vrTracking = *(pe_action_vr_tracking*)_action;
+		m_vrTrackingAge = 0;
+		if (m_vrTracking.enabled) Awake();
+		return 1;
+	}
 	if (_action->type==pe_action_impulse::type_id) {
 		pe_action_impulse *action = (pe_action_impulse*)_action;
 		ENTITY_VALIDATE("CRigidEntity:Action(action_impulse)",action);
@@ -464,9 +529,17 @@ int CRigidEntity::Action(pe_action *_action)
 		} else
 			ipart[1] = 0;
 
-		res = i = RegisterConstraint(action->pt[0],pt1,ipart[0], pBuddy,ipart[1], contact_constraint_3dof);
+		res = i = RegisterConstraint(action->pt[0],pt1,ipart[0], pBuddy,ipart[1],
+			contact_constraint_3dof | ((action->flags & fixed_angular_only) ? contact_angular : 0));
+		if (i<0) return 0;
+		// The penalty solver never registers coupled constraints with the global
+		// solver. A held rigid object must participate in the hand's solver island.
+		// Keep full simulation after release; two hands can release independently.
+		if (pBuddy->GetiForeignData()==PHYS_FOREIGN_ID_VR_BODY) {
+			m_flags &= ~ref_use_simple_solver;
+			Awake();
+		}
 
-		nloc = !m_pConstraints[i].pbody[0]->q*qframe[0]*vectorf(1,0,0);
 		if (is_unused(qframe[0] = action->qframe[0])) qframe[0].SetIdentity();
 		if (is_unused(qframe[1] = action->qframe[1])) qframe[1].SetIdentity();
 		if (action->flags & local_frames) {
@@ -475,6 +548,13 @@ int CRigidEntity::Action(pe_action *_action)
 		}
 		qframe[0] = !m_pConstraints[i].pbody[0]->q*qframe[0];
 		qframe[1] = !m_pConstraints[i].pbody[1]->q*qframe[1];
+		nloc = qframe[0]*vectorf(1,0,0);
+		if (action->flags & fixed_angular_only) {
+			m_pConstraintInfos[i].flags = constraint_fixed_orientation;
+			m_pConstraintInfos[i].qframe_rel[0] = qframe[0];
+			m_pConstraintInfos[i].qframe_rel[1] = qframe[1];
+			return res+1;
+		}
 
 		if (!is_unused(action->pConstraintEntity)) {
 			m_pConstraintInfos[i].pConstraintEnt = (CPhysicalEntity*)action->pConstraintEntity;
@@ -650,6 +730,21 @@ void CRigidEntity::AlertNeighbourhoodND()
 CPhysicalEntity *g_CurColliders[128];
 int g_CurCollParts[128][2];
 
+bool CRigidEntity::IsVRGripCarrier(CPhysicalEntity* candidate)
+{
+	if (!m_vrCarrierHands || !candidate) return false;
+	CPhysicalEntity* carrier = (CPhysicalEntity*)m_pWorld->GetPhysicalEntityById(m_vrCarrierId);
+	return carrier && (candidate==carrier ||
+		(candidate->m_iForeignData==PHYS_FOREIGN_ID_VR_BODY && carrier->m_pForeignData &&
+		 candidate->m_pForeignData==carrier->m_pForeignData));
+}
+
+bool CRigidEntity::IgnoreVRGripCollision(CPhysicalEntity* candidate)
+{
+	return IsVRGripCarrier(candidate) || (candidate && candidate->GetType()==PE_RIGID &&
+		((CRigidEntity*)candidate)->IsVRGripCarrier(this));
+}
+
 int CRigidEntity::GetPotentialColliders(CPhysicalEntity **&pentlist)
 {
 	int i,j,nents,bSameGroup;
@@ -668,6 +763,9 @@ int CRigidEntity::GetPotentialColliders(CPhysicalEntity **&pentlist)
 						g_bitcount[m_pColliderContacts[i]>>16&0xFF]-g_bitcount[m_pColliderContacts[i]>>24&0xFF]);
 
 	for(i=j=0;i<nents;i++) if (!pentlist[i]->m_bProcessed) {
+		if (IgnoreVRGripCollision(pentlist[i])) continue;
+		if ((m_iForeignData==PHYS_FOREIGN_ID_VR_BODY || pentlist[i]->m_iForeignData==PHYS_FOREIGN_ID_VR_BODY) &&
+			m_pForeignData && m_pForeignData==pentlist[i]->m_pForeignData) continue;
 		if (pentlist[i]->m_iSimClass>2) {
 			if (pentlist[i]->GetType()!=PE_ARTICULATED) {
 				pentlist[i]->Awake();
@@ -723,7 +821,9 @@ int CRigidEntity::CheckForNewContacts(geom_world_data *pgwd0,intersection_params
 
 		for(ient=0; ient<nents; ient++) 
 		for(j=0,bCheckBBox=(pentlist[ient]->m_BBox[1]-pentlist[ient]->m_BBox[0]).len2()>0; j<pentlist[ient]->m_nParts; j++) 
-		if ((pentlist[ient]->m_parts[j].flags & m_parts[i].flagsCollider) && !(pentlist[ient]==this && !CheckSelfCollision(i,j)) &&
+		if (!(m_vrTracking.enabled && m_vrTracking.ignoreId>=0 &&
+			pentlist[ient]==m_pWorld->GetPhysicalEntityById(m_vrTracking.ignoreId)) &&
+			(pentlist[ient]->m_parts[j].flags & m_parts[i].flagsCollider) && !(pentlist[ient]==this && !CheckSelfCollision(i,j)) &&
 				(m_nParts+pentlist[ient]->m_nParts==2 || 
 				 (IsAwake(i) || pentlist[ient]->IsAwake(j)) && (!bCheckBBox || AABB_overlap(BBox,pentlist[ient]->m_parts[j].BBox))))
 		{
@@ -1347,9 +1447,22 @@ void CRigidEntity::UpdateConstraints()
 			m_pConstraintInfos[i].pConstraintEnt->GetParams(&sp);
 			m_dampingEx = max(m_dampingEx, sp.damping);
 			m_pConstraintInfos[i].pConstraintEnt->Awake();
-		}	else if (m_pConstraints[i].flags & contact_constraint_3dof) {
-			m_pConstraints[i].n = drift.normalized();
+		} else if (m_pConstraintInfos[i].flags & constraint_fixed_orientation) {
+			qframe0 = m_pConstraints[i].pbody[0]->q*m_pConstraintInfos[i].qframe_rel[0];
+			qframe1 = m_pConstraints[i].pbody[1]->q*m_pConstraintInfos[i].qframe_rel[1];
+			quaternionf error = qframe1*!qframe0;
+			if (error.w<0) { error.w = -error.w; error.v = -error.v; }
+			const float sine = error.v.len();
+			m_pConstraints[i].n.Set(1,0,0);
+			m_pConstraints[i].vreq = sine>1.e-6f ? error.v*(min(10.0f,2.0f*acos_tpl(max(-1.0f,min(1.0f,error.w)))*10.0f)/sine) : vectorf(zero);
+		} else if (m_pConstraints[i].flags & contact_constraint_3dof) {
+			m_pConstraints[i].n = drift.len2()>1.e-12f ? drift.normalized() : vectorf(1,0,0);
 			m_pConstraints[i].vreq = drift*10.0f;
+			// VR joints must not convert large pose error into launch velocity.
+			if ((m_pConstraints[i].pent[0]->GetiForeignData()==PHYS_FOREIGN_ID_VR_BODY ||
+				m_pConstraints[i].pent[1]->GetiForeignData()==PHYS_FOREIGN_ID_VR_BODY) &&
+				m_pConstraints[i].vreq.len2()>4.0f)
+				m_pConstraints[i].vreq *= 2.0f/m_pConstraints[i].vreq.len();
 			//m_pConstraints[i].vsep = (m_pConstraints[i].vreq*m_pConstraints[i].n)*0.5f;
 		} else if (m_pConstraints[i].flags & contact_angular) {
 			m_pConstraints[i].n = m_pConstraints[i].pbody[0]->q*m_pConstraints[i].nloc;
@@ -1419,7 +1532,8 @@ float CRigidEntity::CalcEnergy(float time_interval)
 				}
 			}
 		for(i=0; i<NMASKBITS && getmask(i)<=constraint_mask; i++) 
-		if (constraint_mask & getmask(i) && (m_pConstraints[i].flags & contact_constraint_3dof || m_pConstraintInfos[i].flags & constraint_rope))	{
+		if (constraint_mask & getmask(i) && !(m_pConstraints[i].flags & contact_angular) &&
+			(m_pConstraints[i].flags & contact_constraint_3dof || m_pConstraintInfos[i].flags & constraint_rope)) {
 			v += m_pConstraints[i].n*max(0.0f,max(0.0f,m_pConstraints[i].vreq*m_pConstraints[i].n-max(0.0f,m_pConstraints[i].vrel*m_pConstraints[i].n))-
 				m_pConstraints[i].n*v);
 			if (m_pConstraints[i].pbody[1]->Minv==0 && m_pConstraints[i].pent[1]->m_iSimClass>1) {
@@ -1436,12 +1550,127 @@ float CRigidEntity::CalcEnergy(float time_interval)
 
 void CRigidEntity::StartStep(float time_interval)
 {
+	if (m_vrTracking.enabled) m_vrTrackingAge += time_interval;
 	m_timeStepPerformed = 0;
 	m_timeStepFull = time_interval;
 }
 
 int __bstop = 0;
 extern int __curstep;
+
+void CRigidEntity::RegisterVRTrackingContacts(float dt)
+{
+	if (!m_vrTracking.enabled || m_vrTrackingAge>.25f || dt<=0 || m_body.Minv<=0) return;
+	m_vrMotorDt = dt;
+	const float scale = max(1.0f,min(80.0f,m_vrTracking.frequency))/60.0f;
+	vectorf target = m_vrTracking.pos+m_vrTracking.q*m_body.offsfb;
+	vectorf carrierVelocity(zero);
+	if (m_vrTracking.referenceId>=0) {
+		IPhysicalEntity* carrier = m_pWorld->GetPhysicalEntityById(m_vrTracking.referenceId);
+		pe_status_pos carrierPose; pe_status_dynamics carrierMotion;
+		if (carrier && carrier!=this && carrier->GetStatus(&carrierPose)) {
+			// Follow actual locomotion inside the physics step, not a stale
+			// frame sample or predicted movement through a blocked surface.
+			target += carrierPose.pos-m_vrTracking.referencePos;
+			if (carrier->GetStatus(&carrierMotion)) carrierVelocity = carrierMotion.v;
+		}
+	}
+	const quaternionf entityRotation = m_body.q*m_body.qfb;
+	quaternionf error = m_vrTracking.q*!entityRotation;
+	if (error.w<0) { error.w=-error.w; error.v=-error.v; }
+	const float sine = error.v.len();
+	const vectorf angle = sine>1.e-6f ? error.v*(2*acos_tpl(max(-1.0f,min(1.0f,error.w)))/sine) : vectorf(zero);
+	// With a fixed wrist/load joint, angular velocity is shared. Solve the
+	// bounded wrist drive on the load side of that joint instead of repeatedly
+	// accelerating the tiny hand inertia and cancelling it through the weld.
+	// This is a change of coordinates, not an additional object tracking drive.
+	CRigidEntity* angularOwner = this;
+	vectorf angularError = angle;
+	for (int collider=0;collider<m_nColliders && angularOwner==this;++collider) {
+		if (m_pColliders[collider]->GetType()!=PE_RIGID) continue;
+		CRigidEntity* load = (CRigidEntity*)m_pColliders[collider];
+		if (!load->IsVRGripCarrier(this) || load->m_body.Minv<=0) continue;
+		masktype jointMask = 0;
+		for (int peer=0;peer<load->m_nColliders;++peer)
+			if (load->m_pColliders[peer]==this) jointMask |= load->m_pColliderConstraints[peer];
+		for (int joint=0;joint<load->m_nConstraintsAlloc;++joint) {
+			if (!(jointMask & getmask(joint)) ||
+				!(load->m_pConstraintInfos[joint].flags & constraint_fixed_orientation) ||
+				load->m_pConstraints[joint].pbody[1]!=&m_body) continue;
+			const constraint_info& frame = load->m_pConstraintInfos[joint];
+			const quaternionf desired = (m_vrTracking.q*!m_body.qfb)*frame.qframe_rel[1]*!frame.qframe_rel[0];
+			quaternionf loadError = desired*!load->m_body.q;
+			if (loadError.w<0) { loadError.w=-loadError.w; loadError.v=-loadError.v; }
+			const float length = loadError.v.len();
+			angularError = length>1.e-6f ? loadError.v*(2*acos_tpl(max(-1.0f,min(1.0f,loadError.w)))/length) : vectorf(zero);
+			angularOwner = load;
+			break;
+		}
+	}
+	m_vrAngularBodyId = m_pWorld->GetPhysicalEntityId(angularOwner);
+	m_vrAngularVelocityBefore = angularOwner->m_body.w;
+	// Implicit springs in the same solve as grip, arm joints and world contacts.
+	// Kinematics, inertia and load are resolved together, without pre-accelerating
+	// a small hand as though it already had the inertia of the held object.
+	for (int axis=0; axis<2; ++axis) {
+		entity_contact& motor = m_vrMotors[axis];
+		motor = entity_contact();
+		CRigidEntity* driven = axis ? angularOwner : this;
+		motor.pent[0] = driven; motor.pent[1] = &g_StaticPhysicalEntity;
+		motor.pbody[0] = &driven->m_body; motor.pbody[1] = g_StaticPhysicalEntity.GetRigidBody();
+		motor.ipart[0] = motor.ipart[1] = 0;
+		motor.pt[0] = motor.pt[1] = driven->m_body.pos;
+		motor.n.Set(1,0,0); motor.C.SetIdentity();
+		motor.flags = contact_constraint_3dof | contact_vr_motor | (axis ? contact_angular : 0);
+		const float stiffness = (axis ? 300.0f : 6000.0f)*scale*scale;
+		const float damping = (axis ? 8.0f : 140.0f)*scale;
+		const float denominator = damping+stiffness*dt;
+		motor.motorSoftness = 1.0f/(dt*denominator);
+		motor.motorImpulseLimit = max(0.0f,axis ? m_vrTracking.maxTorque : m_vrTracking.maxForce)*dt;
+		motor.vreq = (axis ? angularError : target-m_body.pos)*(stiffness/denominator)+
+			(axis ? m_vrTracking.w : m_vrTracking.v)*(damping/denominator);
+		// The translating frame has zero relative velocity when carried at
+		// steady speed. Do not damp locomotion as if it were tracking error.
+		if (!axis) motor.vreq += carrierVelocity;
+		if (axis && m_vrTracking.angularVelocityDrive) {
+			// Wrist orientation is a bounded velocity servo, not an angular
+			// spring with retained physical momentum. Reach the
+			// sampled orientation without extrapolating controller motion, then
+			// request zero residual spin when the controller stops.
+			// The solver still limits total torque and resolves world contacts.
+			motor.motorSoftness = 0;
+			vectorf correction = angularError/dt;
+			const float distance = angularError.len();
+			if (distance>1.e-6f && m_vrTracking.maxTorque>0) {
+				const vectorf direction = angularError/distance;
+				matrix3x3f inertia = driven->m_body.Iinv;
+				inertia.Invert();
+				float effectiveInertia = (inertia*direction).len();
+				if (driven!=this) {
+					matrix3x3f handInertia = m_body.Iinv; handInertia.Invert();
+					effectiveInertia += (handInertia*direction).len();
+				}
+				// Reserve braking distance for a torque-limited heavy load.
+				// Light props reach the requested orientation immediately; a heavy
+				// load does not accelerate to a speed it cannot stop near the goal.
+				const float acceleration = m_vrTracking.maxTorque/max(1.e-8f,effectiveInertia);
+				const float brakeStep = acceleration*dt;
+				const float stoppingSpeed = 2*acceleration*distance/
+					(sqrt_tpl(brakeStep*brakeStep+2*acceleration*distance)+brakeStep);
+				correction = direction*min(distance/dt,stoppingSpeed);
+			}
+			// OpenXR supplies the predicted pose already. Extra velocity
+			// extrapolation can turn past that pose and then rotate back on stop.
+			motor.vreq = correction;
+			const float speed = motor.vreq.len();
+			if (speed>20.0f) motor.vreq *= 20.0f/speed;
+		}
+		motor.K.SetIdentity(); motor.K *= m_body.Minv;
+		if (axis) motor.K = driven->m_body.Iinv;
+		for (int diagonal=0; diagonal<3; ++diagonal) motor.K(diagonal,diagonal) += motor.motorSoftness;
+		RegisterContact(&motor);
+	}
+}
 
 int CRigidEntity::Step(float time_interval)
 {
@@ -1938,7 +2167,8 @@ float CRigidEntity::GetMaxTimeStep(float time_interval)
 			gwd0.R.SetIdentity();
 			gwd0.v = m_body.v;
 
-			for(ient=0;ient<nents;ient++) if (pentlist[ient]!=this) for(j=0;j<pentlist[ient]->m_nParts;j++) 
+			for(ient=0;ient<nents;ient++) if (pentlist[ient]!=this && !IgnoreVRGripCollision(pentlist[ient]) &&
+				!(m_iForeignData==PHYS_FOREIGN_ID_VR_BODY && m_pForeignData && m_pForeignData==pentlist[ient]->m_pForeignData)) for(j=0;j<pentlist[ient]->m_nParts;j++) 
 			if (pentlist[ient]->m_parts[j].flags & flagsCollider) {
 				gwd1.offset = pentlist[ient]->m_pos + pentlist[ient]->m_qrot*pentlist[ient]->m_parts[j].pos;
 				//(pentlist[ient]->m_qrot*pentlist[ient]->m_parts[j].q).getmatrix(gwd1.R); //Q2M_IVO
@@ -2083,6 +2313,7 @@ int CRigidEntity::RegisterContacts(float time_interval,int nMaxPlaneContacts)
 	}
 	if (m_submergedFraction>0)
 		g_bUsePreCG = false;
+	RegisterVRTrackingContacts(time_interval);
 	return 1;
 }
 

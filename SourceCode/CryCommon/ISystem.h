@@ -380,6 +380,8 @@ struct ISystem
 	virtual float GetVRHeadYawDeltaRadians() const { return 0.0f; }
 	virtual float GetVRHeadPitchDeltaRadians() const { return 0.0f; }
     virtual bool GetVRControllerTransform(bool left, Matrix34& transform) const { return false; }
+    virtual bool GetVRFingerInput(bool left, float& grip, float& trigger) const
+    { grip = trigger = 0.0f; return false; }
 };
 
 //////////////////////////////////////////////////////////////////////////

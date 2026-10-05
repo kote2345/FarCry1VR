@@ -157,6 +157,7 @@ enum eInVehiclestate
 
 
 	friend class CScriptObjectPlayer;
+	friend class CVRPhysicalWeapons;
 	friend class CXPuppetProxy;
 	//! Current state of player.
 	struct PlayerStats
@@ -432,6 +433,8 @@ public:
 
 	void	InitWeapons();
 	bool	IsAI() const { return m_bIsAI; }
+	bool EnsurePhysicalNPCDamageRig();
+	void UpdateVRBodyPhysics();
 	bool	IsMyPlayer() const;
 	bool	IsFirstPerson() const;
 	void	UpdateSwimState(bool bAlive);
@@ -482,6 +485,7 @@ public:
 
 //	void Die();
 
+	int SetPhysicalDimensions(IPhysicalEntity* physics, const pe_player_dimensions& dimensions);
 	void SetDimNormal(const pe_player_dimensions* const pDim=NULL );
 	void SetDimStealth(const pe_player_dimensions* const pDim=NULL );
 	void SetDimCrouch(const pe_player_dimensions* const pDim=NULL );
@@ -533,6 +537,19 @@ protected:
 	Vec3 CalcLeanOffset(float leanAngle);
 	bool IsLeaning();
 	void SetEyePos();
+	bool GetVRModelEyePosition(Vec3& position) const;
+	void UpdateVRPhysicalWeapons();
+	bool IsVRPhysicalWeaponsActive() const;
+public:
+	bool IsVRPhysicalWeaponFire() const { return m_vrPhysicalWeaponFire; }
+protected:
+	class CVRPhysicalWeapons* m_pVRPhysicalWeapons = NULL;
+	class CVRBodyPhysics* m_pVRBodyPhysics = NULL;
+	class CVRPhysicalNPCController* m_pVRPhysicalNPC = NULL;
+	float m_vrNPCDamageActiveUntil = 0;
+	bool m_vrPhysicalWeaponFire = false;
+	Vec3 m_vrPhysicalFireOrigin = Vec3(0,0,0);
+	Vec3 m_vrPhysicalFireAngles = Vec3(0,0,0);
 	void SetEyePosDead();
 	void SetEyePosBone();
 	void SetEyePosOffset();

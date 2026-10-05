@@ -215,6 +215,8 @@ struct ICryBone
 	// Summary:
 	//     Get the matrix in object coordinates
 	virtual const Matrix44& GetAbsoluteMatrix() = 0;
+	//! Bind-pose joint transform in character coordinates, independent of animation.
+	virtual Matrix44 GetDefaultAbsoluteMatrix() { return GetAbsoluteMatrix(); }
 };
 
 struct AnimSinkEventData
@@ -747,6 +749,8 @@ struct ICryCharInstance: public IBindable
 	// Summary:
 	//     Mark all LODs to be reskinned
 	virtual void ForceReskin () {}
+	//! Copy a render-only pose; animation and physics retain their own matrices.
+	virtual void SetRenderBonePose(const Matrix44* matrices, unsigned count) {}
 
 	// Description:
 	//     Get the leaf buffer materials in this character as they are used in the renderer
@@ -1056,6 +1060,7 @@ struct ICryCharInstance: public IBindable
 	virtual IPhysicalEntity *CreateCharacterPhysics(IPhysicalEntity *pHost, float mass,int surface_idx,float stiffness_scale, int nLod=0) = 0;
 	virtual int CreateAuxilaryPhysics(IPhysicalEntity *pHost, int nLod=0) = 0;
 	virtual IPhysicalEntity *GetCharacterPhysics() = 0;
+	virtual void SetActiveRagdoll(bool enabled) {}
 	virtual IPhysicalEntity *GetCharacterPhysics(const char *pRootBoneName) = 0;
 	virtual IPhysicalEntity *GetCharacterPhysics(int iAuxPhys) = 0;
   virtual void SynchronizeWithPhysicalEntity(IPhysicalEntity *pent, const Vec3& posMaster=Vec3(zero),const Quat& qMaster=Quat(1,0,0,0)) = 0;

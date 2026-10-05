@@ -103,6 +103,11 @@ Vec3d CryBone::GetBonePosition()
   return *(Vec3d*) (getMatrixGlobal()[3]);
 }
 
+Matrix44 CryBone::GetDefaultAbsoluteMatrix()
+{
+	return OrthoUniformGetInverted(getBoneInfo()->getInvDefGlobal());
+}
+
 
 Vec3d CryBone::GetBoneAxis(char cAxis)
 {

@@ -2,6 +2,7 @@
 #include "CryModel.h"
 #include "CryModelState.h"
 #include "CVars.h"
+#include <VRPhysicsDiagnostics.h>
 
 ///////////////////////////////////////////// physics stuff /////////////////////////////////////////////////
 
@@ -129,6 +130,7 @@ void CryModelState::BuildPhysicalEntity(IPhysicalEntity *pent,float mass,int sur
 IPhysicalEntity *CryModelState::CreateCharacterPhysics(IPhysicalEntity *pHost, float mass,int surface_idx,float stiffness_scale, 
 								  																		 float scale,Vec3d offset, int nLod)
 {
+	m_bActiveRagdoll = false;
 	if (m_pCharPhysics) {
 		GetPhysicalWorld()->DestroyPhysicalEntity(m_pCharPhysics);
 		m_pCharPhysics = 0;
@@ -493,8 +495,85 @@ void CryModelState::SynchronizeWithPhysicalEntity(IPhysicalEntity *pent, const V
 }
 
 
+void CryModelState::SetActiveRagdoll(bool enabled)
+{
+	if (!m_pCharPhysics || enabled == m_bActiveRagdoll) return;
+	if (!enabled) RestoreActiveRagdollAnimation();
+	m_activeRagdollAnimationPose.clear();
+	if (!enabled)
+	{
+		for (size_t i=0; i<m_activeRagdollOriginalJoints.size(); ++i)
+		{
+			pe_params_joint original = m_activeRagdollOriginalJoints[i];
+			original.bNoUpdate = 1;
+			m_pCharPhysics->SetParams(&original);
+		}
+		m_activeRagdollOriginalJoints.clear();
+	}
+	m_bActiveRagdoll = enabled;
+	pe_params_articulated_body body;
+	body.bCheckCollisions = enabled;
+	body.bCollisionResp = enabled;
+	body.bExertImpulse = enabled;
+	// Animation already carries host motion. Differentiating host velocity
+	// again injects acceleration impulses into every articulated limb.
+	body.bInheritVel = 0;
+	// The rigid-body solver enforces positional joints; quaternion/position
+	// motors below drive the authored body frames without Euler integration.
+	body.iSimType = enabled ? 1 : 0;
+	body.iSimTypeLyingMode = 1;
+	body.bRecalcJoints = 0;
+	m_pCharPhysics->SetParams(&body);
+	pe_simulation_params simulation;
+	simulation.iSimClass = enabled ? 2 : 4;
+	simulation.maxTimeStep = .01f;
+	simulation.gravity.Set(0,0,enabled ? -9.81f : 0.0f);
+	simulation.gravityFreefall = simulation.gravity;
+	simulation.damping = simulation.dampingFreefall = .3f;
+	m_pCharPhysics->SetParams(&simulation);
+	if (enabled)
+	{
+		m_activeRagdollOriginalJoints.clear();
+		// The authored living rig was built as an animation collider. Clear its
+		// kinematic-only flags before enabling dynamic body/joint solving.
+		for (int i = 0; i < (int)numBones(); ++i)
+		{
+			if (!getBoneInfo(i)->m_PhysInfo[0].pPhysGeom) continue;
+			pe_params_joint joint; joint.op[1] = i;
+			if (!m_pCharPhysics->GetParams(&joint)) continue;
+			pe_params_joint original = joint;
+			// GetParams returns effective damping; SetParams expands auto-kd.
+			for (int axis=0; axis<3; ++axis)
+				if ((original.flags & angle0_auto_kd<<axis) && original.ks[axis] > 0)
+					original.kd[axis] /= 2.0f*sqrt_tpl(original.ks[axis]);
+			m_activeRagdollOriginalJoints.push_back(original);
+			// Flags must not rewrite pivots/rest angles from dormant bodies.
+			MARK_UNUSED joint.pivot,joint.q0,joint.q,joint.qext;
+			joint.flags |= angle0_auto_kd*7;
+			// Living-character rigs relied on qext to animate even locked axes.
+			// A torque motor cannot move through such a lock. Keep positional
+			// articulation, allowing the motor to control angular tracking.
+			joint.flags &= ~(all_angles_locked|joint_no_gravity|joint_isolated_accelerations|
+				joint_expand_hinge|angle0_gimbal_locked*7|angle0_limit_reached*7);
+			joint.nSelfCollidingParts = 0;
+			for (int axis = 0; axis < 3; ++axis)
+			{
+				joint.limits[0][axis] = -1.e10f;
+				joint.limits[1][axis] = 1.e10f;
+				joint.ks[axis] = 0.0f;
+				joint.kd[axis] = 0.0f;
+				joint.qdashpot[axis] = joint.kdashpot[axis] = 0.0f;
+			}
+			joint.bNoUpdate = 1;
+			m_pCharPhysics->SetParams(&joint);
+		}
+		pe_action_awake awake; awake.bAwake = 1; m_pCharPhysics->Action(&awake);
+	}
+}
+
 IPhysicalEntity *CryModelState::RelinquishCharacterPhysics()
 {
+	m_bActiveRagdoll = false;
 	if (m_bHasPhysics) {
 		int i, nLod=crymin(numLODs()-1,1), iRoot=getBonePhysChildIndex(0,0);
 		DestroyCharacterPhysics();
@@ -669,10 +748,110 @@ vectorf CryModelState::GetLimbEndPos(int limbid, float scale)
 	return res;
 }
 
+void CryModelState::RestoreActiveRagdollAnimation()
+{
+	if (!m_bActiveRagdoll || m_activeRagdollAnimationPose.size() != numBones()) return;
+	for (int i=0; i<(int)numBones(); ++i)
+		getBone(i).m_matRelativeToParent = m_activeRagdollAnimationPose[i];
+	UpdateBoneMatricesGlobal();
+}
+
+void CryModelState::ProcessActiveRagdoll(float timestep)
+{
+	pe_params_articulated_body rig;
+	if (!m_pCharPhysics->GetParams(&rig) || !rig.pHost) return;
+	pe_status_pos host;
+	if (!rig.pHost->GetStatus(&host)) return;
+	const float dt = max(.001f, timestep);
+	const int root = getBonePhysChildIndex(0);
+	ConvertBoneGlobalToRelativeMatrices();
+	m_activeRagdollAnimationPose.resize(numBones());
+	for (int i=0; i<(int)numBones(); ++i)
+		m_activeRagdollAnimationPose[i] = getBone(i).m_matRelativeToParent;
+	// Finish the animation (including foot placement) before any physics
+	// readback. All targets below therefore come from the same intact pose.
+	for (int i=0; i<4; ++i) if (m_pIKEffectors[i])
+	{
+		m_pIKEffectors[i]->Tick(dt);
+		m_pIKEffectors[i]->ApplyToBone(i);
+	}
+	ConvertBoneGlobalToRelativeMatrices();
+	pe_params_articulated_body pivot;
+	pivot.posHostPivot = m_vOffset+getBoneMatrixGlobal(root).GetTranslationOLD()*m_fScale;
+	pivot.pivot.zero(); pivot.bRecalcJoints = 0;
+	m_pCharPhysics->SetParams(&pivot);
+	pe_action_awake awake; awake.bAwake = 1;
+	m_pCharPhysics->Action(&awake);
+	static int diagnosticEntity = -1, samples = 0;
+	static float nextSample = 0;
+	const int id = GetPhysicalWorld()->GetPhysicalEntityId(m_pCharPhysics);
+	if (diagnosticEntity < 0) diagnosticEntity = id;
+	const float now = g_GetTimer()->GetCurrTime();
+	const bool capture = id == diagnosticEntity && samples < 16 && now >= nextSample;
+	if (capture) { ++samples; nextSample = now+.25f; }
+	for (int i=0; i<(int)numBones(); ++i)
+	{
+		if (!getBoneInfo(i)->m_PhysInfo[0].pPhysGeom) continue;
+		const int parent = getBonePhysParentIndex(i);
+		quaternionf child((matrix3x3in4x4Tf&)getBoneMatrixGlobal(i)); child.Normalize();
+		quaternionf parentRotation(1,0,0,0);
+		if (parent >= 0) { parentRotation = quaternionf((matrix3x3in4x4Tf&)getBoneMatrixGlobal(parent)); parentRotation.Normalize(); }
+		pe_params_joint goal;
+		goal.op[0] = parent; goal.op[1] = i; goal.bNoUpdate = 1;
+		goal.animationTimeStep = dt;
+		goal.animationTarget = !parentRotation*child;
+		goal.animationRotation = child;
+		goal.animationPosition = m_vOffset+getBoneMatrixGlobal(i).GetTranslationOLD()*m_fScale;
+		const int accepted = m_pCharPhysics->SetParams(&goal);
+		if (capture)
+		{
+			pe_status_pos part; part.partid = i;
+			pe_status_dynamics dynamics; dynamics.partid = i;
+			if (m_pCharPhysics->GetStatus(&part) && m_pCharPhysics->GetStatus(&dynamics))
+			{
+				const vectorf target = host.pos+host.q*goal.animationPosition;
+				quaternionf difference = (host.q*child)*!part.q;
+				const float rotationError = 2*acos_tpl(min(1.0f,fabs_tpl(difference.w)));
+				VRPhysicsTrace("[VRNPCWorld] sample=%d id=%d bone=%s parent=%d accepted=%d dt=%.4f target=(%.4f %.4f %.4f) actual=(%.4f %.4f %.4f) posError=%.4f angleError=%.4f COM=(%.4f %.4f %.4f) v=(%.3f %.3f %.3f) w=(%.3f %.3f %.3f)",
+					samples,id,getBoneInfo(i)->getNameCStr(),parent,accepted,dt,
+					target.x,target.y,target.z,part.pos.x,part.pos.y,part.pos.z,(target-part.pos).len(),rotationError,
+					dynamics.centerOfMass.x,dynamics.centerOfMass.y,dynamics.centerOfMass.z,
+					dynamics.v.x,dynamics.v.y,dynamics.v.z,dynamics.w.x,dynamics.w.y,dynamics.w.z);
+			}
+		}
+	}
+	// Read the physical PART frames, not mass-frame Euler joint angles.
+	// Nonphysical bones keep their animated local transforms and inherit
+	// their actual physical parent. No default-pose parent approximation.
+	for (int i=0; i<(int)numBones(); ++i)
+	{
+		if (getBoneInfo(i)->m_PhysInfo[0].pPhysGeom)
+		{
+			pe_status_pos part; part.partid = i;
+			if (m_pCharPhysics->GetStatus(&part))
+			{
+				Matrix44& global = getBoneMatrixGlobal(i); global.SetIdentity();
+				(matrix3x3in4x4Tf&)global = matrix3x3f(!host.q*part.q);
+				global.SetTranslationOLD((!host.q*(part.pos-host.pos)-m_vOffset)/max(.001f,m_fScale));
+			}
+		}
+		else if (i > 0)
+			getBoneMatrixGlobal(i) = getBone(i).m_matRelativeToParent*getBoneMatrixGlobal(getBoneParentIndex(i));
+	}
+	ConvertBoneGlobalToRelativeMatrices();
+	m_bPhysicsAwake = m_bPhysicsWasAwake = true;
+	m_uFlags |= nFlagsNeedReskinAllLODs;
+}
+
 void CryModelState::ProcessPhysics(float fDeltaTimePhys, int nNeff)
 {
 	if(g_GetCVars()->ca_NoPhys())
 		return;
+	if (m_bActiveRagdoll && m_pCharPhysics)
+	{
+		ProcessActiveRagdoll(fDeltaTimePhys);
+		return;
+	}
 
 	m_uFlags |= nFlagsNeedReskinAllLODs;
 
@@ -682,7 +861,6 @@ void CryModelState::ProcessPhysics(float fDeltaTimePhys, int nNeff)
 	if (fDeltaTimePhys>0)
 		pj.ranimationTimeStep = 1.0f/(pj.animationTimeStep = fDeltaTimePhys);
 	int i,j,iParent,iRoot;
-
 	if (nNeff>=0)
 		for(i=0;i<4;i++) if (m_pIKEffectors[i])
 			m_pIKEffectors[i]->Tick (fDeltaTimePhys);
@@ -690,7 +868,7 @@ void CryModelState::ProcessPhysics(float fDeltaTimePhys, int nNeff)
 	pe_status_awake sa;
 	if (m_pCharPhysics && (m_bPhysicsAwake = m_pCharPhysics->GetStatus(&sa)))
 	{
-		if (nNeff==0) 
+		if (nNeff==0)
 		{	// if there's no animation atm, just read the state from physics verbatim
 			SynchronizeWithPhysicalEntity(m_pCharPhysics, Vec3(0,0,0),Quat(1,0,0,0),m_vOffset);
 		} else 
@@ -716,11 +894,10 @@ void CryModelState::ProcessPhysics(float fDeltaTimePhys, int nNeff)
 
 				//EULER_IVO
 				//(((mtx=mtx0.T())*=matparent)*=matrel).GetEulerAngles_XYZ(sj.qext);
-			   mtx=mtx0.T();
-			   mtx*=matparent;
-			   mtx*=matrel;
+				 mtx=mtx0.T();
+				 mtx*=matparent;
+				 mtx*=matrel;
 				 sj.qext=Ang3::GetAnglesXYZ(mtx);
-				 
 
 				//quaternionf(sj.q+sj.qext).getmatrix(matrel);
  
@@ -827,6 +1004,7 @@ IPhysicalEntity *CryModelState::GetCharacterPhysics(int iAuxPhys)
 
 void CryModelState::DestroyCharacterPhysics(int iMode)
 {
+	if (iMode == 0) m_bActiveRagdoll = false;
 	if (m_pCharPhysics)
 		GetPhysicalWorld()->DestroyPhysicalEntity(m_pCharPhysics,iMode);
 	if (iMode==0)

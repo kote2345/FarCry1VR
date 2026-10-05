@@ -558,6 +558,7 @@ bool CryCharInstance::GetTPVWeaponHelperMatrix(const char * szHelperName, Object
 	assert (pBoundObject);
 
 	const Matrix44* pHelperMatrix = pBoundObject->GetHelperMatrixByName(szHelperName);
+	if (!pHelperMatrix) return false;
 
 	const Matrix44& matAttachedObjectMatrix = m_pModelState->getBoneMatrixGlobal(nBone); // *t
 
@@ -659,6 +660,11 @@ void CryCharInstance::SynchronizeWithPhysicalEntity(IPhysicalEntity *pent, const
 IPhysicalEntity *CryCharInstance::RelinquishCharacterPhysics() 
 {
 	return m_pModelState->RelinquishCharacterPhysics();
+}
+
+void CryCharInstance::SetActiveRagdoll(bool enabled)
+{
+	m_pModelState->SetActiveRagdoll(enabled);
 }
 
 void CryCharInstance::SetCharacterPhysParams(float mass,int surface_idx)
@@ -769,6 +775,7 @@ int CryCharInstance::GetUpdateFrequencyMask(Vec3 vPos, float fRadius)
 void CryCharInstance::ForceUpdate()
 {
 	m_pModelState->ResetBBoxCache();
+	m_pModelState->RestoreActiveRagdollAnimation();
 	m_pModelState->ProcessAnimations(0, true,this);
 }
 
@@ -820,10 +827,11 @@ void CryCharInstance::Update(Vec3d vPos, float fRadius, unsigned uFlags)
 	
 
 
-	if ( update || (fFrameTime>0.25f) )
+	if ( update || (fFrameTime>0.25f) || m_pModelState->m_bActiveRagdoll )
 #endif
 	{
-		m_pModelState->ProcessAnimations(fFrameTime * g_GetCVars()->ca_UpdateSpeed(), (uFlags & flagDontUpdateBones) == 0, this);
+		m_pModelState->RestoreActiveRagdollAnimation();
+		m_pModelState->ProcessAnimations(fFrameTime * g_GetCVars()->ca_UpdateSpeed(), m_pModelState->m_bActiveRagdoll || (uFlags & flagDontUpdateBones) == 0, this);
 /*
 	{
 			char str[256];
@@ -847,7 +855,8 @@ void CryCharInstance::UpdatePhysics( float fScale )
 	//PROFILE_FRAME(CharacterPhysicsUpdate);
 	if (fabsf(g_GetTimer()->GetCurrTime()-m_fLastAnimUpdateTime)<0.001f)	// animation was updated this frame, so update physics as well
 	{
-		m_pModelState->ProcessPhysics(0.01f, (int)m_pModelState->m_arrAnimationLayers.size());
+		const float timestep = m_pModelState->m_bActiveRagdoll ? max(.001f, min(.05f, g_GetTimer()->GetFrameTime())) : .01f;
+		m_pModelState->ProcessPhysics(timestep, (int)m_pModelState->m_arrAnimationLayers.size());
 		m_pModelState->UpdateBBox();
 	}
 }
@@ -1045,6 +1054,16 @@ void CryCharInstance::Render(const struct SRendParams& RendParams, const Vec3& t
 //! marks all LODs as needed to be reskinned
 void CryCharInstance::ForceReskin ()
 {
+	m_pModelState->ForceReskin();
+}
+
+void CryCharInstance::SetRenderBonePose(const Matrix44* matrices, unsigned count)
+{
+	if (!matrices && m_pModelState->m_renderBonePose.empty()) return;
+	if (matrices && count == m_pModelState->numBones())
+		m_pModelState->m_renderBonePose.assign(matrices, matrices + count);
+	else
+		m_pModelState->m_renderBonePose.clear();
 	m_pModelState->ForceReskin();
 }
 

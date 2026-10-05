@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <algorithm>
 
 namespace
 {
@@ -828,6 +829,8 @@ bool Runtime::BeginFrame(Frame& frame)
             if (m_getFloat(m_session, &getInfo, &use) >= 0)
             {
                 states[i]->use = use.isActive == XR_TRUE && use.currentState > 0.55f;
+                states[i]->gripAmount = use.isActive == XR_TRUE ?
+                    std::max(0.0f, std::min(1.0f, use.currentState)) : 0.0f;
                 states[i]->active = states[i]->active || use.isActive == XR_TRUE;
             }
             getInfo.action = m_triggerAction;
@@ -836,6 +839,8 @@ bool Runtime::BeginFrame(Frame& frame)
             if (m_getFloat(m_session, &getInfo, &trigger) >= 0)
             {
                 triggerActive[i] = trigger.isActive;
+                states[i]->triggerAmount = trigger.isActive == XR_TRUE ?
+                    std::max(0.0f, std::min(1.0f, trigger.currentState)) : 0.0f;
                 states[i]->active = states[i]->active || trigger.isActive == XR_TRUE;
                 states[i]->select = states[i]->select ||
                                     (trigger.isActive == XR_TRUE && trigger.currentState > 0.55f);

@@ -115,6 +115,12 @@ public:
 	// Forces skinning on the next frame
 	void ForceReskin();
 	IPhysicalEntity *RelinquishCharacterPhysics();
+	void SetActiveRagdoll(bool enabled);
+	void ProcessActiveRagdoll(float timestep);
+	void RestoreActiveRagdollAnimation();
+	std::vector<Matrix44> m_activeRagdollAnimationPose;
+	std::vector<pe_params_joint> m_activeRagdollOriginalJoints;
+	bool m_bActiveRagdoll;
 	void SetCharacterPhysParams(float mass,int surface_idx,float scale) { m_fMass=mass; m_iSurfaceIdx=surface_idx; m_fScale=scale; }
   void ProcessPhysics(float fDeltaTimePhys, int nNeff);
 	IPhysicalEntity *GetCharacterPhysics() { return m_pCharPhysics; }
@@ -300,7 +306,8 @@ public:
 	void addAnimEvent (int nAnimId, int nFrame, AnimSinkEventData UserData);
 	void removeAnimEvent (int nAnimId, int nFrame, AnimSinkEventData UserData);
 
-	const Matrix44* getBoneGlobalMatrices() const {return &m_arrBoneGlobalMatrices[0];}
+	std::vector<Matrix44> m_renderBonePose;
+	const Matrix44* getBoneGlobalMatrices() const {return m_renderBonePose.empty() ? &m_arrBoneGlobalMatrices[0] : &m_renderBonePose[0];}
 	const Matrix44& getBoneMatrixGlobal (int nBone) const {return m_arrBoneGlobalMatrices[nBone];}
 	Matrix44& getBoneMatrixGlobal (int nBone) {return m_arrBoneGlobalMatrices[nBone];}
 	Matrix44& getBoneMatrixGlobal (const CryBone* pBone) { return getBoneMatrixGlobal (pBone - getBones()); }

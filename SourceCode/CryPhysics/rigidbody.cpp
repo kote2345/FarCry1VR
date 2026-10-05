@@ -203,6 +203,10 @@ static int g_nFollowers,g_idLastUpdate,g_nUnprojLoops;
 static char g_SolverBuf[262144];
 static int g_iSolverBufPos;
 bool g_bUsePreCG = true;
+static bool g_bVRMotors = false;
+static float g_vrMotorWork = 0;
+bool ContactSolverHasVRMotors() { return g_bVRMotors; }
+float ContactSolverVRMotorWork() { return max(0.0f,g_vrMotorWork); }
 int __solver_step=0;
 
 
@@ -312,6 +316,8 @@ void InitContactSolver(float time_interval)
 	g_nContacts = g_nBodies = 0;
 	g_iSolverBufPos = 0;
 	g_bUsePreCG = true;
+	g_bVRMotors = false;
+	g_vrMotorWork = 0;
 }
 
 char *AllocSolverTmpBuf(int size)
@@ -325,8 +331,10 @@ char *AllocSolverTmpBuf(int size)
 
 void RegisterContact(entity_contact *pcontact)
 {
+	pcontact->solvedExternalImpulse.zero();
 	if (!pcontact->pbody[0]->pOwner->OnRegisterContact(pcontact,0) || !pcontact->pbody[1]->pOwner->OnRegisterContact(pcontact,1))
 		return;
+	if (pcontact->flags & contact_vr_motor) g_bVRMotors = true;
 	if (!(pcontact->flags & contact_maintain_count))
 		pcontact->pBounceCount = &pcontact->iCount;
 	g_pContacts[g_nContacts++] = pcontact;
@@ -427,7 +435,7 @@ __solver_step++;
 	}*/
 	for(i=0;i<nBodies;i++) g_pBodies[i]->bProcessed = 0;
 
-	if (g_bUsePreCG && g_nContacts<20) {
+	if (g_bUsePreCG && !g_bVRMotors && g_nContacts<20) {
 		FRAME_PROFILER( "PreCG",GetISystem(),PROFILE_PHYSICS );
 
 		real a,b,r2,r2new,pAp,vmax,vdiff;
@@ -523,6 +531,7 @@ __solver_step++;
 			}
 			for(i=0;i<g_nContacts;i++) {
 				g_pContacts[i]->vrel = g_pContacts[i]->vreq-g_pContacts[i]->r;
+				g_pContacts[i]->solvedExternalImpulse = g_pContacts[i]->P;
 				g_pContacts[i]->Pspare = 1.0f; // indicates that contact is sticky
 			}
 			return;
@@ -578,7 +587,18 @@ __solver_step++;
 						dp = g_pContacts[i]->C*dp;
 					bContactBounced = 0;
 
-					if (g_Contacts[i].flags & contact_constraint) {
+					if (g_Contacts[i].flags & contact_vr_motor) {
+						// Accumulated compliance is essential: clipping each iteration
+						// independently would turn a bounded muscle into an infinite motor.
+						entity_contact* motor = g_pContacts[i];
+						dp += motor->solvedExternalImpulse*motor->motorSoftness;
+						dP = motor->Kinv*-dp;
+						vectorf accumulated = motor->solvedExternalImpulse+dP;
+						if (accumulated.len2()>sqr(motor->motorImpulseLimit))
+							accumulated *= motor->motorImpulseLimit/max(1.e-8f,accumulated.len());
+						dP = accumulated-motor->solvedExternalImpulse;
+						bContactBounced = dP.len2()>1.e-14f;
+					} else if (g_Contacts[i].flags & contact_constraint) {
 						if ((g_pContacts[i]->C*dp).len2()>sqr(e)) {
 							dP = g_pContacts[i]->Kinv*-dp;
 							bContactBounced = 1; 
@@ -624,6 +644,13 @@ __solver_step++;
 					if (bContactBounced) {
 						if (g_Contacts[i].flags & contact_use_C)
 							dP = g_pContacts[i]->C*dP;
+						if (g_Contacts[i].flags & contact_vr_motor) {
+							const vectorf relative = g_Contacts[i].flags & contact_angular ?
+								hbody0->w-hbody1->w : hbody0->v+(hbody0->w^r0)-hbody1->v-(hbody1->w^r1);
+							entity_contact* motor = g_pContacts[i];
+							g_vrMotorWork += 2*(dP*relative)+dP*(motor->K*dP-dP*motor->motorSoftness);
+						}
+						g_pContacts[i]->solvedExternalImpulse += dP;
 						if (!(g_Contacts[i].flags & contact_angular)) {
 							hbody0->v += dP*hbody0->Minv; hbody0->w += hbody0->Iinv*(dp=r0^dP); hbody0->L += dp;
 							hbody1->v -= dP*hbody1->Minv; hbody1->w -= hbody1->Iinv*(dp=r1^dP);	hbody1->L -= dp;
@@ -651,7 +678,7 @@ __solver_step++;
 				Eafter += g_Bodies[i].v.len2()*g_Bodies[i].M + g_Bodies[i].L*g_Bodies[i].w;
 			nBounces += g_nContacts-bBounced >> 4;
 
-		} while (bBounced && nBounces<nMaxIters && Eafter<Ebefore*3.0f);
+		} while (bBounced && nBounces<nMaxIters && Eafter<Ebefore*3.0f+ContactSolverVRMotorWork());
 
 		for(i=0; i<nBodies; i++) {
 			g_pBodies[i]->P = (g_pBodies[i]->v=g_Bodies[i].v)*g_pBodies[i]->M; 
@@ -663,7 +690,7 @@ __solver_step++;
 
 
 	/////////////////////////////////////////////////////////////////////////////////////////////////////////
-	if (bBounced && pss->nMaxLCPCGiters>0) { // use several iterations of CG solver, solving only for non-separating contacts
+	if (!g_bVRMotors && bBounced && pss->nMaxLCPCGiters>0) { // CG does not support bounded compliant motors
 		unsigned int iClass;
 		int cgiter,bStateChanged,n1dofContacts,n2dofContacts,nAngContacts,nFric0Contacts,nFricInfContacts,
 			nContacts,iSortedContacts[6],flags,bNoImprovement;
@@ -907,6 +934,7 @@ __solver_step++;
 						pContacts[i]->pbody[0]->L += pContacts[i]->P; 
 						pContacts[i]->pbody[1]->L -= pContacts[i]->P;
 					} for(;i<nContacts;i++) { // positional contacts
+						pContacts[i]->solvedExternalImpulse += pContacts[i]->P;
 						body0 = pContacts[i]->pbody[0]; body1 = pContacts[i]->pbody[1]; 
 						r0 = pContacts[i]->pt[0]-body0->pos; r1 = pContacts[i]->pt[1]-body1->pos;
 						body0->P += pContacts[i]->P; body0->L += r0^pContacts[i]->P;

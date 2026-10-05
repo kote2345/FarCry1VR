@@ -798,6 +798,7 @@ int CScriptObjectWeaponClass::AttachObjectToBone(IFunctionHandler *pH)
 		{
 			ICryCharInstance::ObjectBindingHandle boneHandler;
 			boneHandler = m_pWeaponClass->GetCharacter()->AttachToBone(m_pWeaponClass->GetMuzzleFlash(), boneid);
+			m_pWeaponClass->TrackMuzzleBinding(boneHandler, m_pWeaponClass->GetCharacter());
 
 			// Make user data for bone handler.
 			USER_DATA ud = m_pScriptSystem->CreateUserData( boneHandler,USER_DATA_BONEHANDLER );
@@ -816,7 +817,7 @@ int CScriptObjectWeaponClass::DetachObjectToBone(IFunctionHandler *pH)
 	pH->GetParam(1,boneName);
 
 	int BAD_HANDLER = -1;
-	int nCookie;
+	int nCookie = 0;
 	ULONG_PTR boneHandler = BAD_HANDLER;
 
 	if (!pH->GetParamUDVal(2,boneHandler,nCookie))
@@ -828,6 +829,8 @@ int CScriptObjectWeaponClass::DetachObjectToBone(IFunctionHandler *pH)
 		boneHandler = BAD_HANDLER;
 	}
 
+	if (boneHandler != (ULONG_PTR)BAD_HANDLER && m_pWeaponClass->DetachMuzzleBinding(boneHandler))
+		return pH->EndFunction();
 	if (m_pWeaponClass->GetCharacter())
 	{
 		if (boneHandler == -1)

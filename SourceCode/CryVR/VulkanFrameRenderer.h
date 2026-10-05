@@ -140,7 +140,9 @@ public:
     {
         if (nearPlane > 0.0f && farPlane > nearPlane)
         {
-            m_stockNearPlane = nearPlane;
+            // Tracked hands and the local avatar use normal world depth.
+            // Desktop near distances clip them well before they reach the HMD.
+            m_stockNearPlane = nearPlane < 0.02f ? nearPlane : 0.02f;
             m_stockFarPlane = farPlane;
         }
     }

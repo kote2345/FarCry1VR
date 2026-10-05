@@ -259,6 +259,7 @@ int CPhysicalEntity::GetParams(pe_params *_params)
 			if (i==m_nParts) return 0;
 		} else
 			i = params->ipart;
+		if (i<0 || i>=m_nParts) return 0;
 		params->partid = m_parts[params->ipart = i].id;
 		params->pos = m_parts[i].pos;
 		params->q = m_parts[i].q;
@@ -278,6 +279,7 @@ int CPhysicalEntity::GetParams(pe_params *_params)
 			m_parts[i].mass/(m_parts[i].pPhysGeomProxy->V*cube(m_parts[i].scale)) : 0;
 		params->pPhysGeom = m_parts[i].pPhysGeom;
 		params->pPhysGeomProxy = m_parts[i].pPhysGeomProxy;
+		return 1;
 	}
 
 	if (_params->type==pe_params_flags::type_id) {

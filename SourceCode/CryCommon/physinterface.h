@@ -19,6 +19,10 @@
 #endif
 
 
+// Foreign-data owner is the player; these bodies ignore the owner collision.
+enum { PHYS_FOREIGN_ID_VR_BODY = 100 };
+enum { PHYS_IMPULSE_NPC_BULLET = 4 };
+
 enum pe_type { PE_NONE=0, PE_STATIC=1, PE_LIVING=2, PE_RIGID=3, PE_WHEELEDVEHICLE=4, PE_PARTICLE=5, PE_ARTICULATED=6, PE_ROPE=7, PE_SOFT=8 };
 enum sim_class { SC_STATIC=0, SC_SLEEPING_RIGID=1, SC_ACTIVE_RIGID=2, SC_LIVING=3, SC_INDEPENDENT=4, SC_TRIGGER=6, SC_DELETED=7 };
 class IGeometry;
@@ -261,6 +265,8 @@ struct pe_params_joint : pe_params {
 		bNoUpdate=0; pMtx0=pMtx0T=0;
 		MARK_UNUSED flags,q0,pivot,ranimationTimeStep,nSelfCollidingParts;
 		animationTimeStep = 0.01f;
+		MARK_UNUSED animationTarget;
+		MARK_UNUSED animationPosition,animationRotation;
 	}
 
 	unsigned int flags; // should be a combination of angle0,1,2_locked, angle0,1,2_auto_kd, joint_no_gravity
@@ -281,6 +287,9 @@ struct pe_params_joint : pe_params {
 	int bNoUpdate; // omit recalculation of body parameters after changing this joint
 	float animationTimeStep; // used to calculate joint velocities of animation
 	float ranimationTimeStep;	// 1/animation time step, can be not specified (specifying just saves extra division operation)
+	quaternionf animationTarget; // explicit child orientation relative to physical parent
+	vectorf animationPosition; // animated part origin in living host coordinates
+	quaternionf animationRotation; // animated part orientation in living host coordinates
 
 	VALIDATORS_START
 		VALIDATOR(pivot)
@@ -298,6 +307,7 @@ struct pe_params_articulated_body : pe_params {
 		MARK_UNUSED bGrounded,bInheritVel,bCheckCollisions,bCollisionResp, a,wa,w,v,pivot, scaleBounceResponse,posHostPivot;
 		MARK_UNUSED bAwake,pHost,nCollLyingMode, gravityLyingMode,dampingLyingMode,minEnergyLyingMode,iSimType,iSimTypeLyingMode;
 		bApply_dqext=0;	bRecalcJoints=1;
+		MARK_UNUSED bExertImpulse;
 	}
 
 	int bGrounded; // whether body's pivot is firmly attached to something or free
@@ -326,6 +336,7 @@ struct pe_params_articulated_body : pe_params {
 	int bExpandHinges;
 
 	int bRecalcJoints;
+	int bExertImpulse; // transfer articulated contact reactions to the locomotion host
 };
 
 ////////// living entity params
@@ -546,7 +557,47 @@ struct pe_action_reset : pe_action { // Resets dynamic state of an entity
 	pe_action_reset() { type=type_id; }
 };
 
-enum constrflags { local_frames=1, world_frames=2 };
+// Compliant NPC root: change actual living velocity, preserving AI intent.
+struct pe_action_npc_root : pe_action {
+	enum entype { type_id=12 };
+	pe_action_npc_root() { type=type_id; impulse.zero(); yieldTime=0; }
+	vectorf impulse;
+	float yieldTime;
+};
+
+// Persistent tracking target; CryPhysics evaluates the bounded servo each substep.
+struct pe_action_vr_tracking : pe_action {
+	enum entype { type_id=13 };
+	pe_action_vr_tracking() { type=type_id; enabled=1; ignoreId=-1; referenceId=-1; referencePos.zero(); angularVelocityDrive=0; pos.zero(); q.SetIdentity(); v.zero(); w.zero(); maxForce=350; maxTorque=40; frequency=60; }
+	int enabled;
+	int ignoreId;
+	int angularVelocityDrive;
+	// Translating carrier frame, sampled with the tracked pose.
+	int referenceId;
+	vectorf referencePos;
+	vectorf pos,v,w;
+	quaternionf q;
+	float maxForce,maxTorque,frequency;
+};
+
+// Collision exclusion belongs to the carrier, and survives a two-handed grip
+// until both hands release. It never disables collisions with the world.
+struct pe_action_vr_grip_owner : pe_action {
+	enum entype { type_id=14 };
+	pe_action_vr_grip_owner() { type=type_id; carrierId=-1; hand=0; enabled=1; }
+	int carrierId,hand,enabled;
+};
+
+// Apply reach limits within living locomotion, without a second root impulse.
+struct pe_action_vr_locomotion_limit : pe_action {
+	enum entype { type_id=15 };
+	pe_action_vr_locomotion_limit() { type=type_id; hand=0; enabled=0; normal.zero(); maxSpeed=0; }
+	int hand,enabled;
+	vectorf normal;
+	float maxSpeed;
+};
+
+enum constrflags { local_frames=1, world_frames=2, fixed_angular_only=4 };
 
 struct pe_action_add_constraint : pe_action {
 	enum entype { type_id=5 };
@@ -690,6 +741,7 @@ struct pe_status_dynamics : pe_status {
 	enum entype { type_id=8 };
 	pe_status_dynamics() : v(zero),w(zero),a(zero),wa(zero),centerOfMass(zero) {
 		MARK_UNUSED partid,ipart; type=type_id; time_interval=0; submergedFraction=0; waterResistance=0;
+		inertiaInverse.SetZero();
 	}
 
 	int partid;
@@ -703,6 +755,7 @@ struct pe_status_dynamics : pe_status {
 	float waterResistance;
 	float mass;
 	float time_interval;
+	matrix3x3f inertiaInverse; // actual inverse inertia tensor in world coordinates
 };
 
 struct coll_history_item {
@@ -716,6 +769,14 @@ struct coll_history_item {
 	int idmat[2];	// 0-this body material, 1-collider material
 };
 
+// Current solver contacts, rather than the bounded impact history.
+struct pe_status_contact_normals : pe_status {
+	enum entype { type_id=21 };
+	pe_status_contact_normals() { type=type_id; count=0; }
+	int count;
+	vectorf normals[8];
+};
+
 struct pe_status_collisions : pe_status {
 	enum entype { type_id=9 };
 	pe_status_collisions() { type=type_id; age=0; len=1; pHistory=0; bClearHistory=0; }
@@ -724,6 +785,24 @@ struct pe_status_collisions : pe_status {
 	int len; // length of this array
 	float age; // maximum age of collision events (older events are ignored)
 	int bClearHistory;
+};
+
+// Consume external loads from an active host-bound character rig.
+struct pe_status_vr_drive : pe_status {
+	enum entype { type_id=23 };
+	pe_status_vr_drive() { type=type_id; force.zero(); torque.zero(); targetPos.zero(); targetRotation.SetIdentity(); age=dt=0; angularBodyId=-1; requestedW.zero(); beforeW.zero(); afterW.zero(); }
+	vectorf force, torque, targetPos;
+	quaternionf targetRotation;
+	float age, dt;
+	int angularBodyId;
+	vectorf requestedW,beforeW,afterW;
+};
+
+struct pe_status_npc_interaction : pe_status {
+	enum entype { type_id=22 };
+	pe_status_npc_interaction() { type=type_id; gripImpulse.zero(); contactImpulse.zero(); damageImpulse.zero(); gripAge=1E10f; }
+	vectorf gripImpulse,contactImpulse,damageImpulse;
+	float gripAge;
 };
 
 struct pe_status_id : pe_status {

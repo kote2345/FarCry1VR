@@ -31,7 +31,9 @@ int CSphereGeom::CalcPhysicalProperties(phys_geometry *pgeom)
 	pgeom->origin = m_sphere.center;
 	pgeom->q.SetIdentity();
 	pgeom->V = 4.0f/3*pi*cube(m_sphere.r);
-	float x2 = sqr(m_sphere.r)*0.4f;
+	// RigidBody::Create/Add multiply unit-density inertia by mass/volume.
+	// Omitting volume makes small spheres thousands of times too hard to turn.
+	float x2 = pgeom->V*sqr(m_sphere.r)*0.4f;
 	pgeom->Ibody.Set(x2,x2,x2);
 	return 1;
 }

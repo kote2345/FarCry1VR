@@ -369,12 +369,58 @@ void CPlayer::UpdateCamera()
 
 // sets players EYE position (camera for fpv)
 //////////////////////////////////////////////////////////////////////////
+bool CPlayer::GetVRModelEyePosition(Vec3& position) const
+{
+	ICryCharInstance* character = m_pEntity->GetCharInterface()->GetCharacter(0);
+	if (!character) return false;
+	ICryBone* eyes = character->GetBoneByName("eyes");
+	if (eyes)
+	{
+		position = eyes->GetDefaultAbsoluteMatrix().GetTranslationOLD();
+		return true;
+	}
+	ICryBone* head = character->GetBoneByName("Bip01 Head");
+	if (!head) return false;
+	// The Biped head joint is at the base of the skull, below and behind
+	// the eyes. Jack's rig has no dedicated eye joint.
+	// Derive the avatar's forward axis from its named shoulders. The Cry
+	// camera's +Y is not necessarily the imported Biped model's forward.
+	Vec3 forward(0, -1, 0);
+	ICryBone* leftShoulder = character->GetBoneByName("Bip01 L UpperArm");
+	ICryBone* rightShoulder = character->GetBoneByName("Bip01 R UpperArm");
+	if (leftShoulder && rightShoulder)
+	{
+		Vec3 right = rightShoulder->GetDefaultAbsoluteMatrix().GetTranslationOLD() -
+			leftShoulder->GetDefaultAbsoluteMatrix().GetTranslationOLD();
+		right.z = 0;
+		if (right.GetLength() > 1.0e-4f)
+		{
+			right.Normalize();
+			forward = Vec3(0, 0, 1).Cross(right);
+		}
+	}
+	position = head->GetDefaultAbsoluteMatrix().GetTranslationOLD() +
+		forward * 0.08f + Vec3(0, 0, 0.10f);
+	return true;
+}
+
 void CPlayer::SetEyePos()
 {
 	if( m_pGame->p_HeadCamera->GetIVal())
 		SetEyePosBone();
 	else
 		SetEyePosOffset();
+	Matrix34 controller;
+	Vec3 modelEyes;
+	if (IsMyPlayer() && m_bFirstPerson && IsAlive() && !m_pVehicle && !m_pMountedWeapon &&
+		m_pGame->GetSystem()->GetVRControllerTransform(false, controller) && GetVRModelEyePosition(modelEyes))
+	{
+		ICryCharInstance* character = m_pEntity->GetCharInterface()->GetCharacter(0);
+		// Preserve physics-driven stance transitions, but use the avatar's
+		// neutral eye height instead of the desktop camera's standing height.
+		if (m_pGame->p_HeadCamera->GetIVal()) SetEyePosOffset();
+		m_vEyePos.z += modelEyes.z + character->GetOffset().z - m_PlayerDimNormal.heightEye;
+	}
 }
 
 // sets players EYE position (camera for fpv)

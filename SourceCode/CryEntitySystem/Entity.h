@@ -479,6 +479,7 @@ public:
 	//! @param entity wich enters the area
 	//! @param areaID id of the area the entity is in
 	virtual void OnEnterArea( IEntity* entity, const int areaID );
+	bool SuppressVRWeaponPickup(IEntity* player) const;
 
 	//! Calls script OnLeaveArea callback in current state. Called when the entity leavs area
 	//! @param entity wich leaves the area

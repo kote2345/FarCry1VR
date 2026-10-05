@@ -23,6 +23,7 @@
 #include "physicalworld.h"
 #include "rigidentity.h"
 #include "articulatedentity.h"
+#include <VRPhysicsDiagnostics.h>
 
 int __ae_step=0; // for debugging
 
@@ -53,6 +54,10 @@ CArticulatedEntity::CArticulatedEntity(CPhysicalWorld *pWorld) : CRigidEntity(pW
 	m_posHostPivot.Set(0,0,0);
 	m_bPartPosForced = 0;
 	m_bExertImpulse = 0;
+	m_npcGripImpulse.zero(); m_npcContactImpulse.zero(); m_npcLastGripTime = -1E10f;
+	m_npcDamageImpulse.zero();
+	m_motorHostValid = false;
+	m_motorHostPosition.zero(); m_motorHostRotation.SetIdentity();
 	m_Ya_vec[0].Set(0,0,0);
 	m_Ya_vec[0].Set(0,0,0);
 	m_nContacts = m_nDynContacts = m_bInGroup = 0;
@@ -305,11 +310,46 @@ int CArticulatedEntity::SetParams(pe_params *_params)
 				m_joints[op[1]].dq[i] = 0;
 		}
 		if (!is_unused(params->nSelfCollidingParts)) {
+			m_joints[op[1]].selfCollMask = 0;
 			for(i=0;i<m_nParts;i++) for(j=0;j<params->nSelfCollidingParts;j++) if (m_parts[i].id==params->pSelfCollidingParts[j])
 				m_joints[op[1]].selfCollMask |= getmask(i);
 		}
 
 		float rdt = !is_unused(params->ranimationTimeStep) ? params->ranimationTimeStep : 1.0f/params->animationTimeStep;
+		if (!is_unused(params->animationPosition) && !is_unused(params->animationRotation)) {
+			ae_joint &joint = m_joints[op[1]];
+			const bool initialize = !joint.hasAnimationPosition;
+			const int part = joint.iStartPart;
+			const quaternionf massRotation = params->animationRotation*!m_infos[part].q0;
+			const vectorf position = params->animationPosition-massRotation*m_infos[part].pos0;
+			joint.animationLinearVelocity = joint.hasAnimationPosition ?
+				(position-joint.animationPosition)*rdt : vectorf(zero);
+			joint.animationPosition = position;
+			joint.animationRotation = massRotation;
+			joint.hasAnimationPosition = true;
+			if (joint.animationLinearVelocity.len2()>81.0f)
+				joint.animationLinearVelocity *= 9.0f/joint.animationLinearVelocity.len();
+			if (initialize && m_bExertImpulse) InitializeMotorJoint(op[1]);
+		}
+		if (!is_unused(params->animationTarget)) {
+			ae_joint &joint = m_joints[op[1]];
+			// Animation targets refer to bone/part frames, whereas the motor
+			// operates on mass frames. Apply both authored body bind offsets.
+			quaternionf target = params->animationTarget;
+			if (op[0] >= 0)
+				target = m_infos[m_joints[op[0]].iStartPart].q0*target;
+			target = target*!m_infos[joint.iStartPart].q0;
+			target.Normalize();
+			quaternionf change = target*!joint.animationTarget;
+			if (change.w < 0) { change.w = -change.w; change.v = -change.v; }
+			const float sine = change.v.len();
+			joint.animationVelocity.zero();
+			if (joint.hasAnimationTarget && sine > 1.e-5f)
+				joint.animationVelocity = change.v*(2*acos_tpl(max(-1.0f,min(1.0f,change.w)))*rdt/sine);
+			if (joint.animationVelocity.len2()>225) joint.animationVelocity *= 15/joint.animationVelocity.len();
+			joint.animationTarget = target;
+			joint.hasAnimationTarget = true;
+		}
 		for(i=0;i<3;i++) {
 			if (!is_unused(params->limits[0][i])) m_joints[op[1]].limits[0][i] = params->limits[0][i];
 			if (!is_unused(params->limits[1][i])) m_joints[op[1]].limits[1][i] = params->limits[1][i];
@@ -400,7 +440,9 @@ int CArticulatedEntity::SetParams(pe_params *_params)
 					for(i=op[1];i<=op[1]+m_joints[op[1]].nChildrenTree;i++) SyncBodyWithJoint(i);
 			}
 		}
-		m_bUpdateBodies = 1;
+		// Active motors change goals, not simulated body transforms. Rebuilding
+		// all bodies here invalidates live contacts and injects correction energy.
+		if (!m_bExertImpulse || !params->bNoUpdate) m_bUpdateBodies = 1;
 		return 1;
 	}
 
@@ -471,6 +513,18 @@ int CArticulatedEntity::SetParams(pe_params *_params)
 			SyncWithHost(params->bRecalcJoints,0);
 		if (!is_unused(params->bCheckCollisions)) m_bCheckCollisions = params->bCheckCollisions;
 		if (!is_unused(params->bCollisionResp)) m_bCollisionResp = params->bCollisionResp;
+		if (!is_unused(params->bExertImpulse)) {
+			if (m_bExertImpulse != params->bExertImpulse) m_motorHostValid = false;
+			m_bExertImpulse = params->bExertImpulse;
+			if (!m_bExertImpulse) {
+				m_npcDamageImpulse.zero();
+				m_npcGripImpulse.zero(); m_npcContactImpulse.zero(); m_npcLastGripTime = -1E10f;
+			}
+			if (!m_bExertImpulse) for (int i=0;i<m_nJoints;++i) {
+				m_joints[i].hasAnimationTarget = false;
+				m_joints[i].hasAnimationPosition = false;
+			}
+		}
 
 		if (!is_unused(params->nCollLyingMode)) m_nCollLyingMode = params->nCollLyingMode;
 		if (!is_unused(params->gravityLyingMode)) m_gravityLyingMode = params->gravityLyingMode;
@@ -510,6 +564,8 @@ int CArticulatedEntity::GetParams(pe_params *_params)
 		params->bounciness = m_joints[i].bounciness;
 		params->ks = m_joints[i].ks;
 		params->kd = m_joints[i].kd;
+		params->qdashpot = m_joints[i].qdashpot;
+		params->kdashpot = m_joints[i].kdashpot;
 		params->q = m_joints[i].q;
 		params->qext = m_joints[i].qext;
 		params->op[0] = m_joints[i].iParent>=0 ? m_joints[m_joints[i].iParent].idbody : -1;
@@ -530,6 +586,7 @@ int CArticulatedEntity::GetParams(pe_params *_params)
 		params->posHostPivot = m_posHostPivot;
 		params->bCheckCollisions = m_bCheckCollisions;
 		params->bCollisionResp = m_bCollisionResp;
+		params->bExertImpulse = m_bExertImpulse;
 		params->nCollLyingMode = m_nCollLyingMode;
 		params->gravityLyingMode = m_gravityLyingMode;
 		params->dampingLyingMode = m_dampingLyingMode;
@@ -546,6 +603,15 @@ int CArticulatedEntity::GetParams(pe_params *_params)
 
 int CArticulatedEntity::GetStatus(pe_status* _status)
 {
+	if (_status->type == pe_status_npc_interaction::type_id) {
+		pe_status_npc_interaction *status = (pe_status_npc_interaction*)_status;
+		if (!m_bExertImpulse || !m_bGrounded || !m_pHost || m_pHost->GetType()!=PE_LIVING) return 0;
+		status->gripImpulse = m_npcGripImpulse; status->contactImpulse = m_npcContactImpulse;
+		status->damageImpulse = m_npcDamageImpulse; m_npcDamageImpulse.zero();
+		status->gripAge = max(0.0f,m_pWorld->GetPhysicsTime()-m_npcLastGripTime);
+		m_npcGripImpulse.zero(); m_npcContactImpulse.zero();
+		return 1;
+	}
 	if (_status->type==pe_status_joint::type_id) {
 		pe_status_joint *status = (pe_status_joint*)_status;
 		int i; for(i=0;i<m_nJoints && m_joints[i].idbody!=status->idChildBody;i++);
@@ -581,6 +647,7 @@ int CArticulatedEntity::GetStatus(pe_status* _status)
 		status->centerOfMass = pbody->pos;
 		status->submergedFraction = m_submergedFraction;
 		status->mass = pbody->M;
+		status->inertiaInverse = pbody->Iinv;
 		return 1;
 	}
 
@@ -640,6 +707,19 @@ int CArticulatedEntity::Action(pe_action *_action)
 			}
 		}
 		m_joints[j].Pimpact += P; m_joints[j].Limpact += L;
+		if (m_bExertImpulse && m_bGrounded && m_pHost && m_pHost->GetType()==PE_LIVING && action->iSource==PHYS_IMPULSE_NPC_BULLET)
+		{
+			m_npcDamageImpulse += vectorf(P.x,P.y,0);
+			// Let the finite bullet impulse move the hit limb before its drives
+			// recover. Soften its parent briefly to transmit visible torso motion.
+			m_joints[j].damageMotorTime = max(m_joints[j].damageMotorTime, .55f);
+			if (m_joints[j].iParent >= 0)
+				m_joints[m_joints[j].iParent].damageMotorTime = max(m_joints[m_joints[j].iParent].damageMotorTime, .30f);
+		}
+		if (m_bExertImpulse && m_bGrounded && m_pHost && m_pHost->GetType()==PE_LIVING && action->iSource==3) {
+			m_npcGripImpulse += vectorf(P.x,P.y,0);
+			m_npcLastGripTime = m_pWorld->GetPhysicsTime();
+		}
 
 		if (action->iSource!=1) {
 			m_bAwake = 1; m_simTime = 0;
@@ -735,12 +815,47 @@ void CArticulatedEntity::SyncWithHost(int bRecalcJoints, float time_interval)
 		}
 		pe_status_pos sp;
 		m_pHost->GetStatus(&sp);
+		const bool transport = m_bExertImpulse && m_motorHostValid;
+		const quaternionf turn = sp.q*!m_motorHostRotation;
+		const bool teleport = transport && (sp.pos-m_motorHostPosition).len2()>1.0f;
 		m_posPivot = sp.q*m_posHostPivot + sp.pos;
 		m_pos = m_posPivot - m_offsPivot;
 		pe_params_pos pp;
 		pp.q = m_pHost->m_qrot;
 		pp.bRecalcBounds = 0;
 		SetParams(&pp);
+		if (transport) {
+			if (teleport || turn.v.len2()>.067f)
+				for (int i=m_nColliders-1;i>=0;--i) RemoveCollider(m_pColliders[i]);
+			// Carry physical deviations through AI heading changes. Ordinary
+			// translation uses simulated host velocity; teleports reset the rig.
+			for (int i=0;i<m_nJoints;++i) if (m_joints[i].hasAnimationPosition) {
+				if (teleport) InitializeMotorJoint(i);
+				else if (turn.v.len2()>1.e-10f) {
+					ae_joint &joint = m_joints[i];
+					joint.body.pos = sp.pos+turn*(joint.body.pos-sp.pos);
+					joint.body.q = turn*joint.body.q; joint.body.q.Normalize();
+					joint.body.v = turn*joint.body.v; joint.body.w = turn*joint.body.w;
+					joint.body.P = turn*joint.body.P; joint.body.L = turn*joint.body.L;
+					joint.Pimpact = turn*joint.Pimpact; joint.Limpact = turn*joint.Limpact;
+					SyncJointWithBody(i,1);
+					const matrix3x3f rotation(joint.body.q);
+					joint.body.Iinv = rotation*joint.body.Ibody_inv*rotation.T();
+					joint.I = rotation*joint.body.Ibody*rotation.T();
+					for (int p=joint.iStartPart;p<joint.iStartPart+joint.nParts;++p) {
+						m_parts[p].q = joint.quat*m_infos[p].q0;
+						m_parts[p].pos = joint.body.pos-m_pos+joint.quat*m_infos[p].pos0;
+					}
+				}
+			}
+			static int transitions = 0;
+			if (transitions < 32 && (teleport || turn.v.len2()>.067f)) {
+				++transitions;
+				VRPhysicsTrace("[VRNPCHost] id=%d teleport=%d distance=%.4f turn=%.4f",m_pWorld->GetPhysicalEntityId(this),
+					teleport,(sp.pos-m_motorHostPosition).len(),2*acos_tpl(min(1.0f,fabs_tpl(turn.w))));
+			}
+		}
+		m_motorHostPosition = sp.pos; m_motorHostRotation = sp.q; m_motorHostValid = true;
 		if (m_bInheritVel && time_interval>0) {
 			pe_status_dynamics sd;
 			m_pHost->GetStatus(&sd);
@@ -769,6 +884,35 @@ void CArticulatedEntity::UpdateJointRotationAxes(int idx)
 	angle = m_joints[idx].q[2]+m_joints[idx].qext[2]; cosa = cos_tpl(angle); sina = sin_tpl(angle);
 	m_joints[idx].rotaxes[0] = m_joints[idx].rotaxes[0].rotated(m_joints[idx].rotaxes[2], cosa,sina); // rot x around z - yaw
 	m_joints[idx].rotaxes[1] = m_joints[idx].rotaxes[1].rotated(m_joints[idx].rotaxes[2], cosa,sina); // rot y around z
+}
+
+void CArticulatedEntity::InitializeMotorJoint(int idx)
+{
+	ae_joint &joint = m_joints[idx];
+	const vectorf oldPosition = joint.body.pos;
+	const quaternionf hostRotation = m_pHost ? m_pHost->m_qrot : m_qrot;
+	joint.quat = hostRotation*joint.animationRotation; joint.quat.Normalize();
+	joint.body.q = joint.quat*!joint.body.qfb; joint.body.q.Normalize();
+	joint.body.pos = m_posPivot+hostRotation*(joint.animationPosition-m_posHostPivot);
+	joint.body.v.zero(); joint.body.w.zero(); joint.body.P.zero(); joint.body.L.zero();
+	joint.Pimpact.zero(); joint.Limpact.zero(); joint.animationLinearVelocity.zero(); joint.animationVelocity.zero();
+	joint.damageMotorTime = 0;
+	const matrix3x3f rotation(joint.body.q);
+	joint.body.Iinv = rotation*joint.body.Ibody_inv*rotation.T();
+	joint.I = rotation*joint.body.Ibody*rotation.T();
+	SyncJointWithBody(idx,1);
+	joint.dq.zero();
+	for (int p=joint.iStartPart;p<joint.iStartPart+joint.nParts;++p) {
+		m_parts[p].q = joint.quat*m_infos[p].q0;
+		m_parts[p].pos = joint.body.pos-m_pos+joint.quat*m_infos[p].pos0;
+	}
+	static int resets = 0;
+	if (resets < 96) {
+		++resets;
+		VRPhysicsTrace("[VRNPCInitialize] id=%d bone=%d delta=%.4f COM=(%.4f %.4f %.4f)",
+			m_pWorld->GetPhysicalEntityId(this),joint.idbody,(oldPosition-joint.body.pos).len(),
+			joint.body.pos.x,joint.body.pos.y,joint.body.pos.z);
+	}
 }
 
 void CArticulatedEntity::CheckForGimbalLock(int idx)
@@ -858,10 +1002,18 @@ void CArticulatedEntity::SyncJointWithBody(int idx, int flags)
 		m_joints[idx].q = Ang3::GetAnglesXYZ( matrix3x3f(!(qparent*m_joints[idx].quat0)*m_joints[idx].quat) );
 		m_joints[idx].q -= m_joints[idx].qext;
 		UpdateJointRotationAxes(idx);
-		CheckForGimbalLock(idx);
+		if (m_bExertImpulse && m_joints[idx].hasAnimationPosition)
+			m_joints[idx].flags &= ~(angle0_gimbal_locked*7);
+		else CheckForGimbalLock(idx);
 	}
 
 	if (flags & 2) { // sync velocities
+		if (m_bExertImpulse && m_joints[idx].hasAnimationPosition && m_iSimTypeCur) {
+			// Quaternion ball-joint motors do not use Euler derivatives. The
+			// inverse Euler basis becomes singular during valid limb rotations.
+			m_joints[idx].dq.zero();
+			return;
+		}
 		vectorf wrel = m_joints[idx].iParent>=0 ? m_joints[m_joints[idx].iParent].body.w : m_body.w;
 		wrel = m_joints[idx].body.w - wrel;
 		if (!(m_joints[idx].flags & (angle0_locked|angle0_gimbal_locked)*7)) {
@@ -986,6 +1138,64 @@ int CArticulatedEntity::StepJoint(int idx, float time_interval,masktype &contact
 	m_joints[idx].bHasExtContacts = 0;
 
 	if (m_iSimTypeCur && m_bCollisionResp) {
+		m_joints[idx].damageMotorTime = max(0.0f,m_joints[idx].damageMotorTime-time_interval);
+		const float motorStrength = 1.0f-.85f*min(1.0f,m_joints[idx].damageMotorTime/.30f);
+		if (m_bExertImpulse && m_joints[idx].hasAnimationPosition) {
+			ae_joint &joint = m_joints[idx];
+			const quaternionf hostRotation = m_pHost ? m_pHost->m_qrot : m_qrot;
+			const vectorf goal = m_posPivot+hostRotation*(joint.animationPosition-m_posHostPivot);
+			pe_status_dynamics host;
+			vectorf hostVelocity(zero);
+			if (m_pHost && m_pHost->GetStatus(&host)) hostVelocity = host.v;
+			const vectorf velocity = hostVelocity+hostRotation*joint.animationLinearVelocity;
+			const float stiffness = 140.0f*motorStrength, damping = 24.0f*sqrt_tpl(motorStrength);
+			vectorf acceleration = ((goal-joint.body.pos)*stiffness+(velocity-joint.body.v)*damping-m_gravity)/
+				(1+damping*time_interval+stiffness*time_interval*time_interval);
+			if (acceleration.len2()>3600.0f) acceleration *= 60.0f/acceleration.len();
+			joint.body.P += acceleration*(joint.body.M*time_interval);
+			joint.body.v = joint.body.P*joint.body.Minv;
+		}
+		if (m_bExertImpulse && m_joints[idx].hasAnimationTarget) {
+			ae_joint &joint = m_joints[idx];
+			ae_joint &parent = m_joints[joint.iParent >= 0 ? joint.iParent : idx];
+			const bool hasParent = joint.iParent >= 0;
+			const quaternionf rootRotation = m_pHost ? m_pHost->m_qrot : m_qrot;
+			const quaternionf desired = (hasParent ? parent.quat : rootRotation)*joint.animationTarget;
+			quaternionf change = desired*!joint.quat;
+			if (change.w < 0) { change.w = -change.w; change.v = -change.v; }
+			const float sine = change.v.len();
+			vectorf error(zero), targetVelocity = (hasParent ? parent.quat : rootRotation)*joint.animationVelocity;
+			if (sine > 1.e-5f) error = change.v*(2.0f*acos_tpl(max(-1.0f,min(1.0f,change.w)))/sine);
+			UpdateJointRotationAxes(idx);
+			const float stiffness = 400.0f*motorStrength, damping = 50.0f*sqrt_tpl(motorStrength);
+			const vectorf relativeVelocity = joint.body.w-(hasParent ? parent.body.w : vectorf(zero));
+			// Both bodies receive opposing impulses. Their combined inverse
+			// inertia determines relative acceleration, rather than child inertia
+			// alone (which can violently accelerate a lighter parent).
+			matrix3x3f effective = joint.body.Iinv;
+			if (hasParent) effective += parent.body.Iinv;
+			effective.Invert();
+			vectorf momentum = effective*(error*stiffness+(targetVelocity-relativeVelocity)*damping)*
+				(time_interval/(1+damping*time_interval+stiffness*time_interval*time_interval));
+			const float limit = max(.5f,joint.body.M*20.0f)*time_interval*motorStrength;
+			if (momentum.len2() > limit*limit) momentum *= limit/momentum.len();
+			joint.body.L += momentum;
+			joint.body.w = joint.body.Iinv*joint.body.L;
+			if (hasParent) {
+				parent.body.L -= momentum;
+				parent.body.w = parent.body.Iinv*parent.body.L;
+			}
+			// Bound the motor's speed while diagnosing frame conversions. Keep
+			// angular momentum consistent with velocity, including the parent.
+			if (joint.body.w.len2()>64.0f) {
+				const float scale = 8.0f/joint.body.w.len();
+				joint.body.w *= scale; joint.body.L *= scale;
+			}
+			if (hasParent && parent.body.w.len2()>64.0f) {
+				const float scale = 8.0f/parent.body.w.len();
+				parent.body.w *= scale; parent.body.L *= scale;
+			}
+		}
 		e = (m_joints[idx].body.v.len2() + (m_joints[idx].body.L*m_joints[idx].body.w)*m_joints[idx].body.Minv)*0.5f + m_joints[idx].body.Eunproj;
 		m_bAwake += (m_joints[idx].bAwake = isneg(minEnergy-e));
 		m_joints[idx].bAwake |= m_bFloating|m_bUsingUnproj;
@@ -1275,6 +1485,27 @@ int CArticulatedEntity::Step(float time_interval)
 	m_dampingEx = 0;
 
 	SyncWithHost(0,time_interval);
+	if (m_bExertImpulse) {
+		bool recover = false;
+		const quaternionf hostRotation = m_pHost ? m_pHost->m_qrot : m_qrot;
+		for (int i=0;i<m_nJoints;++i) if (m_joints[i].hasAnimationPosition) {
+			const ae_joint &joint = m_joints[i];
+			const vectorf target = m_posPivot+hostRotation*(joint.animationPosition-m_posHostPivot);
+			const vectorf parentPivot = joint.iParent >= 0 ?
+				m_joints[joint.iParent].body.pos+m_joints[joint.iParent].quat*joint.pivot[0] : m_posPivot;
+			if ((target-joint.body.pos).len2()>4.0f ||
+				(parentPivot-joint.body.pos-joint.quat*joint.pivot[1]).len2()>.25f) recover = true;
+		}
+		if (recover) {
+			for (int i=m_nColliders-1;i>=0;--i) RemoveCollider(m_pColliders[i]);
+			for (int i=0;i<m_nJoints;++i) if (m_joints[i].hasAnimationPosition) InitializeMotorJoint(i);
+			static int recoveries = 0;
+			if (recoveries < 32) {
+				++recoveries;
+				VRPhysicsTrace("[VRNPCRecovery] id=%d reason=broken-chain",m_pWorld->GetPhysicalEntityId(this));
+			}
+		}
+	}
 
 	if (!m_bAwake && !m_bCheckCollisions)
 		return 1;
@@ -1289,8 +1520,13 @@ int CArticulatedEntity::Step(float time_interval)
 		if (m_body.v.len2()*sqr(time_interval) > szmax)
 			szmax = m_body.v.len()*time_interval;
 		sz.Set(szmax,szmax,szmax);
-		m_nCollEnts = m_pWorld->GetEntitiesAround(m_BBox[0]-sz,m_BBox[1]+sz, m_pCollEntList, 
+		m_nCollEnts = m_pWorld->GetEntitiesAround(m_BBox[0]-sz,m_BBox[1]+sz, m_pCollEntList,
 			ent_terrain|ent_static|ent_sleeping_rigid|ent_rigid|ent_living|ent_independent|ent_sort_by_mass|ent_triggers, this);
+		// The animation rig is attached to its living host. Contact against
+		// that host would make the skeleton fight its own locomotion capsule.
+		for (i = j = 0; i < m_nCollEnts; ++i)
+			if (m_pCollEntList[i] != m_pHost) m_pCollEntList[j++] = m_pCollEntList[i];
+		m_nCollEnts = j;
 
 		for(i=0;i<m_nCollEnts;i++) if (m_pCollEntList[i]->m_iSimClass>2 && m_pCollEntList[i]->GetType()!=PE_ARTICULATED)
 			m_pCollEntList[i]->Awake();
@@ -1437,12 +1673,9 @@ int CArticulatedEntity::Step(float time_interval)
 	for(i=0;i<m_nJoints;i++)
 		SyncBodyWithJoint(i,3);	// synchronize body geometry as well as dynamics to accomodate potential changes in joint limits
 
-	if (m_bGrounded && m_pHost && m_bExertImpulse) {
-		pe_action_impulse ai;
-		ai.impulse = -Za_vec[0]-m_Ya_vec[0];
-		ai.point = m_posPivot;
-		m_pHost->Action(&ai);
-	}
+	// External root loads are collected after the contact solve and consumed
+	// by CVRPhysicalNPCController. Za/Ya also contain motor reactions, so they
+	// must not be transferred a second time to the locomotion host here.
 
 	ComputeBBox();
 	m_pWorld->RepositionEntity(this,1);
@@ -2146,6 +2379,12 @@ __ae_step++;
 				pcontact->pt[1] = pivot[0];
 			} else
 				pcontact->n.Set(0,0,1);
+			if (m_bExertImpulse && m_joints[idx].iParent < 0 && m_pHost) {
+				// This anchor moves with the living actor. Treating it as a
+				// stationary world point creates velocity-proportional root lag.
+				pe_status_dynamics host;
+				if (m_pHost->GetStatus(&host)) pcontact->vreq += host.v;
+			}
 			RegisterContact(pcontact);
 
 			for(i=j=0;i<3;i++) if (!(m_joints[idx].flags & (angle0_locked|angle0_gimbal_locked)<<i))
@@ -2249,13 +2488,71 @@ float __maxdiff = 0;
 
 int CArticulatedEntity::Update(float time_interval, float damping)
 {
+	// Read accepted external contacts once. Motors, root constraints and
+	// static ground must not drive the host through a feedback loop.
+	if (m_bExertImpulse && m_bGrounded && m_pHost && m_pHost->GetType()==PE_LIVING) {
+		masktype mask = 0;
+		for (int c=0;c<m_nColliders;++c) mask |= m_pColliderContacts[c];
+		vectorf external(zero);
+		for (int c=0;c<NMASKBITS && getmask(c)<=mask;++c) if (mask & getmask(c)) {
+			entity_contact &contact = m_pContacts[c];
+			const int side = contact.pent[0]==this ? 0 : contact.pent[1]==this ? 1 : -1;
+			if (side < 0) continue;
+			CPhysicalEntity *other = contact.pent[side^1];
+			if (other && other!=m_pHost && other->GetType()==PE_RIGID && other->m_iSimClass>0 &&
+				!(contact.flags & (contact_constraint|contact_angular)))
+				external += contact.solvedExternalImpulse*(side==0 ? 1.0f : -1.0f);
+			contact.solvedExternalImpulse.zero();
+		}
+		external.z = 0;
+		const float limit = 600.0f*time_interval;
+		if (external.len2()>limit*limit) external *= limit/external.len();
+		m_npcContactImpulse += external;
+		// Persistent grasp constraints are separate from collision contacts.
+		// Only constraints to a VR hand/body can yield this living host; never
+		// feed internal ragdoll pivots or their animation motor reactions back.
+		masktype graspMask = 0;
+		for (int c=0;c<m_nColliders;++c) graspMask |= m_pColliderConstraints[c];
+		vectorf grasp(zero);
+		for (int c=0;c<NMASKBITS && getmask(c)<=graspMask;++c) if (graspMask & getmask(c)) {
+			entity_contact &contact = m_pConstraints[c];
+			CPhysicalEntity* hand = contact.pent[1];
+			if (hand && hand->GetiForeignData()==PHYS_FOREIGN_ID_VR_BODY && !(contact.flags & contact_angular)) {
+				grasp += contact.solvedExternalImpulse;
+				contact.solvedExternalImpulse.zero();
+				m_npcLastGripTime = m_pWorld->GetPhysicsTime();
+			}
+		}
+		grasp.z = 0;
+		if (grasp.len2()>limit*limit) grasp *= limit/grasp.len();
+		m_npcGripImpulse += grasp;
+	}
 	int i,j,nCollJoints=0; 
+	float motorMaxSpeed = 0, motorMaxAngular = 0, motorMaxPivotError = 0;
+	int motorClamps = 0;
 	float e,minEnergy = m_nContacts>=m_nCollLyingMode ? m_EminLyingMode : m_Emin;
 	m_bAwake = (iszero(m_nContacts) & (m_bFloating^1)) | isneg(m_simTimeAux-0.5f);
 	m_bUsingUnproj = 0;
 	m_nStepBackCount = (m_nStepBackCount&-m_bSteppedBack)+m_bSteppedBack;
 
 	for(i=0;i<m_nJoints;i++) {
+		if (m_bExertImpulse && m_joints[i].hasAnimationPosition) {
+			RigidBody &body = m_joints[i].body;
+			motorMaxSpeed = max(motorMaxSpeed,body.v.len());
+			motorMaxAngular = max(motorMaxAngular,body.w.len());
+			// Contact impulses are applied after StepJoint's motor. Bound the
+			// actual solved velocities as well, keeping momenta consistent.
+			if (body.v.len2()>144.0f) {
+				const float scale = 12.0f/body.v.len(); body.v *= scale; body.P *= scale; ++motorClamps;
+			}
+			if (body.w.len2()>400.0f) {
+				const float scale = 20.0f/body.w.len(); body.w *= scale; body.L *= scale; ++motorClamps;
+			}
+			const ae_joint &joint = m_joints[i];
+			const vectorf parentPivot = joint.iParent >= 0 ?
+				m_joints[joint.iParent].body.pos+m_joints[joint.iParent].quat*joint.pivot[0] : m_posPivot;
+			motorMaxPivotError = max(motorMaxPivotError,(parentPivot-body.pos-joint.quat*joint.pivot[1]).len());
+		}
 		m_joints[i].dq *= damping;
 		m_joints[i].body.v*=damping; m_joints[i].body.w*=damping;
 		m_joints[i].body.P*=damping; m_joints[i].body.L*=damping;
@@ -2330,6 +2627,28 @@ if (m_joints[i].iParent>=0)	{
 		m_body.P.zero(); m_body.L.zero(); m_body.v.zero(); m_body.w.zero();
 	}
 
+	if (m_bExertImpulse) {
+		static int diagnosticId = -1, samples = 0;
+		static float elapsed = 0;
+		static float windowMaxSpeed = 0, windowMaxAngular = 0, windowMaxPivot = 0;
+		static int windowClamps = 0;
+		const int id = m_pWorld->GetPhysicalEntityId(this);
+		if (diagnosticId < 0) diagnosticId = id;
+		if (id == diagnosticId && samples < 24) {
+			elapsed += time_interval;
+			windowMaxSpeed = max(windowMaxSpeed,motorMaxSpeed);
+			windowMaxAngular = max(windowMaxAngular,motorMaxAngular);
+			windowMaxPivot = max(windowMaxPivot,motorMaxPivotError);
+			windowClamps += motorClamps;
+			if (elapsed >= .25f) {
+				elapsed = 0; ++samples;
+				VRPhysicsTrace("[VRNPCSolver] sample=%d id=%d dt=%.5f mode=%d joints=%d contacts=%d dynamicContacts=%d maxV=%.4f maxW=%.4f maxPivotError=%.5f clamps=%d host=(%.3f %.3f %.3f)",
+					samples,id,time_interval,m_iSimTypeCur,m_nJoints,m_nContacts,m_nDynContacts,
+					windowMaxSpeed,windowMaxAngular,windowMaxPivot,windowClamps,m_posPivot.x,m_posPivot.y,m_posPivot.z);
+				windowMaxSpeed = windowMaxAngular = windowMaxPivot = 0; windowClamps = 0;
+			}
+		}
+	}
 	return (m_bAwake^1) | isneg(m_timeStepFull-m_timeStepPerformed-0.001f);
 }
 

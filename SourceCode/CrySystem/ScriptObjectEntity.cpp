@@ -1817,6 +1817,36 @@ int CScriptObjectEntity::SetEntityPhysicParams(IPhysicalEntity *pe, IFunctionHan
 			pTable->GetValue("angular_softness_group", sim_params.softnessAngularGroup);
 			pTable->GetValue("mass", sim_params.mass);
 			pTable->GetValue("density", sim_params.density);
+			if (pe->GetType()==PE_RIGID && pe->GetiForeignData()!=PHYS_FOREIGN_ID_VR_BODY) {
+				ICVar* propScale = m_pISystem->GetIConsole()->GetCVar("vr_prop_mass_scale");
+				if (propScale) {
+					const float scale = max(.05f,propScale->GetFVal());
+					if (!is_unused(sim_params.mass) && sim_params.mass>0) sim_params.mass *= scale;
+					if (!is_unused(sim_params.density) && sim_params.density>0) sim_params.density *= scale;
+					// Very small legacy props can inherit arbitrary gameplay masses.
+					// Bound those by a water-density estimate of collision volume.
+					float volume = 0;
+					pe_status_nparts count; const int parts = pe->GetStatus(&count);
+					for (int i=0;i<parts;++i) {
+						pe_params_part part; part.ipart = i;
+						if (pe->GetParams(&part) && part.mass>0 && part.pPhysGeomProxy)
+							volume += max(0.0f,part.pPhysGeomProxy->V)*part.scale*part.scale*part.scale;
+					}
+					if (volume>0 && volume<=.002f) {
+						if (!is_unused(sim_params.mass) && sim_params.mass>0) sim_params.mass = min(sim_params.mass,max(.05f,volume*1000.0f));
+						if (!is_unused(sim_params.density) && sim_params.density>0) sim_params.density = min(sim_params.density,1000.0f);
+					}
+					IStatObj* object = m_pEntity->GetIStatObj(0);
+					const char* model = object ? object->GetFileName() : NULL;
+					const bool dynamic = (!is_unused(sim_params.mass) && sim_params.mass>0) ||
+						(!is_unused(sim_params.density) && sim_params.density>0);
+					if (model && dynamic) {
+						const bool can = strstr(model,"softdrink_can_")!=NULL;
+						const bool box = strstr(model,"box_small_")!=NULL || strstr(model,"box_bananas")!=NULL;
+						if (can || box) { sim_params.mass = can ? .35f : .5f; sim_params.density = -1; }
+					}
+				}
+			}
 			//if (pTable->GetValue("water_density",fDummy))
 			//	m_pEntity->SetWaterDensity(fDummy);
 

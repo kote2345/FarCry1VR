@@ -37,6 +37,10 @@ struct ae_joint {
 	ae_joint() { 
 		nChildren=nChildrenTree=0; iParent=-2; idbody=-1;
 		q.zero(); qext.zero(); dq.zero(); dqext.zero(); ddq.zero();
+		animationTarget.SetIdentity(); animationVelocity.zero(); hasAnimationTarget = false;
+		animationPosition.zero(); animationLinearVelocity.zero(); hasAnimationPosition = false;
+		animationRotation.SetIdentity();
+		damageMotorTime = 0;
 		MARK_UNUSED dq_req.x,dq_req.y,dq_req.z; dq_limit.zero();
 		bounciness.zero(); ks.zero(); kd.zero(); 
 		qdashpot.zero(); kdashpot.zero();
@@ -66,6 +70,13 @@ struct ae_joint {
 	vectorf qext;
 	vectorf dq;
 	vectorf dqext;
+	quaternionf animationTarget;
+	vectorf animationVelocity;
+	bool hasAnimationTarget;
+	vectorf animationPosition,animationLinearVelocity;
+	quaternionf animationRotation;
+	bool hasAnimationPosition;
+	float damageMotorTime;
 	vectorf dq_req;
 	vectorf dq_limit;
 	vectorf ddq;
@@ -157,6 +168,7 @@ class CArticulatedEntity : public CRigidEntity, public IRigidBodyOwner {
 	virtual void RecomputeMassDistribution(int ipart=-1,int bMassChanged=1);
 
 	void SyncWithHost(int bRecalcJoints,float time_interval);
+	void InitializeMotorJoint(int idx);
 	void SyncBodyWithJoint(int idx, int flags=3);
 	void SyncJointWithBody(int idx, int flags=1);
 	void UpdateJointRotationAxes(int idx);
@@ -192,6 +204,12 @@ class CArticulatedEntity : public CRigidEntity, public IRigidBodyOwner {
 	int m_bCheckCollisions;
 	int m_bCollisionResp;
 	int m_bExertImpulse;
+	vectorf m_npcGripImpulse,m_npcContactImpulse;
+	vectorf m_npcDamageImpulse;
+	float m_npcLastGripTime;
+	bool m_motorHostValid;
+	vectorf m_motorHostPosition;
+	quaternionf m_motorHostRotation;
 	int m_iSimType,m_iSimTypeLyingMode;
 	int m_iSimTypeCur;
 	int m_iSimTypeOverride;
