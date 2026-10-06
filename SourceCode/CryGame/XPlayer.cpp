@@ -1112,20 +1112,37 @@ void CPlayer::AutoAiming()
 */
 bool CPlayer::EnsurePhysicalNPCDamageRig()
 {
+	if (!EnsurePhysicalNPCRig()) return false;
+	m_vrNPCDamageActiveUntil = m_pTimer->GetCurrTime()+1.2f;
+	return true;
+}
+
+bool CPlayer::EnsurePhysicalNPCRig()
+{
 	if (!IsAI() || !IsAlive() || !m_pEntity->GetPhysics() || m_pEntity->GetPhysics()->GetType()!=PE_LIVING) return false;
 	Matrix34 controller;
 	if (!m_pGame->GetSystem()->GetVRControllerTransform(true,controller) &&
 		!m_pGame->GetSystem()->GetVRControllerTransform(false,controller)) return false;
 	ICryCharInstance* character = m_pEntity->GetCharInterface()->GetCharacter(0);
 	if (!character) return false;
-	if (!character->GetCharacterPhysics()) {
+	pe_status_nparts rigParts;
+	if (!character->GetCharacterPhysics() || character->GetCharacterPhysics()->GetStatus(&rigParts)<=0) {
 		pe_status_dynamics dynamics;
 		const float mass = m_pEntity->GetPhysics()->GetStatus(&dynamics) ? max(1.0f,dynamics.mass) : 80.0f;
 		m_pEntity->GetCharInterface()->PhysicalizeCharacter(0,mass,-1,1.0f,true);
 	}
 	if (!character->GetCharacterPhysics()) return false;
-	m_vrNPCDamageActiveUntil = m_pTimer->GetCurrTime()+1.2f;
+	pe_status_pos rigPose;
+	if (character->GetCharacterPhysics()->GetStatus(&rigPose) && rigPose.iSimClass<0)
+		m_pGame->GetSystem()->GetIPhysicalWorld()->DestroyPhysicalEntity(character->GetCharacterPhysics(),2);
+	pe_params_articulated_body rigState;
+	if (character->GetCharacterPhysics()->GetParams(&rigState) && rigState.pHost!=m_pEntity->GetPhysics()) {
+		pe_params_articulated_body host;
+		host.pHost = m_pEntity->GetPhysics();
+		character->GetCharacterPhysics()->SetParams(&host);
+	}
 	character->SetActiveRagdoll(true);
+	m_pEntity->SetNeedUpdate(true);
 	m_pEntity->NeedsUpdateCharacter(0,true);
 	return true;
 }
@@ -1153,7 +1170,9 @@ void CPlayer::Update()
 				m_pGame->GetSystem()->GetVRControllerTransform(false, controller);
 			// Visible NPCs stay physical at any distance. Keep nearby actors
 			// active behind the player as well, so turning does not drop a grab.
-			const bool nearby = vr && (bPlayerVisible || (m_pEntity->GetPos()-m_pGame->GetSystem()->GetViewCamera().GetPos()).GetLengthSquared() < 64.0f ||
+			IEntity* localPlayer = m_pGame->GetMyPlayer();
+			const Vec3 interactionOrigin = localPlayer ? localPlayer->GetPos() : m_pGame->GetSystem()->GetViewCamera().GetPos();
+			const bool nearby = vr && (bPlayerVisible || (m_pEntity->GetPos()-interactionOrigin).GetLengthSquared() < 64.0f ||
 				m_vrNPCDamageActiveUntil > m_pTimer->GetCurrTime());
 			if (nearby && !character->GetCharacterPhysics())
 			{

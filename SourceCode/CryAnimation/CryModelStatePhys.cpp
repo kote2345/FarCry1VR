@@ -130,7 +130,12 @@ void CryModelState::BuildPhysicalEntity(IPhysicalEntity *pent,float mass,int sur
 IPhysicalEntity *CryModelState::CreateCharacterPhysics(IPhysicalEntity *pHost, float mass,int surface_idx,float stiffness_scale, 
 								  																		 float scale,Vec3d offset, int nLod)
 {
+	// Build the replacement from animation, never from stretched physical
+	// readback left by the previous rig. Its caches belong to that rig only.
+	RestoreActiveRagdollAnimation();
 	m_bActiveRagdoll = false;
+	m_activeRagdollAnimationPose.clear();
+	m_activeRagdollOriginalJoints.clear();
 	if (m_pCharPhysics) {
 		GetPhysicalWorld()->DestroyPhysicalEntity(m_pCharPhysics);
 		m_pCharPhysics = 0;
@@ -504,7 +509,12 @@ void CryModelState::SetActiveRagdoll(bool enabled)
 		pe_params_articulated_body state; pe_status_pos pose;
 		if (m_pCharPhysics->GetParams(&state) && m_pCharPhysics->GetStatus(&pose) &&
 			state.bExertImpulse && state.bCheckCollisions && state.bCollisionResp &&
-			state.iSimType==1 && pose.iSimClass>0 && pose.iSimClass<3) return;
+			state.iSimType==1 && pose.iSimClass>0 && pose.iSimClass<3) {
+			// A retained active mode can still belong to a sleeping rig after
+			// visibility stopped character updates. Wake it before returning.
+			pe_action_awake awake; awake.bAwake = 1; m_pCharPhysics->Action(&awake);
+			return;
+		}
 		// A cached active flag cannot override a streamed/suspended native rig.
 		// Reapply its mode while preserving the saved authored joint settings.
 	}
@@ -515,6 +525,10 @@ void CryModelState::SetActiveRagdoll(bool enabled)
 		for (size_t i=0; i<m_activeRagdollOriginalJoints.size(); ++i)
 		{
 			pe_params_joint original = m_activeRagdollOriginalJoints[i];
+			// GetParams captured these frames before the body moved. Replaying
+			// their world pivot against today's bodies corrupts local anchors.
+			// Restore authored settings without rewriting joint attachment frames.
+			MARK_UNUSED original.pivot,original.q0,original.q,original.qext;
 			original.bNoUpdate = 1;
 			m_pCharPhysics->SetParams(&original);
 		}
@@ -541,9 +555,9 @@ void CryModelState::SetActiveRagdoll(bool enabled)
 	simulation.gravityFreefall = simulation.gravity;
 	simulation.damping = simulation.dampingFreefall = .3f;
 	m_pCharPhysics->SetParams(&simulation);
-	if (enabled && !repair)
+	if (enabled)
 	{
-		m_activeRagdollOriginalJoints.clear();
+		if (!repair) m_activeRagdollOriginalJoints.clear();
 		// The authored living rig was built as an animation collider. Clear its
 		// kinematic-only flags before enabling dynamic body/joint solving.
 		for (int i = 0; i < (int)numBones(); ++i)
@@ -556,7 +570,7 @@ void CryModelState::SetActiveRagdoll(bool enabled)
 			for (int axis=0; axis<3; ++axis)
 				if ((original.flags & angle0_auto_kd<<axis) && original.ks[axis] > 0)
 					original.kd[axis] /= 2.0f*sqrt_tpl(original.ks[axis]);
-			m_activeRagdollOriginalJoints.push_back(original);
+			if (!repair) m_activeRagdollOriginalJoints.push_back(original);
 			// Flags must not rewrite pivots/rest angles from dormant bodies.
 			MARK_UNUSED joint.pivot,joint.q0,joint.q,joint.qext;
 			joint.flags |= angle0_auto_kd*7;
@@ -1017,7 +1031,12 @@ IPhysicalEntity *CryModelState::GetCharacterPhysics(int iAuxPhys)
 
 void CryModelState::DestroyCharacterPhysics(int iMode)
 {
-	if (iMode == 0) m_bActiveRagdoll = false;
+	if (iMode == 0) {
+		RestoreActiveRagdollAnimation();
+		m_bActiveRagdoll = false;
+		m_activeRagdollAnimationPose.clear();
+		m_activeRagdollOriginalJoints.clear();
+	}
 	if (m_pCharPhysics)
 		GetPhysicalWorld()->DestroyPhysicalEntity(m_pCharPhysics,iMode);
 	if (iMode==0)

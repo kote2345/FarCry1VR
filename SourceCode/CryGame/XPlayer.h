@@ -434,6 +434,7 @@ public:
 	void	InitWeapons();
 	bool	IsAI() const { return m_bIsAI; }
 	bool EnsurePhysicalNPCDamageRig();
+	bool EnsurePhysicalNPCRig();
 	void UpdateVRBodyPhysics();
 	bool	IsMyPlayer() const;
 	bool	IsFirstPerson() const;

@@ -62,6 +62,7 @@ private:
 	void Release(int hand, bool trackingLost = false);
 	void Fire(int hand, bool pressed);
 	void UpdateProximityHaptics();
+	void CollectNearbyNPCRigs(const Vec3& center, float radius, std::vector<IPhysicalEntity*>& rigs);
 	void ReturnToHolster(Item& item);
 	void DestroyBody(Item& item);
 	bool DropBody(Item& item, const Vec3& velocity, const Vec3& angularVelocity);
@@ -89,5 +90,6 @@ private:
 	Matrix34 m_body;
 	bool m_active;
 	float m_nextInventorySync;
+	float m_nextNPCRefresh = 0;
 };
 #endif

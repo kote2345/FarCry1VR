@@ -1062,9 +1062,17 @@ void CEntity::Update( SEntityUpdateContext &ctx )
 		OnVisibilityChange(m_bVisible);
 
 	// check if entity logic passes selected visibility test
+	bool activeCharacterPhysics = false;
+	if (m_physic && m_physic->GetType()==PE_LIVING) {
+		for (int k=0;k<m_nMaxCharNum && !activeCharacterPhysics;++k) if (m_pCryCharInstance[k]) {
+			IPhysicalEntity* rig = m_pCryCharInstance[k]->GetCharacterPhysics();
+			pe_params_articulated_body mode;
+			activeCharacterPhysics = rig && rig->GetParams(&mode) && mode.bExertImpulse;
+		}
+	}
 	if (m_eUpdateVisLevel && m_eUpdateVisLevel!=eUT_PhysicsPostStep && m_pEntitySystem->m_pVisCheckForUpdate->GetIVal())
 	{
-		if (!CheckUpdateVisLevel( ctx,m_eUpdateVisLevel ))
+		if (!activeCharacterPhysics && !CheckUpdateVisLevel( ctx,m_eUpdateVisLevel ))
 		{
 			return;
 		}

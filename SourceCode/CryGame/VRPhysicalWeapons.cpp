@@ -1132,6 +1132,32 @@ bool CVRPhysicalWeapons::IsOwnBody(IPhysicalEntity* body) const
 }
 
 // Force-based grab: the object remains simulated, with contacts and gravity.
+void CVRPhysicalWeapons::CollectNearbyNPCRigs(const Vec3& center, float radius,
+	std::vector<IPhysicalEntity*>& rigs)
+{
+	IPhysicalWorld* physics = m_player.m_pGame->GetSystem()->GetIPhysicalWorld();
+	IPhysicalEntity** found = NULL;
+	const Vec3 extent(radius,radius,radius);
+	const int count = physics->GetEntitiesInBox(center-extent,center+extent,found,ent_living);
+	std::vector<IPhysicalEntity*> hosts;
+	for (int i=0;i<count;++i) hosts.push_back(found[i]);
+	// Rebuilding a streamed rig can modify the physics query scratch array.
+	for (size_t i=0;i<hosts.size();++i)
+	{
+		IPhysicalEntity* host = hosts[i];
+		if (host->GetiForeignData()!=OT_ENTITY) continue;
+		IEntity* entity = static_cast<IEntity*>(host->GetForeignData(OT_ENTITY));
+		if (!entity || entity==m_player.GetEntity() || entity->IsHidden() ||
+			(entity->GetPos()-center).GetLengthSquared()>radius*radius) continue;
+		CPlayer* actor = NULL;
+		if (!entity->GetContainer() || !entity->GetContainer()->QueryContainerInterface(CIT_IPLAYER,(void**)&actor) ||
+			!actor || !actor->EnsurePhysicalNPCRig()) continue;
+		ICryCharInstance* character = entity->GetCharInterface()->GetCharacter(0);
+		IPhysicalEntity* rig = character ? character->GetCharacterPhysics() : NULL;
+		if (rig && std::find(rigs.begin(),rigs.end(),rig)==rigs.end()) rigs.push_back(rig);
+	}
+}
+
 void CVRPhysicalWeapons::GrabProp(int hand)
 {
 	Hand& state = m_hands[hand];
@@ -1144,6 +1170,9 @@ void CVRPhysicalWeapons::GrabProp(int hand)
 		list, ent_rigid | ent_sleeping_rigid | ent_independent);
 	std::vector<IPhysicalEntity*> candidates;
 	if (count > 0) candidates.assign(list, list+count);
+	// The living host remains discoverable even if its character rig has
+	// just been recreated or dropped out of the articulated broad phase.
+	CollectNearbyNPCRigs(center,2.0f,candidates);
 	float nearest = .16f*.16f;
 	for (size_t i = 0; i < candidates.size(); ++i)
 	{
@@ -1462,6 +1491,12 @@ void CVRPhysicalWeapons::Update()
 	m_player.GetEntity()->GetScriptObject()->SetValue("VRPhysicalWeapons", m_active ? 1 : 0);
 	UpdateBody();
 	const float now = m_player.m_pTimer->GetCurrTime();
+	if (m_active && anyTracked && now>=m_nextNPCRefresh)
+	{
+		std::vector<IPhysicalEntity*> rigs;
+		CollectNearbyNPCRigs(m_player.GetEntity()->GetPos(),8.0f,rigs);
+		m_nextNPCRefresh = now+.2f;
+	}
 	if (now >= m_nextInventorySync)
 	{ SyncInventory(); m_nextInventorySync = now + 0.5f; }
 	IEntitySystem* entities = system->GetIEntitySystem();
