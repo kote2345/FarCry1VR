@@ -60,6 +60,11 @@ bool CSystem::GetVRFingerInput(bool left, float& grip, float& trigger) const
     trigger = state.triggerAmount;
     return state.poseValid && state.active;
 }
+
+bool CSystem::PulseVRController(bool left, float amplitude, float seconds)
+{
+    return m_vrRuntime.PulseController(left, amplitude, seconds);
+}
 #include "System.h"
 
 #ifndef _XBOX

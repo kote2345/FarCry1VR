@@ -22,6 +22,8 @@ private:
 	std::vector<Part*> m_parts;
 	bool m_handBlocked[2];
 	Vec3 m_handPosition[2];
+	bool m_separatedHand[2];
+	Vec3 m_recoveredWrist[2];
 	Vec3 m_shoulderOffset[2];
 	bool m_reachValid[2];
 	int m_armConstraints[2][4];

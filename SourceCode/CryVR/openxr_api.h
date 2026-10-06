@@ -67,6 +67,8 @@ enum {
     XR_TYPE_SESSION_BEGIN_INFO = 10,
     XR_TYPE_VIEW_STATE = 11,
     XR_TYPE_FRAME_END_INFO = 12,
+    XR_TYPE_HAPTIC_VIBRATION = 13,
+    XR_TYPE_HAPTIC_ACTION_INFO = 59,
     XR_TYPE_EVENT_DATA_BUFFER = 16,
     XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED = 18,
     XR_TYPE_ACTION_STATE_BOOLEAN = 23,
@@ -119,6 +121,7 @@ enum {
     XR_ACTION_TYPE_FLOAT_INPUT = 2,
     XR_ACTION_TYPE_VECTOR2F_INPUT = 3,
     XR_ACTION_TYPE_POSE_INPUT = 4,
+    XR_ACTION_TYPE_VIBRATION_OUTPUT = 100,
     XR_SPACE_LOCATION_POSITION_VALID_BIT = 1,
     XR_SPACE_LOCATION_ORIENTATION_VALID_BIT = 2,
     XR_VIEW_STATE_ORIENTATION_VALID_BIT = 1,
@@ -453,6 +456,24 @@ typedef XrResult (*PFN_xrSuggestInteractionProfileBindings)(XrInstance, const Xr
 typedef XrResult (*PFN_xrAttachSessionActionSets)(XrSession, const XrSessionActionSetsAttachInfo*);
 typedef XrResult (*PFN_xrCreateActionSpace)(XrSession, const XrActionSpaceCreateInfo*, XrSpace*);
 typedef XrResult (*PFN_xrSyncActions)(XrSession, const XrActionsSyncInfo*);
+typedef struct XrHapticActionInfo {
+    XrStructureType type;
+    const void* next;
+    XrAction action;
+    XrPath subactionPath;
+} XrHapticActionInfo;
+typedef struct XrHapticBaseHeader {
+    XrStructureType type;
+    const void* next;
+} XrHapticBaseHeader;
+typedef struct XrHapticVibration {
+    XrStructureType type;
+    const void* next;
+    XrDuration duration;
+    float frequency;
+    float amplitude;
+} XrHapticVibration;
+typedef XrResult (*PFN_xrApplyHapticFeedback)(XrSession, const XrHapticActionInfo*, const XrHapticBaseHeader*);
 typedef XrResult (*PFN_xrGetActionStateBoolean)(XrSession, const XrActionStateGetInfo*, XrActionStateBoolean*);
 typedef XrResult (*PFN_xrGetActionStateFloat)(XrSession, const XrActionStateGetInfo*, XrActionStateFloat*);
 typedef XrResult (*PFN_xrGetActionStateVector2f)(XrSession, const XrActionStateGetInfo*, XrActionStateVector2f*);

@@ -93,6 +93,7 @@ public:
     const char* GetLastError() const { return m_lastError; }
     const ControllerState& GetLeftController() const { return m_leftController; }
     const ControllerState& GetRightController() const { return m_rightController; }
+    bool PulseController(bool left, float amplitude, float seconds);
 
 private:
     bool LoadLoader();
@@ -129,6 +130,7 @@ private:
     PFN_xrCreateActionSpace m_createActionSpace = nullptr;
     PFN_xrLocateSpace m_locateSpace = nullptr;
     PFN_xrSyncActions m_syncActions = nullptr;
+    PFN_xrApplyHapticFeedback m_applyHapticFeedback = nullptr;
     PFN_xrGetActionStateBoolean m_getBoolean = nullptr;
     PFN_xrGetActionStateFloat m_getFloat = nullptr;
     PFN_xrGetActionStateVector2f m_getVector2 = nullptr;
@@ -156,6 +158,7 @@ private:
     XrAction m_useAction = XR_NULL_HANDLE;
     XrAction m_moveAction = XR_NULL_HANDLE;
     XrAction m_gripPoseAction = XR_NULL_HANDLE;
+    XrAction m_hapticAction = XR_NULL_HANDLE;
     XrSpace m_gripSpaces[2]{};
     XrPath m_leftHandPath = 0;
     XrPath m_rightHandPath = 0;

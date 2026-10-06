@@ -1201,6 +1201,15 @@ void CEntity::UpdateCharacters( SEntityUpdateContext &ctx )
 		return;
 
 	bool bProcess=m_bVisible;
+	// An active animation-driven rig needs fresh targets even when its actor
+	// was not rendered. Visibility must not suspend only half of the system.
+	if (!bProcess && m_physic && m_physic->GetType()==PE_LIVING) {
+		for (int k=0;k<m_nMaxCharNum && !bProcess;++k) if (m_pCryCharInstance[k]) {
+			IPhysicalEntity* rig = m_pCryCharInstance[k]->GetCharacterPhysics();
+			pe_params_articulated_body state;
+			if (rig && rig->GetParams(&state) && state.bExertImpulse) bProcess = true;
+		}
+	}
 
 	IGame *pGame = GetISystem()->GetIGame();
 

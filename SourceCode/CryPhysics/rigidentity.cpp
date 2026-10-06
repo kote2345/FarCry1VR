@@ -383,9 +383,14 @@ int CRigidEntity::GetStatus(pe_status *_status)
 		status->count = 0;
 		for (int i=0; i<NMASKBITS && status->count<8; ++i) if (mask & getmask(i)) {
 			const vectorf normal = m_pContacts[i].n;
+			IPhysicalEntity* collider = m_pContacts[i].pent[0]==this ? m_pContacts[i].pent[1] : m_pContacts[i].pent[0];
 			bool duplicate = false;
-			for (int j=0; j<status->count; ++j) duplicate |= (normal*status->normals[j]) > .99f;
-			if (!duplicate) status->normals[status->count++] = normal;
+			for (int j=0; j<status->count; ++j)
+				duplicate |= status->colliders[j]==collider && (normal*status->normals[j]) > .99f;
+			if (!duplicate) {
+				status->colliders[status->count] = collider;
+				status->normals[status->count++] = normal;
+			}
 		}
 		return status->count;
 	}

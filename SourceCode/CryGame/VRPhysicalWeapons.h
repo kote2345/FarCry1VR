@@ -21,6 +21,7 @@ public:
 	IPhysicalEntity* GetHeldPropPhysics(int hand) const;
 	void LimitNPCGripMovement(Vec3& velocity);
 	bool HasPhysicalGrip(int hand) const;
+	bool CanRecoverHand(int hand) const;
 	bool GetGripTrackingRotation(int hand, Quat& rotation, Vec3* angularVelocity = NULL) const;
 	bool GetGripTrackingPose(int hand, Matrix34& pose) const;
 	bool IsActive() const { return m_active; }
@@ -50,6 +51,9 @@ private:
 		Quat gripObjectRotation;
 		float nextGripTrace;
 		int gripTraceCount;
+		bool nearWeapon = false;
+		float nextProximityScan = 0;
+		float shotHapticUntil = 0;
 	};
 	void SyncInventory();
 	void UpdateBody();
@@ -57,6 +61,7 @@ private:
 	void Grab(int hand, bool scanWorld = true);
 	void Release(int hand, bool trackingLost = false);
 	void Fire(int hand, bool pressed);
+	void UpdateProximityHaptics();
 	void ReturnToHolster(Item& item);
 	void DestroyBody(Item& item);
 	bool DropBody(Item& item, const Vec3& velocity, const Vec3& angularVelocity);

@@ -658,6 +658,80 @@ void CVRPhysicalWeapons::Release(int hand, bool trackingLost)
 	SaveMagazine(*item);
 }
 
+void CVRPhysicalWeapons::UpdateProximityHaptics()
+{
+	ISystem* system = m_player.m_pGame->GetSystem();
+	const float now = m_player.m_pTimer->GetCurrTime();
+	bool scan[2] = {false,false};
+	float distances[2] = {10000,10000};
+	for (int hand=0; hand<2; ++hand)
+	{
+		Hand& state = m_hands[hand];
+		if (!m_active || !m_player.IsAlive() || !state.tracked)
+		{ state.nearWeapon = false; state.nextProximityScan = 0; continue; }
+		if (now < state.nextProximityScan) continue;
+		state.nextProximityScan = now+.08f;
+		scan[hand] = true;
+		const Vec3 position = state.pose.GetTranslation();
+		for (size_t i=0; i<m_items.size(); ++i)
+		{
+			Item& item = *m_items[i];
+			if (item.state==Item::Consumed) continue;
+			if (item.personal)
+				distances[hand] = min(distances[hand],(position-HolsterPose(item.slot).GetTranslation()).GetLengthSquared());
+			if (item.state==Item::Held && item.holder==hand) continue;
+			CWeaponClass* weapon = Weapon(item);
+			IStatObj* object = weapon ? weapon->GetObject() : NULL;
+			if (!object) continue;
+			Matrix34 model = item.model;
+			if (item.state==Item::Holstered) model = StaticModelPose(object,HolsterPose(item.slot));
+			else if (item.state==Item::Held && !HeldModel(item.holder,m_hands[item.holder].pose,model)) continue;
+			const Vec3 local = model.GetInverted()*position;
+			const Vec3 lo = object->GetBoxMin(), hi = object->GetBoxMax();
+			const Vec3 closest = model*Vec3(max(lo.x,min(hi.x,local.x)),max(lo.y,min(hi.y,local.y)),max(lo.z,min(hi.z,local.z)));
+			distances[hand] = min(distances[hand],(position-closest).GetLengthSquared());
+		}
+	}
+	if (!scan[0] && !scan[1]) return;
+	// Query nearby physical entities instead of walking the whole level.
+	// Copy the world scratch list before inspecting individual entities.
+	for (int hand=0; hand<2; ++hand) if (scan[hand])
+	{
+		const Vec3 p = m_hands[hand].pose.GetTranslation();
+		const Vec3 extent(.3f,.3f,.3f);
+		IPhysicalEntity** found = NULL;
+		const int count = system->GetIPhysicalWorld()->GetEntitiesInBox(p-extent,p+extent,found,
+			ent_static|ent_rigid|ent_sleeping_rigid|ent_independent);
+		std::vector<IPhysicalEntity*> nearby;
+		for (int i=0; i<count; ++i) nearby.push_back(found[i]);
+		for (size_t n=0; n<nearby.size(); ++n)
+		{
+			IPhysicalEntity* body = nearby[n];
+			if (body->GetiForeignData()!=OT_ENTITY) continue;
+			IEntity* entity = static_cast<IEntity*>(body->GetForeignData(OT_ENTITY));
+			if (!entity || entity->IsHidden()) continue;
+			const char* name = entity->GetEntityClassName();
+			if (!name || strncmp(name,"Pickup",6) || !m_player.m_pGame->GetWeaponSystemEx()->GetWeaponClassByName(name+6)) continue;
+			bool tracked = false;
+			for (size_t i=0; i<m_items.size(); ++i)
+				if (m_items[i]->entity==entity->GetId()) { tracked=true; break; }
+			if (tracked) continue;
+			Vec3 lo,hi; entity->GetBBox(lo,hi);
+			const Vec3 closest(max(lo.x,min(hi.x,p.x)),max(lo.y,min(hi.y,p.y)),max(lo.z,min(hi.z,p.z)));
+			distances[hand] = min(distances[hand],(p-closest).GetLengthSquared());
+		}
+	}
+	for (int hand=0; hand<2; ++hand) if (scan[hand])
+	{
+		Hand& state = m_hands[hand];
+		const float radius = state.nearWeapon ? .26f : .20f;
+		const bool near = distances[hand] < radius*radius;
+		if (near && !state.nearWeapon && now>=state.shotHapticUntil)
+			system->PulseVRController(hand==0,.25f,.02f);
+		state.nearWeapon = near;
+	}
+}
+
 void CVRPhysicalWeapons::Fire(int hand, bool pressed)
 {
 	Item* item = m_hands[hand].item;
@@ -744,6 +818,11 @@ void CVRPhysicalWeapons::Fire(int hand, bool pressed)
 			m_player.m_vrPhysicalFireAngles = RAD2DEG(Ang3::GetAnglesXYZ(Matrix33(muzzle)));
 			const int shots = weapon->Fire(muzzle.GetTranslation(),
 				m_player.m_vrPhysicalFireAngles, &m_player, item->fire, NULL);
+			if (shots > 0 && mode.iFireModeType != FireMode_Melee)
+			{
+				m_player.m_pGame->GetSystem()->PulseVRController(hand == 0, .8f, .035f);
+				m_hands[hand].shotHapticUntil = m_player.m_pTimer->GetCurrTime()+.035f;
+			}
 			// Scripts normally debit the clip. Keep native magazines correct for
 			// modes whose scripts do not update the cached value.
 			if (!mode.no_ammo && item->ammoType != "Unlimited")
@@ -1184,6 +1263,13 @@ bool CVRPhysicalWeapons::HasPhysicalGrip(int hand) const
 	return hand>=0 && hand<2 && m_hands[hand].gripConstraint>0 && m_hands[hand].gripAngularConstraint>0;
 }
 
+bool CVRPhysicalWeapons::CanRecoverHand(int hand) const
+{
+	// Weapons, magazines and slides do not create a physical prop grip.
+	return hand>=0 && hand<2 && m_hands[hand].propID<0 &&
+		m_hands[hand].gripConstraint==0 && m_hands[hand].gripAngularConstraint==0;
+}
+
 bool CVRPhysicalWeapons::GetGripTrackingRotation(int hand, Quat& rotation, Vec3* angularVelocity) const
 {
 	if (!HasPhysicalGrip(hand) || !m_hands[hand].tracked) return false;
@@ -1520,6 +1606,7 @@ void CVRPhysicalWeapons::Update()
 		state.gripDown = grip; state.triggerDown = trigger;
 	}
 	// Evaluate slide acquisition after both hands and weapon poses are updated.
+	UpdateProximityHaptics();
 	// A held grip can engage when the free hand reaches the slide; it need not
 	// be pressed in the acquisition radius on precisely one input frame.
 	for (int hand = 0; hand < 2; ++hand)

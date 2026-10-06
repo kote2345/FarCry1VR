@@ -775,6 +775,7 @@ struct pe_status_contact_normals : pe_status {
 	pe_status_contact_normals() { type=type_id; count=0; }
 	int count;
 	vectorf normals[8];
+	IPhysicalEntity* colliders[8];
 };
 
 struct pe_status_collisions : pe_status {

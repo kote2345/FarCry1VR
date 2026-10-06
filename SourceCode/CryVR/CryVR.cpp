@@ -154,6 +154,7 @@ bool Runtime::LoadInstanceFunctions()
     XR_LOAD(createActionSpace, "xrCreateActionSpace")
     XR_LOAD(locateSpace, "xrLocateSpace")
     XR_LOAD(syncActions, "xrSyncActions")
+    XR_LOAD(applyHapticFeedback, "xrApplyHapticFeedback")
     XR_LOAD(getBoolean, "xrGetActionStateBoolean")
     XR_LOAD(getFloat, "xrGetActionStateFloat")
 	XR_LOAD(getVector2, "xrGetActionStateVector2f")
@@ -370,6 +371,15 @@ bool Runtime::CreateActions()
     const XrPath hands[] = { m_leftHandPath, m_rightHandPath };
     const XrPath* handSubactions = hands;
 
+    XrActionCreateInfo hapticInfo{};
+    hapticInfo.type = XR_TYPE_ACTION_CREATE_INFO;
+    strcpy(hapticInfo.actionName, "haptic");
+    strcpy(hapticInfo.localizedActionName, "Controller vibration");
+    hapticInfo.actionType = XR_ACTION_TYPE_VIBRATION_OUTPUT;
+    hapticInfo.countSubactionPaths = 2;
+    hapticInfo.subactionPaths = hands;
+    if (!Check(m_createAction(m_gameplayActionSet, &hapticInfo, &m_hapticAction), "xrCreateAction(haptic)")) return false;
+
     XrActionCreateInfo selectInfo{};
     selectInfo.type = XR_TYPE_ACTION_CREATE_INFO;
     strcpy(selectInfo.actionName, "select");
@@ -462,8 +472,14 @@ bool Runtime::CreateActions()
         XrInteractionProfileSuggestedBinding suggested{};
         suggested.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
         suggested.interactionProfile = profilePath;
-        suggested.countSuggestedBindings = count;
-        suggested.suggestedBindings = bindings;
+        std::vector<XrActionSuggestedBinding> outputs(bindings, bindings+count);
+        XrPath leftHaptic = 0, rightHaptic = 0;
+        m_stringToPath(m_instance, "/user/hand/left/output/haptic", &leftHaptic);
+        m_stringToPath(m_instance, "/user/hand/right/output/haptic", &rightHaptic);
+        outputs.push_back({m_hapticAction, leftHaptic});
+        outputs.push_back({m_hapticAction, rightHaptic});
+        suggested.countSuggestedBindings = static_cast<uint32_t>(outputs.size());
+        suggested.suggestedBindings = outputs.data();
         // Unsupported profiles are expected: the runtime chooses one that
         // matches connected hardware and ignores unrelated profiles.
         const XrResult result = m_suggestBindings(m_instance, &suggested);
@@ -887,6 +903,23 @@ bool Runtime::EndFrame(const XrCompositionLayerBaseHeader* const* layers, uint32
     return Check(m_endFrame(m_session, &endInfo), "xrEndFrame");
 }
 
+bool Runtime::PulseController(bool left, float amplitude, float seconds)
+{
+    if (!m_sessionRunning || !m_session || !m_hapticAction || !m_applyHapticFeedback ||
+        !(amplitude > 0.0f) || !(seconds > 0.0f)) return false;
+    XrHapticActionInfo info{};
+    info.type = XR_TYPE_HAPTIC_ACTION_INFO;
+    info.action = m_hapticAction;
+    info.subactionPath = left ? m_leftHandPath : m_rightHandPath;
+    XrHapticVibration vibration{};
+    vibration.type = XR_TYPE_HAPTIC_VIBRATION;
+    vibration.amplitude = amplitude < 1.0f ? amplitude : 1.0f;
+    vibration.duration = static_cast<XrDuration>((seconds < 1.0f ? seconds : 1.0f)*1000000000.0);
+    vibration.frequency = 0.0f; // Runtime chooses the supported frequency.
+    return m_applyHapticFeedback(m_session, &info,
+        reinterpret_cast<const XrHapticBaseHeader*>(&vibration)) == XR_SUCCESS;
+}
+
 void Runtime::Shutdown()
 {
     if (m_sessionRunning && m_endSession)
@@ -899,6 +932,7 @@ void Runtime::Shutdown()
         m_gripSpaces[hand] = XR_NULL_HANDLE;
     }
     m_gripPoseAction = XR_NULL_HANDLE;
+    m_hapticAction = XR_NULL_HANDLE;
     if (m_stageSpace && m_destroySpace) m_destroySpace(m_stageSpace);
     if (m_session && m_destroySession) m_destroySession(m_session);
     if (m_gameplayActionSet && m_destroyActionSet) m_destroyActionSet(m_gameplayActionSet);

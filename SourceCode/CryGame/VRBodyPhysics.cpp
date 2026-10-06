@@ -1,11 +1,56 @@
 #include "StdAfx.h"
 #include "VRBodyPhysics.h"
+#include "VRArmIK.h"
 #include "VRPhysicalWeapons.h"
 #include <primitives.h>
 #include <VRPhysicsDiagnostics.h>
 
 namespace
 {
+bool HandSpaceFree(IPhysicalWorld* physics, IPhysicalEntity* player, const Vec3& center, float radius)
+{
+	primitives::sphere sphere; sphere.center.zero(); sphere.r = radius;
+	IGeometry* probe = physics->GetGeomManager()->CreatePrimitive(primitives::sphere::type,&sphere);
+	if (!probe) return false;
+	IPhysicalEntity** found = NULL;
+	const Vec3 extent(radius,radius,radius);
+	const int count = physics->GetEntitiesInBox(center-extent,center+extent,found,
+		ent_terrain|ent_static|ent_rigid|ent_sleeping_rigid|ent_living|ent_independent);
+	std::vector<IPhysicalEntity*> bodies;
+	for (int i=0; i<count; ++i) bodies.push_back(found[i]);
+	bool clear = true;
+	geom_world_data probeWorld; probeWorld.offset = center;
+	for (size_t i=0; clear && i<bodies.size(); ++i)
+	{
+		IPhysicalEntity* body = bodies[i];
+		if (body==player || body->GetiForeignData()==100) continue;
+		pe_status_nparts parts;
+		const int n = body->GetStatus(&parts);
+		for (int p=0; clear && p<n; ++p)
+		{
+			pe_status_pos pose; pose.ipart = p;
+			if (!body->GetStatus(&pose) || !(pose.flagsOR & geom_colltype_player)) continue;
+			IGeometry* geometry = pose.pGeomProxy ? pose.pGeomProxy : pose.pGeom;
+			if (!geometry) continue;
+			geom_world_data world; world.offset = pose.pos; world.R = Matrix33(pose.q); world.scale = pose.scale;
+			intersection_params params;
+			// Occupancy needs only a contact, not a polygon contact manifold.
+			params.bNoAreaContacts = true;
+			params.bStopAtFirstTri = true;
+			geom_contact* contacts = NULL;
+			clear = !geometry->Intersect(probe,&world,&probeWorld,&params,contacts);
+			// Mesh PointInsideStatus requires an initialized ray hash and does
+			// not bound its cell index. A sphere query does not prepare that
+			// hash. Only analytic primitives support this containment query.
+			const int type = geometry->GetType();
+			if (clear && pose.scale>0 && (type==GEOM_BOX || type==GEOM_SPHERE || type==GEOM_CYLINDER))
+				clear = !geometry->PointInsideStatus((!pose.q*(center-Vec3(pose.pos)))/pose.scale);
+		}
+	}
+	probe->Release();
+	return clear;
+}
+
 bool Descendant(ICryBone* bone, ICryBone* root)
 {
 	while (bone && bone != root) bone = bone->GetParent();
@@ -35,7 +80,7 @@ struct CVRBodyPhysics::Part
 {
 	Part(const char* first, const char* second, float r, bool root, float weight)
 		: a(first), b(second), radius(r), mass(weight), length(0), body(NULL), physics(NULL),
-		previousValid(false), collisionEnabled(true), previousCenter(0,0,0), previousPlayerPosition(0,0,0) {}
+		previousValid(false), collisionEnabled(true),  previousCenter(0,0,0), previousPlayerPosition(0,0,0) {}
 	~Part()
 	{
 		if (physics && body) physics->DestroyPhysicalEntity(body);
@@ -55,6 +100,7 @@ struct CVRBodyPhysics::Part
 CVRBodyPhysics::CVRBodyPhysics()
 {
 	m_handBlocked[0] = m_handBlocked[1] = false;
+	m_separatedHand[0] = m_separatedHand[1] = false;
 	m_reachValid[0] = m_reachValid[1] = false;
 	memset(m_armConstraints,0,sizeof(m_armConstraints));
 	m_parts.push_back(new Part("Bip01 Spine", "Bip01 Spine2", .14f, false, 15));
@@ -77,7 +123,7 @@ CVRBodyPhysics::~CVRBodyPhysics()
 
 bool CVRBodyPhysics::GetHandCollisionTarget(int hand, Matrix34& target) const
 {
-	if (!m_handBlocked[hand]) return false;
+	if (hand<0 || hand>1 || !m_handBlocked[hand]) return false;
 	target.SetTranslation(m_handPosition[hand]);
 	return true;
 }
@@ -183,6 +229,107 @@ void CVRBodyPhysics::Resolve(ICryCharInstance* character, Matrix34& world,
 			m_reachValid[hand] = true;
 		}
 	}
+	const int solidTypes=ent_terrain|ent_static|ent_rigid|ent_sleeping_rigid|ent_living|ent_independent;
+	const int rayFlags=rwi_stop_at_pierceable|(geom_colltype_player<<rwi_colltype_bit);
+	for (int hand=0; hand<2; ++hand)
+	{
+		if (interactions && !interactions->CanRecoverHand(hand))
+		{ m_separatedHand[hand]=false; continue; }
+		// Rendering uses the last accepted wrist target. Geometry queries and
+		// recovery state changes belong only to the physical update.
+		if (!drive) continue;
+		const Vec3 shoulder=targetA[3+hand];
+		bool separated=false;
+		// Require BOTH occlusion and a contact against that very collider
+		// with the opposite surface normal. Near-side pressure is not escape.
+		for (int link=0; drive && link<4 && !separated; ++link)
+		{
+			Part& part=*m_parts[1+hand+link*2];
+			if (!part.body) continue;
+			pe_status_pos pose; pe_status_contact_normals contacts;
+			if (!part.body->GetStatus(&pose) || part.body->GetStatus(&contacts)<=0) continue;
+			const Vec3 travel=Vec3(pose.pos)-shoulder;
+			const float distance=travel.GetLength();
+			if (distance<=part.radius+.02f) continue;
+			ray_hit hit;
+			if (!physics->RayWorldIntersection(shoulder,travel,solidTypes,rayFlags,&hit,1,player->GetPhysics(),part.body)) continue;
+			if (hit.dist>=distance-part.radius-.01f) continue;
+			for (int n=0; n<contacts.count; ++n)
+				separated |= contacts.colliders[n]==hit.pCollider && contacts.normals[n]*hit.n < -.5f;
+		}
+		if (!separated && !m_separatedHand[hand]) continue;
+		const auto clearArm = [&](const std::vector<Vec3>& a, const std::vector<Vec3>& b) -> bool
+		{
+			ray_hit obstruction;
+			const Vec3 wristTravel=a[7+hand]-shoulder;
+			if (wristTravel.GetLengthSquared()>1.e-8f && physics->RayWorldIntersection(
+				shoulder,wristTravel,solidTypes,rayFlags,&obstruction,1,player->GetPhysics(),m_parts[7+hand]->body)) return false;
+			for (int link=0; link<4; ++link)
+			{
+				const int index=1+hand+link*2;
+				const float radius=m_parts[index]->radius*1.1f;
+				const int samples=max(1,(int)((b[index]-a[index]).GetLength()/max(.01f,radius))+1);
+				for (int sample=0; sample<=samples; ++sample)
+					if (!HandSpaceFree(physics,player->GetPhysics(),a[index]+(b[index]-a[index])*((float)sample/samples),radius)) return false;
+			}
+			return true;
+		};
+		std::vector<Vec3> recoveredA=targetA, recoveredB=targetB;
+		bool clear=clearArm(recoveredA,recoveredB);
+		if (m_separatedHand[hand] && !separated && clear)
+		{
+			m_separatedHand[hand]=false;
+			if (drive) for (int link=0; link<4; ++link) m_parts[1+hand+link*2]->previousValid=false;
+			continue;
+		}
+		const Vec3 rawWrist=targetA[7+hand];
+		const Vec3 fingers=targetB[7+hand]-rawWrist;
+		const float upperLength=(targetB[3+hand]-shoulder).GetLength();
+		const float forearmLength=(rawWrist-targetA[5+hand]).GetLength();
+		Vec3 outward=shoulder-targetA[3+1-hand]; outward.z=0;
+		if (outward.GetLengthSquared()>1.e-8f) outward.Normalize(); else outward.Set(hand==0 ? -1.0f : 1.0f,0,0);
+		const Vec3 pole=targetA[5+hand]+outward*(.35f*(upperLength+forearmLength))-Vec3(0,0,.2f*(upperLength+forearmLength));
+		Vec3 preferred=rawWrist;
+		ray_hit targetHit;
+		const Vec3 desiredTravel=rawWrist-shoulder;
+		if (desiredTravel.GetLengthSquared()>1.e-8f && physics->RayWorldIntersection(shoulder,desiredTravel,solidTypes,rayFlags,&targetHit,1,player->GetPhysics(),m_parts[7+hand]->body))
+			preferred=shoulder+GetNormalized(desiredTravel)*max(.02f,targetHit.dist-.12f);
+		for (int candidate=0; !clear && candidate<7; ++candidate)
+		{
+			Vec3 wristTarget=preferred;
+			if (candidate>0)
+			{
+				const Vec3 forward=Matrix33(world)*Vec3(0,1,0);
+				wristTarget=shoulder+forward*(candidate<4 ? .18f : -.12f)+outward*(.08f*(candidate%3))-Vec3(0,0,.20f);
+			}
+			Vec3 elbow,wrist;
+			if (!SolveVRArm(shoulder,wristTarget,pole,upperLength,forearmLength,elbow,wrist)) continue;
+			recoveredB[1+hand]=shoulder;
+			recoveredA[3+hand]=shoulder; recoveredB[3+hand]=elbow;
+			recoveredA[5+hand]=elbow; recoveredB[5+hand]=wrist;
+			recoveredA[7+hand]=wrist; recoveredB[7+hand]=wrist+fingers;
+			clear=clearArm(recoveredA,recoveredB);
+		}
+		if (!clear) continue; // No safe destination: preserve physical blocking.
+		targetA=recoveredA; targetB=recoveredB;
+		m_recoveredWrist[hand]=targetA[7+hand];
+		m_separatedHand[hand]=true;
+		if (!drive || !separated) continue;
+		UpdateArmConstraints(hand,false,targetA);
+		for (int link=0; link<4; ++link)
+		{
+			const int index=1+hand+link*2;
+			Part& part=*m_parts[index];
+			if (!part.body) continue;
+			const Vec3 axis=targetB[index]-targetA[index];
+			Quat rotation(1,0,0,0);
+			if (axis.GetLengthSquared()>1.e-8f) rotation=Quat(GetRotationV0V1<float>(Vec3(0,0,1),GetNormalized(axis)));
+			pe_action_reset reset; part.body->Action(&reset);
+			pe_params_pos position; position.pos=(targetA[index]+targetB[index])*.5f; position.q=rotation;
+			part.body->SetParams(&position);
+			part.previousValid=false;
+		}
+	}
 	for (size_t index = 0; index < m_parts.size(); ++index)
 	{
 		Part& part = *m_parts[index];
@@ -257,19 +404,19 @@ void CVRBodyPhysics::Resolve(ICryCharInstance* character, Matrix34& world,
 			pe_params_flags flags; flags.flagsOR = pef_never_affect_triggers;
 			part.body->SetParams(&flags);
 		}
-		if (drive && !part.collisionEnabled)
-		{
-			for (int shape = 0; shape < 3; ++shape)
-			{
-				pe_params_part params; params.ipart = shape; params.flagsColliderAND = 0;
-				params.flagsColliderOR = geom_colltype_player;
-				part.body->SetParams(&params);
-			}
-			part.collisionEnabled = true;
-		}
 		pe_status_pos pose; pe_status_dynamics dynamics;
 		if (!part.body->GetStatus(&pose) || !part.body->GetStatus(&dynamics)) continue;
-		if (drive && !connectedBody && (center-Vec3(pose.pos)).GetLengthSquared() > 2.25f)
+		pe_status_contact_normals contacts;
+		bool touching = part.collisionEnabled && part.body->GetStatus(&contacts) > 0;
+		// Tracking lag behind a wall is not a teleport. Never recenter a
+		// blocked body through that wall just because the controller kept moving.
+		ray_hit recoveryHit;
+		const Vec3 recoveryTravel = center-Vec3(pose.pos);
+		const bool recoveryNeeded = drive && hand<0 && !connectedBody && recoveryTravel.GetLengthSquared()>2.25f;
+		const bool recoveryClear = recoveryNeeded && !touching && !physics->RayWorldIntersection(
+			pose.pos,recoveryTravel,ent_terrain|ent_static|ent_rigid|ent_sleeping_rigid|ent_living|ent_independent,
+			rwi_stop_at_pierceable|(geom_colltype_player<<rwi_colltype_bit),&recoveryHit,1,player->GetPhysics(),part.body);
+		if (recoveryClear)
 		{
 			// Recenter/teleport recovery; normal tracking never writes body position.
 			pe_params_pos position; position.pos = center; position.q = rotation;
@@ -277,8 +424,6 @@ void CVRBodyPhysics::Resolve(ICryCharInstance* character, Matrix34& world,
 			pe_action_set_velocity stop; stop.v.zero(); stop.w.zero(); part.body->Action(&stop);
 			part.previousValid = false; part.body->GetStatus(&pose); part.body->GetStatus(&dynamics);
 		}
-		pe_status_contact_normals contacts;
-		const bool touching = part.collisionEnabled && part.body->GetStatus(&contacts) > 0;
 		if (drive)
 		{
 			// Differentiate tracking relative to the carrier. Its translation and
@@ -308,7 +453,6 @@ void CVRBodyPhysics::Resolve(ICryCharInstance* character, Matrix34& world,
 		// This keeps physics active without introducing its step latency into IK.
 		if (hand >= 0 && !held && touching)
 		{
-			m_handBlocked[hand] = true;
 			const Vec3 physical = Vec3(pose.pos)-Matrix33(pose.q)*Vec3(0,0,part.length*.5f);
 			// Only block motion into contact planes. Tangential tracking remains
 			// immediate; releasing a contact no longer switches whole hand poses.
@@ -318,6 +462,9 @@ void CVRBodyPhysics::Resolve(ICryCharInstance* character, Matrix34& world,
 				const Vec3 normal(contacts.normals[n]);
 				m_handPosition[hand] += normal*max(0.0f, (physical-m_handPosition[hand])*normal);
 			}
+			// A contact history entry alone is not a tracking obstruction.
+			// Once motion no longer enters its plane, render raw controller IK.
+			m_handBlocked[hand] = (m_handPosition[hand]-a).GetLengthSquared()>1.e-6f;
 		}
 		else if (hand < 0 && touching)
 		{
@@ -333,6 +480,11 @@ void CVRBodyPhysics::Resolve(ICryCharInstance* character, Matrix34& world,
 			const Vec3 pivot = first->GetBonePosition();
 			RotateChain(character,first,pivot,second->GetBonePosition()-pivot,world.GetInverted()*end-pivot);
 		}
+	}
+	for (int hand=0; hand<2; ++hand) if (m_separatedHand[hand])
+	{
+		m_handBlocked[hand]=true;
+		m_handPosition[hand]=m_recoveredWrist[hand];
 	}
 	for (int hand=0;drive && hand<2;++hand)
 		UpdateArmConstraints(hand,interactions && interactions->HasPhysicalGrip(hand),targetA);

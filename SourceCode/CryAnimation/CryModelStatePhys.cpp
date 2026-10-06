@@ -497,9 +497,19 @@ void CryModelState::SynchronizeWithPhysicalEntity(IPhysicalEntity *pent, const V
 
 void CryModelState::SetActiveRagdoll(bool enabled)
 {
-	if (!m_pCharPhysics || enabled == m_bActiveRagdoll) return;
-	if (!enabled) RestoreActiveRagdollAnimation();
-	m_activeRagdollAnimationPose.clear();
+	if (!m_pCharPhysics) return;
+	const bool repair = enabled && m_bActiveRagdoll;
+	if (enabled==m_bActiveRagdoll) {
+		if (!enabled) return;
+		pe_params_articulated_body state; pe_status_pos pose;
+		if (m_pCharPhysics->GetParams(&state) && m_pCharPhysics->GetStatus(&pose) &&
+			state.bExertImpulse && state.bCheckCollisions && state.bCollisionResp &&
+			state.iSimType==1 && pose.iSimClass>0 && pose.iSimClass<3) return;
+		// A cached active flag cannot override a streamed/suspended native rig.
+		// Reapply its mode while preserving the saved authored joint settings.
+	}
+	if (!enabled || repair) RestoreActiveRagdollAnimation();
+	if (!repair) m_activeRagdollAnimationPose.clear();
 	if (!enabled)
 	{
 		for (size_t i=0; i<m_activeRagdollOriginalJoints.size(); ++i)
@@ -531,7 +541,7 @@ void CryModelState::SetActiveRagdoll(bool enabled)
 	simulation.gravityFreefall = simulation.gravity;
 	simulation.damping = simulation.dampingFreefall = .3f;
 	m_pCharPhysics->SetParams(&simulation);
-	if (enabled)
+	if (enabled && !repair)
 	{
 		m_activeRagdollOriginalJoints.clear();
 		// The authored living rig was built as an animation collider. Clear its
@@ -567,8 +577,11 @@ void CryModelState::SetActiveRagdoll(bool enabled)
 			joint.bNoUpdate = 1;
 			m_pCharPhysics->SetParams(&joint);
 		}
-		pe_action_awake awake; awake.bAwake = 1; m_pCharPhysics->Action(&awake);
 	}
+	if (enabled) { pe_action_awake awake; awake.bAwake = 1; m_pCharPhysics->Action(&awake); }
+	static int activationSamples = 0;
+	if (activationSamples++<128) VRPhysicsTrace("[VRNPCActivation] rig=%d enabled=%d repair=%d joints=%d",
+		GetPhysicalWorld()->GetPhysicalEntityId(m_pCharPhysics),enabled,repair,(int)m_activeRagdollOriginalJoints.size());
 }
 
 IPhysicalEntity *CryModelState::RelinquishCharacterPhysics()

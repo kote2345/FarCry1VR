@@ -18,6 +18,7 @@
 #include "WeaponSystemEx.h"
 #include "VRPhysicalWeapons.h"
 #include "VRBodyPhysics.h"
+#include "VRArmIK.h"
 #include "VRPhysicalNPC.h"
 #include <VRPhysicsDiagnostics.h>
 #include "ScriptObjectStream.h"
@@ -211,49 +212,6 @@ static bool BuildVRBoneDelta(const Vec3& from, const Vec3& to,
 	axis /= axisLength;
 	const Matrix33 rotation = Matrix33::CreateRotationAA(angle, axis);
 	delta = Matrix34::CreateRotationAA(angle, axis, pivot - rotation * pivot);
-	return true;
-}
-
-static bool SolveVRArm(const Vec3& shoulder, const Vec3& wristTarget,
-	const Vec3& elbowPole, float upperLength, float forearmLength,
-	Vec3& elbow, Vec3& reachableWrist)
-{
-	if (upperLength <= 1.0e-4f || forearmLength <= 1.0e-4f)
-		return false;
-	Vec3 direction = wristTarget - shoulder;
-	float distance = direction.GetLength();
-	if (distance > 1.0e-4f)
-		direction /= distance;
-	else
-	{
-		direction.Set(0, 0, 1);
-		distance = 0.0f;
-	}
-	const float minReach = fabsf(upperLength - forearmLength) + 1.0e-4f;
-	const float maxReach = upperLength + forearmLength - 1.0e-4f;
-	const float reach = max(minReach, min(maxReach, distance));
-	reachableWrist = shoulder + direction * reach;
-
-	Vec3 pole = elbowPole - shoulder;
-	pole -= direction * (pole | direction);
-	float poleLength = pole.GetLength();
-	if (poleLength < 1.0e-4f)
-	{
-		pole = direction.Cross(Vec3(0, 1, 0));
-		poleLength = pole.GetLength();
-		if (poleLength < 1.0e-4f)
-		{
-			pole = direction.Cross(Vec3(1, 0, 0));
-			poleLength = pole.GetLength();
-		}
-	}
-	if (poleLength < 1.0e-4f)
-		return false;
-	pole /= poleLength;
-	const float along = (upperLength * upperLength - forearmLength * forearmLength + reach * reach) /
-		(2.0f * reach);
-	const float height = cry_sqrtf(max(0.0f, upperLength * upperLength - along * along));
-	elbow = shoulder + direction * along + pole * height;
 	return true;
 }
 
@@ -1193,9 +1151,9 @@ void CPlayer::Update()
 			Matrix34 controller;
 			const bool vr = m_pGame->GetSystem()->GetVRControllerTransform(true, controller) ||
 				m_pGame->GetSystem()->GetVRControllerTransform(false, controller);
-			// Every NPC retains its skeleton; only nearby NPCs need continuous
-			// contact solving. This also includes actors behind the player.
-			const bool nearby = vr && ((m_pEntity->GetPos()-m_pGame->GetSystem()->GetViewCamera().GetPos()).GetLengthSquared() < 64.0f ||
+			// Visible NPCs stay physical at any distance. Keep nearby actors
+			// active behind the player as well, so turning does not drop a grab.
+			const bool nearby = vr && (bPlayerVisible || (m_pEntity->GetPos()-m_pGame->GetSystem()->GetViewCamera().GetPos()).GetLengthSquared() < 64.0f ||
 				m_vrNPCDamageActiveUntil > m_pTimer->GetCurrTime());
 			if (nearby && !character->GetCharacterPhysics())
 			{
